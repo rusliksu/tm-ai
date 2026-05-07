@@ -1,0 +1,3 @@
+# TODO
+- check the game logs from board game arena (another implementation) https://github.com/RuneDK93/terraforming-mars-dataset in logs/TM_games.json and see if the can be changed to the format we use and then used for initial training as well
+- the TM game can be configured initially which highly affects the game play. I want the AI to be able to handle different configuration but I want to train it and play best with the configuration we typically use - see game logs/json. How to best achive that?

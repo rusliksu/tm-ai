@@ -35,34 +35,25 @@
 - `GET /version`: Commit‑Hash, Modell‑Version, Model‑Config.  
 - Optional: `POST /train_step` (nur intern genutzt, wenn du Training „online“ machen willst – für den Anfang nicht notwendig).  
 
-### 3.4 State Encoding & Action Mapping
+### 3.4 State‑Encoding & Aktion‑Schema
 
-**State Encoder:**
+**State‑Encoder:**
 
-The TM-Server already serializes the game state into `GameStatePayload` (camelCase structure). Your encoder should:
+- Modul `encoding.py`:
+  - Nimmt JSON‑State des TM‑Servers und erzeugt:
+    - `state_vector` (NumPy/Torch‑Tensor):  
+      - globale Features (Temperatur, Ozeane, O2, Generation, Milestones/Awards, global tags counts).  
+      - pro Spieler: TR, Ressourcen, Produktionen, Anzahl Tags, wichtige Karten‑Features aggregiert.  
+      - aktueller Spieler: zusätzliche Features (Handkartenzahl, Durchschnittskosten etc.).  
+    - `action_mask`: Binärvektor `len(ACTION_SPACE)` lang, der anzeigt, welche abstrakten Aktionen erlaubt sind.  
 
-- Take `GameStatePayload` JSON from the request and convert to a `state_vector` (NumPy/PyTorch tensor):
-  - **Scalar features**: generation, temperature, oxygen, oceans, currentPlayerId index
-  - **Per-player aggregates**: TR, total resources, production per resource type, tag counts, card count
-  - **Current player features**: hand size, card costs distribution, phase encoding
-  - Optionally: board state features (if needed for your policy)
-  - Target: ~512–1024 float32 dimensions (can be tuned)
+**Action‑Schema:**
 
-- Generate `action_mask`: binary vector of length `len(legal_actions)` indicating which actions are valid
-  - In practice, all actions in `legal_actions` are already valid, so the mask is all-ones
-  - The mask is mainly for internal consistency with policy networks
-
-**Action Schema:**
-
-The TM-Server already provides `legal_actions` as a flat list from the request. Your AI server does not need to perform action abstraction; instead:
-
-1. Each action in `legal_actions` has a unique `actionId` string
-2. Some actions require `parameters` (e.g., `play_card` needs `cardId`)
-3. Your policy network outputs logits over `len(legal_actions)` possible actions
-4. You pick the action with highest logits (or sample, etc.) and return `{ action_id: ..., parameters: {...} }`
-
-**Note**: The action space is not fixed at 64 slots. It varies per decision point (2–100+ actions depending on game state).
-
+- Zunächst abstraktes, reduziertes Aktionsset, z.B.:
+  - „Spiele Karte i“ (auf Slots gemappt),  
+  - „Standardprojekt X“,  
+  - „Passe“.  
+- Mapping‑Modul, das zwischen diesem abstrakten Schema und den `legal_actions` des TM‑Servers vermittelt.  
 
 ### 3.5 Modell & Trainingspipeline
 
@@ -121,37 +112,35 @@ The TM-Server already provides `legal_actions` as a flat list from the request. 
 Hier ist ein konkretisiertes API‑Schema plus ein schlanker Skeleton‑Code für deinen KI‑Server mit FastAPI und `uv` als Paketmanager. [huggingface](https://huggingface.co/blog/deep-rl-ppo)
 
 
-## API Contract (from implemented TM-adaption)
+## API‑Schema
 
-**NOTE:** The following API contract is based on the actual TM-Server implementation in `TM-adaption.md`. This is the interface the AI server must implement.
+### Basis
 
-### Base Configuration
+- Base URL: `http://localhost:8000`
+- Content‑Type: `application/json`
+- Endpoints:
+  - `POST /move` – Kern‑API für den TM‑Server
+  - `GET /health` – Healthcheck
+  - `GET /version` – Meta‑Infos (Modellversion etc.)
 
-- Base URL: `http://localhost:8000` (configured via `AI_SERVER_URL` env var)
-- Timeout: `5000` ms (configured via `AI_TIMEOUT_MS` env var)
-- Content-Type: `application/json`
-- Core Endpoints:
-  - `POST /move` – Decision request from TM-Server (required)
-  - `GET /health` – Health check (optional but recommended)
-  - `GET /version` – Model metadata (optional)
+### `POST /move`
 
-### `POST /move` Request
-
-**From TM-Server to AI-Server:**
+**Request‑Body (vom TM‑Server):**
 
 ```json
 {
   "game_id": "tm-2025-05-01-001",
   "player_id": "p2",
   "state": {
-    "generation": 7,
-    "temperature": -12,
-    "oxygen": 8,
-    "oceans": 5,
-    "currentPlayerId": "p2",
+    "global": {
+      "generation": 7,
+      "temperature": -12,
+      "oxygen": 8,
+      "oceans": 5
+    },
     "players": [
       {
-        "playerId": "p1",
+        "player_id": "p1",
         "tr": 42,
         "resources": {
           "megacredits": 25,
@@ -173,31 +162,34 @@ Hier ist ein konkretisiertes API‑Schema plus ein schlanker Skeleton‑Code fü
           "science": 2,
           "building": 3,
           "space": 1
-        },
-        "playedCards": ["card_456", "card_789"]
+        }
       }
     ],
+    "current_player_id": "p2",
     "hand": [
       {
-        "cardId": "card_123",
+        "card_id": "card_123",
         "cost": 13,
-        "tags": ["science"]
+        "tags": ["science"],
+        "requirements": {
+          "min_temperature": -20
+        }
       }
     ],
-    "phase": "action"
+    "phase": "action_phase"
   },
   "legal_actions": [
     {
-      "actionId": "play_card",
-      "parameters": {
-        "cardId": "card_123"
+      "action_id": "play_card",
+      "params": {
+        "card_id": "card_123"
       }
     },
     {
-      "actionId": "standard_project_heat_to_temp"
+      "action_id": "standard_project_heat_to_temp"
     },
     {
-      "actionId": "pass"
+      "action_id": "pass"
     }
   ],
   "metadata": {
@@ -206,15 +198,13 @@ Hier ist ein konkretisiertes API‑Schema plus ein schlanker Skeleton‑Code fü
 }
 ```
 
-### `POST /move` Response
-
-**From AI-Server back to TM-Server:**
+**Response‑Body (vom KI‑Server):**
 
 ```json
 {
   "action_id": "play_card",
   "parameters": {
-    "cardId": "card_123"
+    "card_id": "card_123"
   },
   "debug": {
     "policy_logits": [1.2, -0.3, 0.1],
@@ -223,17 +213,9 @@ Hier ist ein konkretisiertes API‑Schema plus ein schlanker Skeleton‑Code fü
 }
 ```
 
-**Field specifications:**
-- `action_id`: string, must match one of `legal_actions[*].actionId` from the request
-- `parameters`: optional object, required only if the action needs parameters
-- `debug`: optional object for logging/analysis; TM-Server ignores this
-  - `policy_logits`: optional array of floats, raw policy network outputs
-  - `value_estimate`: optional float, estimated state value
-
-**Error handling:**
-- If the AI server is unreachable or times out (> 5000 ms), the TM-Server applies a fallback action (typically the first legal action or "pass")
-- Non-OK HTTP status codes will also trigger fallback behavior
-- Malformed responses will cause the AI server request to be logged as an error and trigger fallback  
+- `action_id`: muss einer der `legal_actions[*].action_id` sein.  
+- `parameters`: optional, nur wenn für diese Aktion notwendig.  
+- `debug`: nur für Logging/Analyse, der TM‑Server kann es ignorieren.  
 
 ### `GET /health`
 
@@ -261,110 +243,7 @@ Hier ist ein konkretisiertes API‑Schema plus ein schlanker Skeleton‑Code fü
 }
 ```
 
-## Training Data Log Format (from TM-Server)
-
-The TM-Server logs all game decisions to JSON files (stored in `logs/json/` by default) for training. Each log file represents one complete game.
-
-### Log Structure
-
-```json
-{
-  "game_id": "game-20250507-001",
-  "players": [
-    {
-      "playerId": "player_1",
-      "isAi": false,
-      "name": "Human Player"
-    },
-    {
-      "playerId": "player_2",
-      "isAi": true,
-      "name": "AI Agent"
-    }
-  ],
-  "turns": [
-    {
-      "step": 0,
-      "playerId": "player_1",
-      "generation": 1,
-      "phase": "action",
-      "state": {
-        "generation": 1,
-        "temperature": -30,
-        "oxygen": 0,
-        "oceans": 0,
-        "currentPlayerId": "player_1",
-        "players": [
-          {
-            "playerId": "player_1",
-            "tr": 20,
-            "resources": { "megacredits": 0, "steel": 0, "titanium": 0, "plants": 0, "energy": 0, "heat": 0 },
-            "production": { "megacredits": 20, "steel": 0, "titanium": 0, "plants": 0, "energy": 0, "heat": 0 },
-            "tags": { "science": 0, "building": 0, "space": 0 },
-            "playedCards": []
-          }
-        ],
-        "hand": [
-          { "cardId": "card_123", "cost": 10, "tags": ["building"] }
-        ],
-        "phase": "action"
-      },
-      "legal_actions": [
-        { "actionId": "play_card", "parameters": { "cardId": "card_123" } },
-        { "actionId": "standard_project_power_plant" },
-        { "actionId": "pass" }
-      ],
-      "chosen_action": {
-        "actionId": "play_card",
-        "parameters": { "cardId": "card_123" }
-      },
-      "is_human": true
-    }
-  ],
-  "final_result": {
-    "endGeneration": 14,
-    "playerResults": [
-      {
-        "playerId": "player_1",
-        "tr": 67,
-        "vp_total": 95,
-        "rank": 1
-      },
-      {
-        "playerId": "player_2",
-        "tr": 55,
-        "vp_total": 82,
-        "rank": 2
-      }
-    ]
-  }
-}
-```
-
-### Log Field Reference
-
-- `game_id`: unique identifier for the game session
-- `players`: metadata about each player (human or AI)
-- `turns`: array of decision records, one per action taken
-  - `step`: sequence number (0-indexed)
-  - `playerId`: which player made this decision
-  - `generation`, `phase`: game phase context
-  - `state`: full game state (see GameStatePayload schema)
-  - `legal_actions`: available actions at this decision point
-  - `chosen_action`: the action that was actually taken
-  - `is_human`: boolean flag (true for human, false for AI)
-- `final_result`: end-of-game summary
-  - `endGeneration`: final generation number
-  - `playerResults`: final standings with TR, victory points, rank
-
-### Usage for Training
-
-1. **Supervised Learning**: Extract (state, legal_actions, chosen_action) tuples from human games (where `is_human: true`) to train initial policy
-2. **Reinforcement Learning**: Use game logs to compute episode rewards and train with PPO
-3. **Dataset Filtering**: Filter by `is_human` or `is_ai` to separate training data sources
-4. **Reward Calculation**: Use `final_result.playerResults` to compute per-player rewards based on rank/TR/VP
-
-
+***
 
 ## Projektstruktur mit `uv`
 
@@ -412,184 +291,30 @@ uv add "stable-baselines3[extra]"
 - Die Dokumentation sollte zusätzlich ein Beispiel `Dockerfile` / `docker-compose.yml` zur besseren Umsetzbarkeit enthalten.
 - `uv` ist ein spezifischer Paketmanager; falls das Projekt später auf `pip` oder `poetry` umsteigt, sollte das dokumentiert werden.
 
-## Design Decisions & Remaining Gaps
-
-The following areas require explicit design choices. We present the options and recommend one for each.
-
-### 1. Reward Function for RL Training
-
-**Gap**: How do we convert game outcomes (rank, TR, victory points) into a scalar reward for PPO?
-
-**Options:**
-
-- **A) Ranking-based** (recommended for competitive play)
-  - Reward = +1.0 for 1st place, 0.0 for last, interpolated for middle ranks
-  - Pros: Clear, competitive signal
-  - Cons: Only winner gets positive reward; others may learn slowly
-
-- **B) Relative scoring** (recommended for score optimization)
-  - Reward = (player_final_vp - player_starting_vp) / total_game_vp
-  - Pros: Everyone gets signal; rewards improvement even in losses
-  - Cons: Doesn't penalize losing; may not teach winning
-
-- **C) Win margin** (balanced approach)
-  - Reward = (player_final_vp - average_opponent_vp) / max_possible_vp
-  - Pros: Competitive but rewards all learning; good for self-play
-  - Cons: More complex to implement
-
-**Recommendation**: Start with **(B) Relative scoring** for initial training (better exploration signal); switch to **(A)** or **(C)** after agent stabilizes.
-
-**Question for you**: Which reward scheme do you prefer? Or do you have a different idea?
-
----
-
-### 2. Variable-Length Action Space Handling
-
-**Gap**: Each game state has 2–100+ possible actions, but policy network needs fixed output size.
-
-**Options:**
-
-- **A) Attention-based masking** (recommended)
-  - Use `action_mask` (all-ones currently, but can mark invalid actions)
-  - Policy outputs logits for variable-length action set
-  - Use attention or variable-length encoding
-  - Pros: Clean, general, handles action variations naturally
-  - Cons: More complex architecture
-
-- **B) Pad to fixed size** (simple)
-  - Always output 128 logits (max observed actions + buffer)
-  - Mask invalid actions to -∞ before softmax
-  - Pros: Easy to implement, standard RL approach
-  - Cons: Inefficient if actions sparse; wastes capacity
-
-- **C) Clustering actions** (compact)
-  - Group action types (play_card, standard_project, pass, etc.)
-  - First predict action type, then parameters
-  - Pros: Reduces output size; hierarchical
-  - Cons: More complex; harder to extend
-
-**Recommendation**: Start with **(B) Pad to fixed size** (simplest); later upgrade to **(A)** if needed.
-
-**Question for you**: Do you want to stick with fixed padding, or invest in attention-based architecture early?
-
----
-
-### 3. State Encoding Features
-
-**Gap**: What features should `state_vector` include? Currently undefined beyond sketched list.
-
-**Essential features** (must have):
-- Generation, temperature, oxygen, oceans, phase encoding
-- Per-player: TR, resources (all 6), production (all 6), tags (3), card count
-- Current player: hand card costs, card tag distribution
-
-**Optional but potentially important**:
-- Played card types / tags for each player
-- Milestones / Awards state
-- Opponent hand size (can infer playable cards)
-- Global tag counts (# science cards in play, etc.)
-
-**Recommendation**: Implement essential features first (~150–200 dims). Monitor training; add optional features if needed.
-
-**Question for you**: Should we include advanced features like milestones/awards, or keep it minimal initially?
-
----
-
-### 4. Model Persistence & Versioning
-
-**Gap**: No strategy for saving/loading models or managing versions.
-
-**Proposed structure**:
-
-```
-models/
-  policy_value_v0.1.0.pt
-  policy_value_v0.1.0.config.json    # architecture, state_dim, etc.
-  policy_value_v0.1.0.training_log   # training data (loss, reward, epoch)
-  checkpoint_latest.pt               # symlink to latest
-```
-
-**Strategy**:
-- Save model state dict + config after each training epoch
-- Version format: `v<major>.<minor>.<patch>` (e.g., v0.1.0)
-- Bump minor on architecture changes, patch on weight updates
-- At inference, load config and validate compatibility
-
-**Question for you**: Does this versioning strategy work for you, or do you need a different approach?
-
----
-
-### 5. Error Handling & Fallback Actions
-
-**Gap**: What happens if AI server fails or times out?
-
-**Proposed logic** (TM-Server side):
-- If AI request times out (> 5000 ms): return first legal action
-- If AI returns invalid action_id: return first legal action
-- If AI returns malformed JSON: log error, return first legal action
-
-**Alternative fallback strategies**:
-- **Random legal action**: More diverse but may hurt training
-- **"pass" action**: Safe but may bottleneck learning
-- **Retry logic**: Query again, but increases latency
-
-**Question for you**: Is first-action fallback acceptable, or do you prefer random/pass?
-
----
-
-### 6. Training Data: Human vs. AI Games
-
-**Gap**: How to use mixed human + AI game logs for supervised pretraining?
-
-**Proposed approach**:
-1. Collect ~50 human games (from existing TM data)
-2. Extract (state, action) pairs where `is_human: true`
-3. Train supervised baseline (cross-entropy loss) on human plays
-4. Initialize PPO agent with this baseline
-5. Fine-tune with self-play PPO
-
-**Alternative**:
-- Train only on human data initially, ignore AI games during pretraining
-- Or mix in AI games (but risk learning bad habits)
-
-**Question for you**: Do you have access to 50+ human game logs? Should we start with fewer?
-
----
-
-### 7. Performance Monitoring
-
-**Recommendation**: Add metrics collection:
-- **Inference time**: per-request latency (log if > 100 ms)
-- **Request success rate**: % of successful AI responses
-- **Policy entropy**: measure exploration vs. exploitation
-- **Value estimation accuracy**: compare predicted value vs. actual outcome
-
-**Proposed output**: Weekly metrics file or dashboard integration (TBD)
-
----
-
-## Summary of Decisions Needed
-
-| Item | Your Input | Our Recommendation |
-|------|------------|-------------------|
-| Reward function | ❓ | Relative scoring (B) |
-| Action space | ❓ | Pad to fixed size (B) |
-| State features | ❓ | Essential only (start minimal) |
-| Model versioning | ❓ | v<major>.<minor>.<patch> |
-| Error fallback | ❓ | First legal action |
-| Training data | ❓ | 50 human games + supervised pretraining |
-| Monitoring | ❓ | Weekly metrics |
+## Detailed Inconsistencies and Gaps
+- `MoveRequest` im Schema erwartet `GameState.global_`, aber Beispiel-JSON nutzt `global`; das führt zu Deserialisierungsfehlern.
+- Die `build_action_space`-Funktion erzeugt aktuell nur eine 1:1-Abbildung und keine echte abstrakte Aktions-Maske.
+- Das Modell-Skeleton verwendet `List[int]` für `hidden_sizes`, aber der Default ist ein Tuple; das ist zwar praktisch, sollte jedoch konsistent sein.
+- Für Produktionsreife fehlen Angaben zur Modellpersistenz (`save`/`load`), zur Versionskompatibilität der Checkpoints und zu einer möglichen `model_version`-Strategie.
+- Es gibt keine Bewertung oder Überwachung der Laufzeit/Performance der API, was bei späterem Cloud-Einsatz wichtig ist.
 ```
 
 ***
 
 ## Skeleton‑Code
 
-### Pydantic Schema Definitions (aligned with TM-adaption)
+### `src/tm_ai_server/schemas.py`
 
 ```python
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+
+
+class GlobalState(BaseModel):
+    generation: int
+    temperature: int
+    oxygen: int
+    oceans: int
 
 
 class PlayerResources(BaseModel):
@@ -616,35 +341,38 @@ class PlayerTags(BaseModel):
     space: int = 0
 
 
-class PlayerStatePayload(BaseModel):
-    playerId: str
+class PlayerState(BaseModel):
+    player_id: str
     tr: int
     resources: PlayerResources
     production: PlayerProduction
     tags: PlayerTags
-    playedCards: List[str] = []
 
 
-class CardInHand(BaseModel):
-    cardId: str
+class CardRequirement(BaseModel):
+    min_temperature: Optional[int] = None
+    max_temperature: Optional[int] = None
+    # später erweitern (O2, Ozeane, Tags, etc.)
+
+
+class CardState(BaseModel):
+    card_id: str
     cost: int
     tags: List[str] = []
+    requirements: Optional[CardRequirement] = None
 
 
-class GameStatePayload(BaseModel):
-    generation: int
-    temperature: int
-    oxygen: int
-    oceans: int
-    currentPlayerId: str
+class GameState(BaseModel):
+    global_: GlobalState
+    players: List[PlayerState]
+    current_player_id: str
+    hand: List[CardState] = []
     phase: str
-    players: List[PlayerStatePayload]
-    hand: List[CardInHand] = []
 
 
 class LegalAction(BaseModel):
-    actionId: str
-    parameters: Dict[str, Any] = {}
+    action_id: str
+    params: Dict[str, Any] = {}
 
 
 class Metadata(BaseModel):
@@ -654,7 +382,7 @@ class Metadata(BaseModel):
 class MoveRequest(BaseModel):
     game_id: str
     player_id: str
-    state: GameStatePayload
+    state: GameState
     legal_actions: List[LegalAction]
     metadata: Metadata
 
@@ -685,7 +413,6 @@ class VersionResponse(BaseModel):
     git_commit: str
     config: VersionConfig
 ```
-
 
 ### `src/tm_ai_server/config.py`
 
