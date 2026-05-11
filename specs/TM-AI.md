@@ -123,7 +123,7 @@ The TM server calls this when an AI player must make a decision. The full `Playe
 **Response body:**
 ```json
 {
-  "input_response": {"type": "or", "responses": [{"index": 2}]},
+  "input_response": {"type": "or", "index": 2, "response": {"type": "option"}},
   "debug": {
     "policy_logits": [1.2, -0.3, 0.8],
     "value_estimate": 0.35
@@ -132,6 +132,22 @@ The TM server calls this when an AI player must make a decision. The full `Playe
 ```
 
 `input_response` is passed directly to `player.process()` on the TM server. `debug` is optional and ignored by the game.
+
+**InputResponse wire format** (from `src/common/inputs/InputResponse.ts`):
+
+| Type | Format |
+|---|---|
+| `OrOptions` | `{type:"or", index:N, response:<InputResponse>}` |
+| `AndOptions` | `{type:"and", responses:[<InputResponse>, ...]}` |
+| `SelectOption` | `{type:"option"}` |
+| `SelectCard` | `{type:"card", cards:[<CardName>, ...]}` |
+| `SelectProjectCardToPlay` | `{type:"projectCard", card:<CardName>, payment:{...}}` |
+| `SelectSpace` | `{type:"space", spaceId:<SpaceId>}` |
+| `SelectAmount` | `{type:"amount", amount:N}` |
+| `SelectPlayer` | `{type:"player", player:<Color>}` |
+| `SelectColony` | `{type:"colony", colonyName:<ColonyName>}` |
+| `SelectDelegate` | `{type:"delegate", player:<Color>}` |
+| `SelectParty` | `{type:"party", partyName:<PartyName>}` |
 
 ### `GET /health`
 ```json
@@ -425,16 +441,18 @@ Version format: `v<major>.<minor>.<patch>`. Bump minor on architecture changes, 
 
 | Component | Status | Notes |
 |---|---|---|
-| Project structure + `pyproject.toml` | ✅ Done | All deps declared |
-| FastAPI skeleton (`main.py`) | ⚠️ Bug | Duplicate `if __name__ == "__main__"` block; second calls undefined `main()` — remove it |
-| `schemas.py` | ❌ Wrong format | Uses old snake_case + nested `global_` field; replace entirely with schemas above |
-| `encoding.py` | ❌ Not started | Blocks all downstream work |
-| `model.py` | ❌ Not started | |
-| `inference.py` | ❌ Not started | |
-| `config.py` | ❌ Not started | |
-| `dataset.py` | ❌ Not started | |
-| `train_supervised.py` | ❌ Not started | |
-| `env_tm.py` + `train_ppo.py` | ❌ Not started | Phase 2 |
+| Project structure + `pyproject.toml` | ✅ Done | src-layout, setuptools build system, dev deps |
+| `main.py` (root shim) + `src/tm_ai_server/main.py` | ✅ Done | Correct `/move`, `/health`, `/version` endpoints |
+| `schemas.py` | ✅ Done | Correct camelCase schemas matching TM server output |
+| `config.py` | ✅ Done | STATE_DIM=55, constants for phases/boards/expansions/tags |
+| `model.py` | ✅ Done | PolicyValueNet with LayerNorm + Dropout |
+| `encoding.py` | ✅ Done | encode_state, flatten_options, index_to_response, response_to_index |
+| `inference.py` | ✅ Done | load_model, select_action; falls back to random when no checkpoint |
+| `training/dataset.py` | ✅ Done | TMDataset from Plan-B training log format |
+| `training/train_supervised.py` | ✅ Done | Cross-entropy + MSE, checkpoint_best/latest |
+| `training/env_tm.py` | ✅ Skeleton | Gymnasium env; requires TM server Phase-2 HTTP endpoints |
+| `training/train_ppo.py` | ✅ Skeleton | MaskablePPO; requires env_tm and sb3-contrib |
+| Tests (test_encoding, test_schemas) | ✅ Done | 20 tests, all passing |
 
 ---
 

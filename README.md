@@ -1,53 +1,92 @@
-## Spezifikation 1: Gesamtvorhaben
+# TM AI — Terraforming Mars AI Agent
 
-### Ziele
+A local AI server that plays Terraforming Mars alongside a custom fork of the open-source TM server.
 
-- KI‑Agent, der Terraforming Mars in der Open‑Source‑Online‑Umsetzung spielen kann.  
-- Fokus: Machbarkeit, verständliche Architektur, nachvollziehbares Training; spielerische Qualität kann durch zusätzliches Training verbessert werden.  
-- Training zunächst lokal (Laptop ohne GPU) mit kleinen Experimenten, dann ernsthafte Trainingsläufe auf günstigen GPU‑Providern (RunPod/Vast/Synpix) per Docker. [synpixcloud](https://www.synpixcloud.com/blog/cloud-gpu-pricing-comparison-2026)
+## Architecture
 
-### Systemarchitektur (High‑Level)
+```
+terraforming-mars/  (Node.js, TypeScript, branch: feat/ai-player)
+    └── AI player calls POST /move on the AI server for every decision
+tm-ai/              (this repo — Python, FastAPI, PyTorch)
+    └── Responds with a valid InputResponse for the current PlayerInputModel
+```
 
-Komponenten:
+The TM server sends the full decision tree (`PlayerInputModel`) to the AI server at each turn. The AI server returns a raw `InputResponse` that the game processes directly.
 
-1. **TM‑Server (angepasster Fork):**
-   - Node/TypeScript‑Server, wie im Originalrepo, lokal oder in der Cloud deployt. [reddit](https://www.reddit.com/r/boardgames/comments/961yjz/terraforming_mars_inventrix_adaptation_technology/)
-   - Erweiterungen:
-     - AI‑Spielertyp („AI_PLAYER“) im Match‑Setup.  
-     - Logging von Spielzuständen und Aktionen (JSON) für Training. [reddit](https://www.reddit.com/r/boardgames/comments/1hl9hke/opensource_version_of_terraforming_mars/)
-     - HTTP‑Client, der bei Zug eines AI‑Spielers den KI‑Server aufruft und dessen Aktion ausführt.  
+## Quick Start
 
-2. **KI‑Server (Python, PyTorch, Stable‑Baselines3):**
-   - REST‑API (`/move`, `/health`, `/version`), optional `/train`.  
-   - Modul für State‑Encoding (TM‑JSON → Tensoren).  
-   - Policy/Value‑Netz (erst einfaches MLP), später ggf. AlphaZero‑light.  
-   - Trainingspipeline:
-     - Supervised Learning auf ca. 50 vorhandenen menschlichen Partien (lokale TM‑Daten).  
-     - Self‑Play‑PPO (oder AlphaZero‑light) über den TM‑Server als Environment.  
+### AI Server
 
-3. **Trainings‑/Deployment‑Umgebung:**
-   - **Lokal:**  
-     - TM‑Server auf Laptop (nur CPU).  
-     - KI‑Server lokal (CPU‑Training sehr klein, primär Inferenz und Debug).  
-   - **Cloud (RunPod/Vast/Synpix):**  
-     - Docker‑Image, das KI‑Server + optional TM‑Server enthält. [synpixcloud](https://www.synpixcloud.com/ko/blog/cloud-gpu-pricing-comparison-2026)
-     - GPU‑Instanz (z.B. RTX 4090 oder A100), auf der Self‑Play + PPO‑Training laufen. [gpucloudlist](https://www.gpucloudlist.com/en/blog/google-cloud-gpu-pricing-guide)
+```bash
+cd tm-ai-server
+uv run uvicorn tm_ai_server.main:app --reload --host 0.0.0.0 --port 8000
+```
 
-### Nicht‑funktionale Anforderungen
+Without a trained model checkpoint the server uses a random-valid-action policy (last `SelectOption` in `OrOptions`, or first available option otherwise). This is sufficient to play full games.
 
-- **Portabilität:**  
-  - Ganzer Stack (TM‑Server + KI‑Server) über Docker compose startbar, sowohl lokal (CPU) als auch auf GPU‑Instanzen.  
-- **Konfigurierbarkeit:**  
-  - Endpoints, Ports und DB‑Backends über Environment‑Variablen konfigurierbar. [github](https://github.com/Gugatec/terraforming-mars_deuteranopia-colors)
-- **Reproduzierbarkeit:**  
-  - Trainingsskripte mit Seeds und klaren Config‑Dateien (YAML/JSON).  
-- **Sicherheit:**  
-  - KI‑Server nur lokal bzw. im privaten Netzwerk, keine offene Internet‑API.  
+### TM Server with AI Player
 
-## Review Remarks
-- Das Architekturmodell ist klar, aber es fehlen konkrete Schnittstellen- und API-Verträge zwischen TM‑Server und KI‑Server.
-- Es gibt keine Angabe zur Datenformat-Spezifikation der Trainingslogs oder der erwarteten Log-Struktur.
-- Bewertungsmetriken und Erfolgskriterien für den KI-Agenten werden nicht definiert.
-- Die Cloud-Deployment-Beschreibung sollte Netzwerksicherheitsanforderungen genauer ausführen, damit „nur privates Netzwerk" bei GPU-Deployments wirklich eingehalten wird.
-- Für Reproduzierbarkeit fehlen Hinweise zu Versionierung, Modell-Checkpointing und experimentellen Metadaten.
+```bash
+cd ../terraforming-mars
+npm start
+```
 
+Create a game at `http://localhost:8080`, enable "AI player?" for one or more players. The TM server calls the AI server at `AI_SERVER_URL` (default `http://localhost:8000`).
+
+### Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `AI_SERVER_URL` | `http://localhost:8000` | URL the TM server calls for AI moves |
+| `AI_TIMEOUT_MS` | `5000` | Timeout for AI server requests |
+| `AI_TRAINING_LOG_DIR` | `ai_training_logs` | Where the TM server writes JSONL training logs |
+| `MODEL_PATH` | `models/checkpoint_latest.pt` | Path to the trained model checkpoint |
+| `PORT` | `8000` | AI server port |
+
+## Training Pipeline
+
+### Phase 1 — Supervised Learning
+
+Play games with human + AI players. The TM server automatically writes per-game JSONL logs (`logs/training/{game_id}.jsonl`) with every decision by every player.
+
+Train the policy/value network:
+
+```bash
+cd tm-ai-server
+uv run python -m tm_ai_server.training.train_supervised \
+    --data-dir logs/training \
+    --output-dir models \
+    --epochs 50
+```
+
+Output: `models/checkpoint_best.pt` and `models/checkpoint_latest.pt`.
+
+The server loads the checkpoint automatically on startup (set `MODEL_PATH` env var to override the path).
+
+### Phase 2 — PPO Self-Play (cloud GPU)
+
+Requires implementing the `/api/ai/new-game` and `/api/ai/step` endpoints on the TM server (see `specs/TM-adaption.md`).
+
+```bash
+cd tm-ai-server
+uv add sb3-contrib
+uv run python -m tm_ai_server.training.train_ppo \
+    --checkpoint models/checkpoint_best.pt \
+    --output-dir models \
+    --total-steps 10_000_000
+```
+
+## Development
+
+```bash
+cd tm-ai-server
+uv run pytest tests/ -v          # run tests
+uv run pytest tests/test_encoding.py -v   # run one module
+```
+
+See `CLAUDE.md` for full architecture details, command reference, and remaining work.
+
+## Specifications
+
+- `specs/TM-AI.md` — AI server: schemas, model architecture, training pipeline
+- `specs/TM-adaption.md` — TM server integration: API contract, Plan B logging, Plan A remaining work
