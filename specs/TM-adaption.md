@@ -1,273 +1,254 @@
-## AI integration adaptation for the local Terraforming Mars repo
-
-CAUTION: this specification was already implemented in the TM repo and is contained here for reference only.
+## AI Integration for the Terraforming Mars Server
 
 ### Goal
 
-Add a lightweight AI player integration to the local Terraforming Mars repo that:
+Add AI player support to the local Terraforming Mars server (Vue 3 + Node.js):
+- `isAI` flag on the player model
+- HTTP request to an external AI server for each AI player decision
+- Logging of game states and decisions in a training-friendly format for both human and AI players
 
-- supports AI players via a new `isAI` flag on the player model,
-- makes an HTTP request for each AI decision to an external AI server,
-- logs game states, legal actions, and chosen moves in a training-friendly JSON format.
+The existing game loop must remain intact; AI behavior is a clean extension point.
 
-This should keep the existing game loop intact and add AI behavior as a clean extension point.
+---
 
-### Repo context
+## Implementation Status
 
-This repo is a Vue 3 + Node.js implementation of Terraforming Mars.
-Key integration points for AI support are:
+| Component | Status | Location |
+|---|---|---|
+| `isAI` flag on `Player` | ✅ Done | `src/server/Player.ts:258` |
+| Auto-trigger AI on `setWaitingFor` | ✅ Done | `src/server/Player.ts:1718–1720` |
+| `requestAiMove()` | ✅ Done | `src/server/Player.ts:1747–1795` |
+| `AiClient.ts` HTTP client | ✅ Done | `src/server/ai/AiClient.ts` |
+| `stateMapping.ts` state builder | ✅ Minimal | `src/server/ai/stateMapping.ts` |
+| `TrainingLogger.ts` | ✅ Stub | `src/server/ai/TrainingLogger.ts` |
+| `isAI` flag from game creation API | ✅ Done | `src/server/routes/ApiCreateGame.ts:103` |
+| Human game decision logging | ❌ Not started | — |
+| Training data export from existing games | ❌ Not started | — |
+| AI toggle in `CreateGameForm.vue` | ❌ Not started | — |
 
-- `src/server/Player.ts` — player action flow and waiting-for-input logic,
-- `src/server/Game.ts` — game lifecycle and end-of-game state,
-- `src/server/routes/ApiCreateGame.ts` — new-game endpoint and player creation,
-- `src/common/game/NewGameConfig.ts` — client/server game creation payload definitions,
-- `src/client/components/create/CreateGameForm.vue` — game setup UI,
-- `src/server/database/LocalFilesystem.ts` — existing JSON persistence.
+---
 
-The cleanest implementation is a boolean `isAI` flag rather than a separate player enum.
+## Actual API Format
 
-## Implementation plan
+> **Note:** The implemented API diverges from the original flat `actionId` design. The actual implementation uses a `provide_input` paradigm: the TM server sends the full `PlayerInput` decision tree, and the AI server returns a raw `InputResponse`.
 
-### 1. Add AI player support in game setup
-
-- Extend `src/common/game/NewGameConfig.ts` so `NewPlayerModel` includes `isAI?: boolean`.
-- Update `src/client/components/create/CreateGameForm.vue` to add a per-player AI toggle in the setup UI.
-- Preserve the flag in the serialized `NewGameConfig` payload.
-- Update `src/server/routes/ApiCreateGame.ts` to set `player.isAI = obj.isAI === true` when new players are created.
-- Add `public isAI: boolean = false;` to `src/server/Player.ts` and include it in `serialize()` / deserialization if needed.
-
-This keeps the new feature minimal and compatible with existing human-player setup.
-
-### 2. Intercept AI turns in the server
-
-The server already computes player decisions using `Player.takeAction()` and `Player.waitingFor`. AI integration should hook there.
-
-- Detect AI players during the turn flow by checking `player.isAI`.
-- When the AI player is waiting for input, serialize the current game state and available legal actions.
-- Send that payload to the configured AI server endpoint.
-- Apply the returned action through the game engine using the existing `InputResponse` / action-processing path.
-
-This approach avoids replacing the entire game loop and keeps AI behavior localized to player decision handling.
-
-### 3. Serialize game state and legal actions for the AI server
-
-Build a mapper from the current `Game` / `Player` state into an AI payload.
-Required payload fields should include:
-
-- global state: generation, temperature, oxygen, oceans, phase,
-- each player: TR, resources, production, tags, played cards,
-- current player: hand cards, active projects, board state context,
-- legal actions: flattened action IDs with explicit parameters.
-
-The repo uses `PlayerInput` objects such as `OrOptions`, `SelectCard`, `SelectSpace`, etc. Build a serializer layer that converts those inputs into a canonical `legal_actions` list and a reverse mapper from AI response back into a `PlayerInput` response.
-
-### 4. Add AI client and configuration
-
-Create a simple AI client in `src/server/ai/AiClient.ts`:
-
-- read `AI_SERVER_URL`, `AI_TIMEOUT_MS`, and `LOG_DIR` from environment variables,
-- POST to `AI_SERVER_URL/move`,
-- parse the AI response into `{ action_id, parameters }`,
-- throw on timeout or non-OK response.
-
-Also add `src/server/ai/index.ts` to export a shared client instance.
-
-This keeps the external dependency isolated and reusable.
-
-### 5. Log training data
-
-Use the existing JSON persistence model to add training logs without breaking the current database.
-
-- Keep the existing `LocalFilesystem` persistence for saved games.
-- Add a training log writer in `src/server/ai/TrainingLogger.ts`.
-- Write one JSON file per game or per training episode under `LOG_DIR`.
-- Record for each decision:
-  - `game_id`, `player_id`, generation, phase,
-  - serialized state,
-  - legal actions,
-  - chosen action + parameters,
-  - `is_human` / `is_ai`.
-- At game end, record final results per player and the full turn history.
-
-Example log structure:
+### Request (TM Server → AI Server)
 
 ```json
 {
-  "game_id": "...",
-  "players": [ ... ],
+  "game_id": "g123...",
+  "player_id": "p456...",
+  "state": {
+    "game": {
+      "id": "g123...",
+      "phase": "action",
+      "generation": 7,
+      "oxygen": 8,
+      "temperature": -12,
+      "oceanCount": 5
+    },
+    "player": {
+      "id": "p456...",
+      "name": "Alice",
+      "color": "blue",
+      "terraformRating": 42,
+      "megacredits": 25,
+      "steel": 3,
+      "titanium": 1,
+      "plants": 5,
+      "energy": 2,
+      "heat": 6,
+      "handSize": 4,
+      "production": {
+        "megacredits": 4,
+        "steel": 1,
+        "titanium": 0,
+        "plants": 2,
+        "heat": 0,
+        "energy": 1
+      },
+      "tags": {"science": 2, "building": 3, "space": 1},
+      "isAI": true
+    },
+    "waitingFor": {"type": "or", "title": "Take action", "options": ["..."]}
+  },
+  "legal_actions": [
+    {
+      "action_id": "provide_input",
+      "type": "or",
+      "title": "Take action",
+      "payload": {
+        "input": {"type": "or", "title": "Take action", "options": ["..."]}
+      }
+    }
+  ],
+  "metadata": {"schema_version": 1}
+}
+```
+
+`legal_actions` always contains exactly one entry with `action_id: "provide_input"`. The full `PlayerInputModel` decision tree is in both `state.waitingFor` and `legal_actions[0].payload.input`.
+
+### Response (AI Server → TM Server)
+
+```json
+{
+  "input_response": {"type": "or", "responses": [{"index": 2}]},
+  "debug": {
+    "policy_logits": [1.2, -0.3, 0.8],
+    "value_estimate": 0.35
+  }
+}
+```
+
+`input_response` is passed directly to `player.process(input_response)` in the TM server. It must be a valid serialized response to the `PlayerInput` type that was sent. `debug` is optional and logged but otherwise ignored.
+
+### Error Handling (current behavior)
+
+- Timeout (> 5000 ms): error logged, no action applied (AI player stalls)
+- Non-OK HTTP status: error logged, no action applied
+- `input_response` undefined: error logged, no action applied
+
+No automatic fallback to a random or default action is currently implemented.
+
+---
+
+## State Mapping (`stateMapping.ts`)
+
+`buildAiRequestState()` currently extracts a minimal single-player view:
+
+- **`game`**: id, phase, generation, oxygen, temperature, oceanCount
+- **`player`** (active player only): id, name, color, terraformRating, megacredits, steel, titanium, plants, heat, energy, handSize, production (all 6 resources), tags (all counts), isAI
+- **`waitingFor`**: the full `PlayerInputModel` for the current decision
+
+**Not yet included:**
+- Other players' resources, production, tags, played cards
+- Board state (tile placement, ocean/city/greenery positions)
+- Milestones and awards (claimed, funded, scores)
+- Active player's played cards
+
+---
+
+## PlayerInput Model Reference
+
+The `waitingFor` and `payload.input` objects are `PlayerInputModel` instances — a recursive decision tree. Key types:
+
+| Type | Description |
+|---|---|
+| `OrOptions` | Player chooses one of N options |
+| `SelectCard` | Player selects from a list of cards |
+| `SelectSpace` | Player selects a board hex |
+| `SelectPlayer` | Player selects another player |
+| `SelectAmount` | Player enters a number within a range |
+| `AndOptions` | Sequence of inputs resolved in order |
+
+The AI must return an `input_response` compatible with the active `PlayerInput` type. This is the core complexity of the AI implementation — there is no flat list of named actions.
+
+---
+
+## Training Data
+
+### Current Situation
+
+**The 80 exported JSON files in `logs/json/` are not usable for training.** The `export_all_logs.ts` script exports only `version.gameLog` (an array of human-readable display messages). It does not export game states, player resources, or actions.
+
+The SQLite database (`db/game.db`) contains the full `SerializedGame` JSON at every save point:
+- 82 games, 11,192 total save rows
+- Largest game: 282 saves (~282 decision points)
+- Each row contains complete state: players, board, cards, resources, game options
+
+### Plan A: Re-run Engine During Export (for existing games)
+
+**Concept:** `Game.deserialize()` already re-triggers the active player's turn at the end (line 1793 of `Game.ts`), which internally calls `player.setWaitingFor()`. This means after loading any save from the DB, `player.waitingFor` is populated automatically — legal actions are available without extra work.
+
+**Steps:**
+1. Iterate consecutive save pairs (N, N+1) for each game
+2. Deserialize save N → `game.activePlayer.waitingFor` is set automatically
+3. Capture `player.waitingFor.toModel(player)` as the `PlayerInputModel`
+4. Compare game logs between save N and N+1 to determine which option was chosen
+5. Extract state features from `SerializedGame`
+
+**Risks and mitigations:**
+
+| Risk | Detail | Mitigation |
+|---|---|---|
+| `game.save()` fires during deserialization | `takeAction()` calls `game.save()` when `actionsTakenThisRound === 0`. The `saveBeforeTakingAction` parameter is currently `@ts-ignore`d and does nothing. This means loading a save for export would write spurious saves to the DB. | Patch `takeAction()` to honour the flag during export, or use a read-only DB connection |
+| Chosen action inference is hard | No chosen action is stored; must be inferred by diffing consecutive saves or parsing log message deltas | GameLog messages between saves describe what happened; build a parser or diff player state |
+| Non-decision saves | Some consecutive saves are mid-deferred-action (not at a clean decision boundary) | Filter: only emit a training tuple when `activePlayer` changes or `phase` changes |
+| Undo pollution | DB stores saves after undo operations, creating contradictory sequences | Detect and skip games with `undoCount > 0`, or cross-reference `lastSaveId` monotonicity |
+| `PlayerInputModel` is a tree, not a flat list | The `waitingFor` model has variable depth and structure | Accept the tree as-is; flatten to a canonical list during dataset preprocessing in Python |
+
+### Plan B: Real-time Hook (for future games)
+
+Add logging in `Player.setWaitingFor()` (captures state + waitingFor before decision) and `Player.process()` (captures the chosen `InputResponse` after decision) for **both AI and human players**.
+
+This produces clean `(state, waitingFor, input_response, is_human)` tuples at every decision point without any inference or diffing.
+
+**Recommended:** Implement Plan A for historical data and Plan B simultaneously so all future games produce training data automatically.
+
+### Training Log Format
+
+Per-game log file (one file per game):
+
+```json
+{
+  "game_id": "g123...",
+  "game_spec": {
+    "board_name": "tharsis",
+    "player_count": 2,
+    "expansions": ["corpEra", "venus", "prelude"],
+    "variants": {"draftVariant": true},
+    "created_at": "2026-05-01T10:00:00.000Z"
+  },
+  "players": [
+    {"playerId": "p1", "name": "Alice", "isAI": false},
+    {"playerId": "p2", "name": "Bot", "isAI": true}
+  ],
   "turns": [
     {
       "step": 0,
-      "player_id": "...",
-      "state": { ... },
-      "legal_actions": [ ... ],
-      "action": { "action_id": "...", "parameters": { ... } },
+      "playerId": "p1",
+      "generation": 3,
+      "phase": "action",
+      "state": {"game": {"..."}, "player": {"..."}},
+      "waitingFor": {"type": "or", "title": "Take action", "options": ["..."]},
+      "input_response": {"type": "or", "responses": [{"index": 1}]},
       "is_human": true
     }
   ],
   "final_result": {
-    "player_results": [
-      { "player_id": "...", "tr": 67, "vp_total": 95, "rank": 1 }
+    "endGeneration": 14,
+    "playerResults": [
+      {"playerId": "p1", "tr": 67, "vp_total": 95, "rank": 1},
+      {"playerId": "p2", "tr": 55, "vp_total": 82, "rank": 2}
     ]
   }
 }
 ```
 
-This output is suitable for supervised learning and reinforcement learning analysis.
+---
 
-## Repo-specific review
+## Remaining Work
 
-### What is already available
+- [ ] Fix `takeAction()` to honour `saveBeforeTakingAction=false` (required for Plan A)
+- [ ] Create `src/server/tools/export_training_data.ts` (Plan A: re-run engine on DB saves)
+- [ ] Add logging hook to `Player.setWaitingFor()` + `Player.process()` (Plan B)
+- [ ] Extend `stateMapping.ts` to include opponent states, played cards, board
+- [ ] Extend `TrainingLogger.ts` to write per-game files (not per-record files)
+- [ ] Add AI toggle to `CreateGameForm.vue`
+- [ ] Add fallback action when AI server fails (random legal option or pass)
 
-- `src/server/Player.ts` is the main hook for player action flow and waiting-for-input semantics.
-- `src/server/routes/ApiCreateGame.ts` currently builds players from `NewGameConfig`.
-- The client `CreateGameForm.vue` already serializes players and can be extended with an AI flag.
-- `src/server/database/LocalFilesystem.ts` already writes serialized game JSON, so training log support can be added on top.
+---
 
-### Key technical gap
+## File Reference
 
-The main challenge is mapping the repo's internal `PlayerInput` tree into a flat `legal_actions` representation and back. This is the core serialization work for the AI integration.
-
-## Suggested file changes
-
-- `src/common/game/NewGameConfig.ts`
-- `src/client/components/create/CreateGameForm.vue`
-- `src/server/routes/ApiCreateGame.ts`
-- `src/server/Player.ts`
-- `src/server/ai/AiClient.ts`
-- `src/server/ai/index.ts`
-- `src/server/ai/TrainingLogger.ts`
-- `src/server/ai/stateMapping.ts`
-- `src/server/database/LocalFilesystem.ts` (optional: hook training logs)
-- `tests/server/ai/*.spec.ts`
-
-## Example AI client and flow
-
-### AI client implementation
-
-```ts
-// src/server/ai/AiClient.ts
-import { URL } from "node:url";
-
-const AI_SERVER_URL = process.env.AI_SERVER_URL ?? "http://localhost:8000";
-const AI_TIMEOUT_MS = Number(process.env.AI_TIMEOUT_MS ?? "5000");
-
-export interface GameStatePayload {
-  generation: number;
-  temperature: number;
-  oxygen: number;
-  oceans: number;
-  currentPlayerId: string;
-  players: Array<{
-    playerId: string;
-    tr: number;
-    resources: Record<string, number>;
-    production: Record<string, number>;
-    tags: Record<string, number>;
-    playedCards: string[];
-  }>;
-  hand: Array<{ cardId: string; cost: number; tags: string[] }>;
-  phase: string;
-}
-
-export interface LegalAction {
-  actionId: string;
-  parameters?: Record<string, unknown>;
-}
-
-export interface MoveRequestPayload {
-  game_id: string;
-  player_id: string;
-  state: GameStatePayload;
-  legal_actions: LegalAction[];
-  metadata: { schema_version: number };
-}
-
-export interface MoveResponsePayload {
-  action_id: string;
-  parameters?: Record<string, unknown>;
-  debug?: { policy_logits?: number[]; value_estimate?: number };
-}
-
-export class AiClient {
-  private readonly baseUrl: string;
-
-  constructor(baseUrl = AI_SERVER_URL) {
-    this.baseUrl = baseUrl.replace(/\/+$/, "");
-  }
-
-  async requestMove(payload: MoveRequestPayload): Promise<MoveResponsePayload> {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
-
-    try {
-      const url = new URL("/move", this.baseUrl).toString();
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
-
-      if (!res.ok) {
-        throw new Error(`AI server returned status ${res.status}`);
-      }
-
-      return (await res.json()) as MoveResponsePayload;
-    } finally {
-      clearTimeout(timeout);
-    }
-  }
-}
-```
-
-### AI decision hook example
-
-```ts
-// repo-specific example: server code should call this when an AI player waits for input
-import { aiClient } from "./ai/index";
-
-export async function handleAiPlayerTurn(game: Game, player: Player): Promise<void> {
-  const waitingFor = player.waitingFor;
-  if (!player.isAI || !waitingFor) {
-    return;
-  }
-
-  const state = buildGameStatePayload(game, player);
-  const legalActions = flattenPlayerInputToLegalActions(waitingFor);
-
-  const request = {
-    game_id: game.id,
-    player_id: player.id,
-    state,
-    legal_actions: legalActions,
-    metadata: { schema_version: 1 },
-  };
-
-  try {
-    const response = await aiClient.requestMove(request);
-    const chosen = legalActions.find((a) => a.actionId === response.action_id);
-
-    if (!chosen) {
-      return applyFallbackAction(game, player, legalActions);
-    }
-
-    const inputResponse = buildInputResponse(response, chosen);
-    player.process(inputResponse);
-  } catch (err) {
-    applyFallbackAction(game, player, legalActions);
-  }
-}
-```
-
-This is the first iteration: once the AI client is in place, the remaining work is to make sure the action mapping covers the repo's actual `PlayerInput` types.
-
-## Testing note
-
-Mark the test section for future implementation. The AI integration should be verified with:
-
-- unit tests for serialization and response validation,
-- integration tests with a dummy AI server,
-- end-to-end tests where AI and human players run through a small game.
-
-> The actual implementation should be repository-specific and use the existing `Player` / `Game` classes and serialization patterns. Keep tests as planned future work and focus first on the AI hook, state mapping, and logging paths.
+| File | Purpose | Status |
+|---|---|---|
+| `src/server/Player.ts` | AI trigger on `setWaitingFor`, `requestAiMove` | ✅ Done |
+| `src/server/ai/AiClient.ts` | HTTP client to AI server | ✅ Done |
+| `src/server/ai/stateMapping.ts` | Build state payload | ✅ Minimal |
+| `src/server/ai/TrainingLogger.ts` | Log training records (per-record, AI only) | ✅ Stub |
+| `src/server/ai/index.ts` | Re-exports | ✅ Done |
+| `src/server/routes/ApiCreateGame.ts` | Set `isAI` on player create | ✅ Done |
+| `src/server/tools/export_all_logs.ts` | Exports game log messages only | ⚠️ Not training data |
+| `src/server/tools/export_training_data.ts` | Re-run engine export (Plan A) | ❌ To create |
+| `src/client/components/create/CreateGameForm.vue` | AI toggle in game setup UI | ❌ To add |

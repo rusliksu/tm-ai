@@ -1,329 +1,170 @@
+## TM AI Server Specification
 
-## Spezifikation 3: KI‑Server (Python, PyTorch, PPO)
+### Goal
 
-### 3.1 Ziel
+A local AI server that:
+- Receives HTTP requests from the TM server when an AI player must decide
+- Returns a valid `input_response` for the given `PlayerInput` decision tree
+- Always returns a legal move (baseline behaviour, no trained model required)
+- Trains from human game logs via supervised learning (Phase 1)
+- Improves via self-play PPO on cloud GPUs (Phase 2)
 
-- Lokaler KI‑Server, der:
-  - über HTTP von deinem TM‑Server aufgerufen wird,  
-  - zunächst einfache, aber gültige Züge liefert (Baseline),  
-  - aus Logs mit ca. 50 menschlichen Spielen eine initiale Policy lernt (Supervised),  
-  - später via Self‑Play‑PPO auf Cloud‑GPUs weitertrainiert werden kann. [en.wikipedia](https://en.wikipedia.org/wiki/Proximal_policy_optimization)
+---
 
-### 3.2 Tech‑Stack
+## Tech Stack
 
-- Sprache: Python 3.11+.  
-- Frameworks:
-  - Web‑API: FastAPI oder Flask.  
-  - DL: PyTorch.  
-  - RL: Stable‑Baselines3 (PPO) + eigenes Wrapper‑Environment für TM.  
-- Packaging/Deploy:
-  - `uv`.  
-  - Dockerfile für CPU (lokal) und GPU (Cloud). [synpixcloud](https://www.synpixcloud.com/blog/cloud-gpu-pricing-comparison-2026)
+| Layer | Choice |
+|---|---|
+| Language | Python 3.11+ |
+| Web API | FastAPI + uvicorn |
+| Deep Learning | PyTorch |
+| Reinforcement Learning | Stable-Baselines3 (PPO) |
+| Package manager | `uv` |
+| Deployment | Docker — CPU (local), GPU (cloud) |
 
-### 3.3 API‑Design
+---
 
-**Endpoint: `POST /move`**
+## Project Structure
 
-- Request:
-  - Body wie oben (State + legal_actions).  
-- Response:
-  - `action_id`, `parameters`, optional `debug`.  
-
-**Weitere Endpoints:**
-
-- `GET /health`: `{ "status": "ok" }`.  
-- `GET /version`: Commit‑Hash, Modell‑Version, Model‑Config.  
-- Optional: `POST /train_step` (nur intern genutzt, wenn du Training „online“ machen willst – für den Anfang nicht notwendig).  
-
-### 3.4 State‑Encoding & Aktion‑Schema
-
-**State‑Encoder:**
-
-- Modul `encoding.py`:
-  - Nimmt JSON‑State des TM‑Servers und erzeugt:
-    - `state_vector` (NumPy/Torch‑Tensor):  
-      - globale Features (Temperatur, Ozeane, O2, Generation, Milestones/Awards, global tags counts).  
-      - pro Spieler: TR, Ressourcen, Produktionen, Anzahl Tags, wichtige Karten‑Features aggregiert.  
-      - aktueller Spieler: zusätzliche Features (Handkartenzahl, Durchschnittskosten etc.).  
-    - `action_mask`: Binärvektor `len(ACTION_SPACE)` lang, der anzeigt, welche abstrakten Aktionen erlaubt sind.  
-
-**Action‑Schema:**
-
-- Zunächst abstraktes, reduziertes Aktionsset, z.B.:
-  - „Spiele Karte i“ (auf Slots gemappt),  
-  - „Standardprojekt X“,  
-  - „Passe“.  
-- Mapping‑Modul, das zwischen diesem abstrakten Schema und den `legal_actions` des TM‑Servers vermittelt.  
-
-### 3.5 Modell & Trainingspipeline
-
-**Modell (erste Version):**
-
-- `PolicyValueNet` (MLP):
-  - Input: `state_vector`.  
-  - 3–4 Hidden‑Layer à 256–512 Neuronen, ReLU, LayerNorm, Dropout.  
-  - Policy‑Head: logits über `ACTION_SPACE`, Softmax + Maskierung mit `action_mask`.  
-  - Value‑Head: skalarer State‑Wert \(v(s)\).  
-
-**Supervised‑Training (Phase 1):**
-
-- Daten: 
-  - Aus deinen existierenden Logs die menschlichen Züge extrahieren.  
-- Loss:
-  - Cross‑Entropy zwischen Policy‑Head und „gewählter Aktion“ (ggf. gewichtet nach Endergebnissen).  
-  - MSE oder L2‑Loss für Value‑Head gegen finalen Reward (z.B. normalisierte TR/Platzierung).  
-- Training:
-  - CPU‑Training ausreichend, evtl. 10–50 Epochen, Batch‑Size 64–256.  
-
-**PPO‑Training (Phase 2, in der Cloud):**
-
-- TM‑Environment:
-  - Python‑Wrapper, der über HTTP einen TM‑Server steuert:
-    - `reset()` startet neues Spiel,  
-    - `step(action)` schickt Aktion für aktuellen Spieler, liest neuen State + Reward.  
-- Stable‑Baselines3:
-  - PPO mit MLP‑Policy, ggf. initialisiert mit deinem vortrainierten Policy‑Netz.  
-  - Hyperparameter (Startwerte):
-    - `learning_rate = 3e-4`,  
-    - `gamma = 0.99`,  
-    - `gae_lambda = 0.95`,  
-    - `n_steps` so wählen, dass pro Update einige tausend Schritte gesammelt werden,  
-    - `clip_range = 0.2`. [huggingface](https://huggingface.co/blog/deep-rl-ppo)
-
-### 3.6 Lokale Nutzung vs. Cloud‑Training
-
-**Lokal (Laptop ohne GPU):**
-
-- KI‑Server:
-  - Läuft im „Inferenz‑Modus“ mit CPU, evtl. kleiner Batch‑Size.  
-  - Training nur für kleine Tests (z.B. 1–2 Epochen auf wenigen Samples).  
-
-**Cloud (RunPod/Vast/Synpix):**
-
-- Docker‑Image:
-  - Basis‑Image mit GPU‑Support (z.B. `pytorch/pytorch` + CUDA).  
-  - Enthält KI‑Server + Option, TM‑Server im gleichen Container oder per Compose‑Netzwerk.  
-- Startscripts:
-  - `run_inference.sh` (nur KI‑Server, für spätere Online‑Spiele).  
-  - `run_training.sh` (startet TM‑Server + Self‑Play‑Training mit PPO).  
-- Kostenkontrolle:
-  - Trainingsjobs so schreiben, dass sie nach N Millionen Schritten sauber stoppen und Ergebnisse (Models, Logs) in ein Cloud‑Volume oder S3‑kompatiblen Storage schreiben. [synpixcloud](https://www.synpixcloud.com/ko/blog/cloud-gpu-pricing-comparison-2026)
-
-Hier ist ein konkretisiertes API‑Schema plus ein schlanker Skeleton‑Code für deinen KI‑Server mit FastAPI und `uv` als Paketmanager. [huggingface](https://huggingface.co/blog/deep-rl-ppo)
-
-
-## API‑Schema
-
-### Basis
-
-- Base URL: `http://localhost:8000`
-- Content‑Type: `application/json`
-- Endpoints:
-  - `POST /move` – Kern‑API für den TM‑Server
-  - `GET /health` – Healthcheck
-  - `GET /version` – Meta‑Infos (Modellversion etc.)
-
-### `POST /move`
-
-**Request‑Body (vom TM‑Server):**
-
-```json
-{
-  "game_id": "tm-2025-05-01-001",
-  "player_id": "p2",
-  "state": {
-    "global": {
-      "generation": 7,
-      "temperature": -12,
-      "oxygen": 8,
-      "oceans": 5
-    },
-    "players": [
-      {
-        "player_id": "p1",
-        "tr": 42,
-        "resources": {
-          "megacredits": 25,
-          "steel": 3,
-          "titanium": 1,
-          "plants": 5,
-          "energy": 2,
-          "heat": 6
-        },
-        "production": {
-          "megacredits": 4,
-          "steel": 1,
-          "titanium": 0,
-          "plants": 2,
-          "energy": 1,
-          "heat": 0
-        },
-        "tags": {
-          "science": 2,
-          "building": 3,
-          "space": 1
-        }
-      }
-    ],
-    "current_player_id": "p2",
-    "hand": [
-      {
-        "card_id": "card_123",
-        "cost": 13,
-        "tags": ["science"],
-        "requirements": {
-          "min_temperature": -20
-        }
-      }
-    ],
-    "phase": "action_phase"
-  },
-  "legal_actions": [
-    {
-      "action_id": "play_card",
-      "params": {
-        "card_id": "card_123"
-      }
-    },
-    {
-      "action_id": "standard_project_heat_to_temp"
-    },
-    {
-      "action_id": "pass"
-    }
-  ],
-  "metadata": {
-    "schema_version": 1
-  }
-}
 ```
-
-**Response‑Body (vom KI‑Server):**
-
-```json
-{
-  "action_id": "play_card",
-  "parameters": {
-    "card_id": "card_123"
-  },
-  "debug": {
-    "policy_logits": [1.2, -0.3, 0.1],
-    "value_estimate": 0.35
-  }
-}
-```
-
-- `action_id`: muss einer der `legal_actions[*].action_id` sein.  
-- `parameters`: optional, nur wenn für diese Aktion notwendig.  
-- `debug`: nur für Logging/Analyse, der TM‑Server kann es ignorieren.  
-
-### `GET /health`
-
-**Response:**
-
-```json
-{
-  "status": "ok"
-}
-```
-
-### `GET /version`
-
-**Response:**
-
-```json
-{
-  "model_version": "0.1.0",
-  "git_commit": "abc123def",
-  "config": {
-    "state_dim": 512,
-    "hidden_sizes": [512, 512, 512],
-    "action_space_size": 64
-  }
-}
-```
-
-***
-
-## Projektstruktur mit `uv`
-
-Vorschlag:
-
-```text
 tm-ai-server/
   pyproject.toml
   uv.lock
   src/
     tm_ai_server/
       __init__.py
-      main.py           # FastAPI App, Endpoints
-      schemas.py        # Pydantic-Modelle für Request/Response
-      encoding.py       # TM-JSON -> Tensoren / Masken
+      main.py           # FastAPI app and endpoints
+      schemas.py        # Pydantic models for request/response
+      encoding.py       # State JSON → feature tensors
       model.py          # PolicyValueNet (PyTorch)
-      inference.py      # Laden des Modells, Auswahl der Aktion
-      config.py         # Pfade, Hyperparameter, Defaults
+      inference.py      # Model loading and action selection
+      config.py         # Hyperparameters and env var config
       training/
         __init__.py
-        dataset.py      # Laden der Log-Dateien
+        dataset.py      # Load and parse training logs
         train_supervised.py
-        train_ppo_env.py
-        env_tm.py       # RL-Environment für PPO (später)
+        env_tm.py       # Gymnasium environment wrapping TM server HTTP
+        train_ppo.py
+  tests/
 ```
 
-**Init mit uv (nur Info, kein Code):**
-
+Run locally:
 ```bash
-uv init tm-ai-server
-cd tm-ai-server
-uv add fastapi uvicorn[standard] pydantic torch numpy
-# später:
-uv add "stable-baselines3[extra]"
-
-***
-
-## Review Remarks
-- Die Beispiel-API zeigt `state.global`, aber das Pydantic-Modell nutzt `GameState.global_`; dieser Feldname-Mismatch muss geklärt oder über Aliase gelöst werden.
-- Die `encoding.py`-Skeleton enthält fehlerhafte Markdown-Link-Texte (`[huggingface]`, `[datacamp]`) innerhalb des Codeblockes, was unbrauchbaren Beispielcode erzeugt.
-- `action_space_size = 64` wird genannt, aber die konkrete Definition und das Mapping auf reale legale Aktionen fehlen.
-- Es fehlen Spezifikationen für die Belohnungsfunktion im PPO-Training, insbesondere wie finaler Score / TR / Platzierung in einen numerischen Reward übersetzt wird.
-- Es wird ein optionaler `POST /train_step`-Endpoint erwähnt, aber nicht im API-Schema definiert.
-- Die vorgeschlagene Projektstruktur listet Trainingsmodule, aber es fehlen konkrete Datenformate für `dataset.py` und `env_tm.py`.
-- Die Dokumentation sollte zusätzlich ein Beispiel `Dockerfile` / `docker-compose.yml` zur besseren Umsetzbarkeit enthalten.
-- `uv` ist ein spezifischer Paketmanager; falls das Projekt später auf `pip` oder `poetry` umsteigt, sollte das dokumentiert werden.
-
-## Detailed Inconsistencies and Gaps
-- `MoveRequest` im Schema erwartet `GameState.global_`, aber Beispiel-JSON nutzt `global`; das führt zu Deserialisierungsfehlern.
-- Die `build_action_space`-Funktion erzeugt aktuell nur eine 1:1-Abbildung und keine echte abstrakte Aktions-Maske.
-- Das Modell-Skeleton verwendet `List[int]` für `hidden_sizes`, aber der Default ist ein Tuple; das ist zwar praktisch, sollte jedoch konsistent sein.
-- Für Produktionsreife fehlen Angaben zur Modellpersistenz (`save`/`load`), zur Versionskompatibilität der Checkpoints und zu einer möglichen `model_version`-Strategie.
-- Es gibt keine Bewertung oder Überwachung der Laufzeit/Performance der API, was bei späterem Cloud-Einsatz wichtig ist.
+uv run uvicorn tm_ai_server.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-***
+---
 
-## Skeleton‑Code
+## API Contract
 
-### `src/tm_ai_server/schemas.py`
+Base URL: `http://localhost:8000` (via `AI_SERVER_URL` env var)
+Timeout: 5000 ms (via `AI_TIMEOUT_MS` env var)
+Content-Type: `application/json`
+
+### `POST /move`
+
+The TM server calls this when an AI player must make a decision. The full `PlayerInputModel` decision tree is provided; the AI server must return a valid `input_response` for it.
+
+**Request body:**
+```json
+{
+  "game_id": "g123...",
+  "player_id": "p456...",
+  "state": {
+    "game": {
+      "id": "g123...",
+      "phase": "action",
+      "generation": 7,
+      "oxygen": 8,
+      "temperature": -12,
+      "oceanCount": 5
+    },
+    "player": {
+      "id": "p456...",
+      "name": "Alice",
+      "color": "blue",
+      "terraformRating": 42,
+      "megacredits": 25,
+      "steel": 3,
+      "titanium": 1,
+      "plants": 5,
+      "energy": 2,
+      "heat": 6,
+      "handSize": 4,
+      "production": {
+        "megacredits": 4,
+        "steel": 1,
+        "titanium": 0,
+        "plants": 2,
+        "heat": 0,
+        "energy": 1
+      },
+      "tags": {"science": 2, "building": 3, "space": 1},
+      "isAI": true
+    },
+    "waitingFor": {"type": "or", "title": "Take action", "options": ["..."]}
+  },
+  "legal_actions": [
+    {
+      "action_id": "provide_input",
+      "type": "or",
+      "title": "Take action",
+      "payload": {
+        "input": {"type": "or", "title": "Take action", "options": ["..."]}
+      }
+    }
+  ],
+  "metadata": {"schema_version": 1}
+}
+```
+
+`legal_actions` always has exactly one entry with `action_id: "provide_input"`. The `PlayerInputModel` decision tree is in `state.waitingFor` and also in `legal_actions[0].payload.input`.
+
+**Response body:**
+```json
+{
+  "input_response": {"type": "or", "responses": [{"index": 2}]},
+  "debug": {
+    "policy_logits": [1.2, -0.3, 0.8],
+    "value_estimate": 0.35
+  }
+}
+```
+
+`input_response` is passed directly to `player.process()` on the TM server. `debug` is optional and ignored by the game.
+
+### `GET /health`
+```json
+{"status": "ok"}
+```
+
+### `GET /version`
+```json
+{
+  "model_version": "0.1.0",
+  "git_commit": "abc123def",
+  "config": {"state_dim": 512, "hidden_sizes": [512, 512, 512]}
+}
+```
+
+---
+
+## Pydantic Schemas (`schemas.py`)
+
+The current `schemas.py` in `tm-ai-server/` uses the wrong format (old snake_case structure with a nested `global_` field). It must be replaced with the following, which matches the actual TM server output:
 
 ```python
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel
 
 
-class GlobalState(BaseModel):
+class GameContext(BaseModel):
+    id: str
+    phase: str
     generation: int
-    temperature: int
     oxygen: int
-    oceans: int
-
-
-class PlayerResources(BaseModel):
-    megacredits: int
-    steel: int
-    titanium: int
-    plants: int
-    energy: int
-    heat: int
+    temperature: int
+    oceanCount: int
 
 
 class PlayerProduction(BaseModel):
@@ -331,48 +172,38 @@ class PlayerProduction(BaseModel):
     steel: int
     titanium: int
     plants: int
+    heat: int
+    energy: int
+
+
+class PlayerContext(BaseModel):
+    id: str
+    name: str
+    color: str
+    terraformRating: int
+    megacredits: int
+    steel: int
+    titanium: int
+    plants: int
     energy: int
     heat: int
-
-
-class PlayerTags(BaseModel):
-    science: int = 0
-    building: int = 0
-    space: int = 0
-
-
-class PlayerState(BaseModel):
-    player_id: str
-    tr: int
-    resources: PlayerResources
+    handSize: int
     production: PlayerProduction
-    tags: PlayerTags
+    tags: Dict[str, int] = {}
+    isAI: bool = False
 
 
-class CardRequirement(BaseModel):
-    min_temperature: Optional[int] = None
-    max_temperature: Optional[int] = None
-    # später erweitern (O2, Ozeane, Tags, etc.)
-
-
-class CardState(BaseModel):
-    card_id: str
-    cost: int
-    tags: List[str] = []
-    requirements: Optional[CardRequirement] = None
-
-
-class GameState(BaseModel):
-    global_: GlobalState
-    players: List[PlayerState]
-    current_player_id: str
-    hand: List[CardState] = []
-    phase: str
+class MoveRequestState(BaseModel):
+    game: GameContext
+    player: PlayerContext
+    waitingFor: Optional[Dict[str, Any]] = None
 
 
 class LegalAction(BaseModel):
     action_id: str
-    params: Dict[str, Any] = {}
+    type: str
+    title: str
+    payload: Optional[Dict[str, Any]] = None
 
 
 class Metadata(BaseModel):
@@ -382,7 +213,7 @@ class Metadata(BaseModel):
 class MoveRequest(BaseModel):
     game_id: str
     player_id: str
-    state: GameState
+    state: MoveRequestState
     legal_actions: List[LegalAction]
     metadata: Metadata
 
@@ -393,8 +224,7 @@ class MoveDebug(BaseModel):
 
 
 class MoveResponse(BaseModel):
-    action_id: str
-    parameters: Dict[str, Any] = {}
+    input_response: Dict[str, Any]
     debug: Optional[MoveDebug] = None
 
 
@@ -402,225 +232,220 @@ class HealthResponse(BaseModel):
     status: str = "ok"
 
 
-class VersionConfig(BaseModel):
-    state_dim: int
-    hidden_sizes: List[int]
-    action_space_size: int
-
-
 class VersionResponse(BaseModel):
     model_version: str
     git_commit: str
-    config: VersionConfig
+    config: Dict[str, Any]
 ```
 
-### `src/tm_ai_server/config.py`
+---
+
+## State Encoding (`encoding.py`)
+
+Converts the JSON state from the TM server into a fixed-size float32 feature vector.
+
+### Essential features (~150–200 dims, implement first)
+
+- **Global** (5): generation, temperature, oxygen, oceans, phase (one-hot over 5 phases)
+- **Current player** (28): TR, megacredits, steel, titanium, plants, energy, heat (7 resources), production for all 6 resources, tags for all 13 tag types, handSize
+- **Game config** (20+): player count, board one-hot (tharsis/hellas/elysium/...), enabled expansion flags (corpEra, venus, colonies, prelude, prelude2, turmoil, moon, pathfinders, ...)
+
+### Extended features (add after baseline converges)
+
+- Per opponent (×N players): TR, resources, production, tags, played card count
+- Board state: ocean/city/greenery tile counts
+- Milestones: which are claimed, by whom
+- Awards: which are funded, by whom
+
+### Action encoding
+
+The `waitingFor` `PlayerInputModel` is a recursive tree. Flatten it to a canonical list of leaf options:
+- Walk the tree depth-first, collect all leaf choices (e.g. each `OrOptions` option, each selectable card)
+- Pad to a fixed maximum (128 options) with -∞ masking for invalid slots
+- The AI outputs 128 logits; apply mask before softmax
+
+This avoids a fixed global action space and handles the variable 2–100+ actions per decision.
+
+---
+
+## Model Architecture (`model.py`)
+
+**`PolicyValueNet` (MLP):**
 
 ```python
-import os
-from dataclasses import dataclass
-from typing import List
-
-
-@dataclass
-class ModelConfig:
-    state_dim: int = 512
-    hidden_sizes: List[int] = (512, 512, 512)
-    action_space_size: int = 64
-    model_path: str = os.getenv("MODEL_PATH", "models/policy_value.pt")
-
-
-@dataclass
-class AppConfig:
-    model_version: str = os.getenv("MODEL_VERSION", "0.1.0")
-    git_commit: str = os.getenv("GIT_COMMIT", "dev")
-    model: ModelConfig = ModelConfig()
-```
-
-### `src/tm_ai_server/model.py`
-
-```python
-from typing import Tuple
-
 import torch
 import torch.nn as nn
+from typing import Tuple
 
 
 class PolicyValueNet(nn.Module):
-    def __init__(self, state_dim: int, hidden_sizes, action_space_size: int):
+    def __init__(self, state_dim: int, hidden_sizes: list[int], action_space_size: int):
         super().__init__()
         layers = []
-        input_dim = state_dim
+        in_dim = state_dim
         for h in hidden_sizes:
-            layers.append(nn.Linear(input_dim, h))
-            layers.append(nn.ReLU())
-            input_dim = h
+            layers += [nn.Linear(in_dim, h), nn.LayerNorm(h), nn.ReLU(), nn.Dropout(0.1)]
+            in_dim = h
         self.backbone = nn.Sequential(*layers)
-        self.policy_head = nn.Linear(input_dim, action_space_size)
-        self.value_head = nn.Linear(input_dim, 1)
+        self.policy_head = nn.Linear(in_dim, action_space_size)
+        self.value_head = nn.Linear(in_dim, 1)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         features = self.backbone(x)
         logits = self.policy_head(features)
+        logits = logits.masked_fill(~mask, float('-inf'))
         value = self.value_head(features).squeeze(-1)
         return logits, value
 ```
 
-### `src/tm_ai_server/encoding.py`
+Default config: `hidden_sizes=[512, 512, 512]`, `action_space_size=128`.
 
-```python
-from typing import List, Tuple
+---
 
-import numpy as np
-import torch
+## Training Pipeline
 
-from .schemas import GameState, LegalAction
+### Phase 1 — Supervised learning from human games
 
+- **Input**: `(state_vector, action_mask, chosen_action_index)` tuples from human decision logs
+- **Policy loss**: cross-entropy between policy head logits and chosen action index
+- **Value loss**: MSE between value head output and normalized final rank reward
+- **Reward normalization**: `rank_reward = (num_players - rank) / (num_players - 1)` → range [0, 1]
+- **Target**: 10–50 epochs, batch size 64–256, CPU sufficient
 
-def encode_state(game_state: GameState) -> np.ndarray:
-    # Platzhalter – hier später echte Features bauen
-    # z.B. globale Werte, pro Spieler aggregierte Stats, Hand-Features etc.
-    # Jetzt nur Dummy-Vektor, damit der Skeleton kompilierbar ist.
-    vec = np.zeros(512, dtype=np.float32)
-    vec[0] = game_state.global_.generation
-    vec [huggingface](https://huggingface.co/blog/deep-rl-ppo) = game_state.global_.temperature
-    vec [datacamp](https://www.datacamp.com/tutorial/proximal-policy-optimization) = game_state.global_.oxygen
-    vec[3] = game_state.global_.oceans
-    # TODO: weitere Features einbauen
-    return vec
+### Phase 2 — PPO self-play (cloud GPU)
 
+The `env_tm.py` Gymnasium environment wraps the TM server over HTTP:
+- `reset()`: POST to TM server to start a new game, return initial state
+- `step(action)`: send `input_response`, receive next state + reward
+- **Reward**: relative scoring = `(player_vp - mean_opponent_vp) / reference_vp`
+  - Gives learning signal to all players, not just the winner
+  - Switch to rank-based reward once agent stabilises
 
-def build_action_space(legal_actions: List[LegalAction]) -> Tuple[List[LegalAction], torch.Tensor]:
-    """
-    Placeholder: im Moment ist ACTION_SPACE == legal_actions.
-    Später: globaler Action-Space (z.B. 64 Slots) + Maske.
-    """
-    n = len(legal_actions)
-    mask = torch.zeros(n, dtype=torch.bool)
-    mask[:] = True
-    return legal_actions, mask
+Stable-Baselines3 PPO hyperparameters (starting values):
+
+| Parameter | Value |
+|---|---|
+| `learning_rate` | 3e-4 |
+| `gamma` | 0.99 |
+| `gae_lambda` | 0.95 |
+| `clip_range` | 0.2 |
+| `n_steps` | collect several thousand steps per update |
+
+Initialise PPO from the supervised model checkpoint.
+
+---
+
+## Training Data
+
+### Existing data
+
+The 80 exported JSON files in `logs/json/` **contain only display log messages** (the game event log), not game states or actions. They are not usable for training.
+
+The SQLite database (`db/game.db` in the TM server repo) contains the full `SerializedGame` JSON at every save point: 82 games, 11,192 saves. This is the source for training data.
+
+**Export strategy — two parallel tracks:**
+
+1. **Plan A (historical)**: Re-run the game engine on each DB save to recover the `waitingFor` decision tree. See `TM-adaption.md` for full analysis, risks, and the `export_training_data.ts` implementation plan.
+
+2. **Plan B (ongoing)**: Hook `Player.setWaitingFor()` + `Player.process()` in the TM server to log all decisions (human and AI) in real time. Produces clean training tuples without any inference or diffing.
+
+### Training log format consumed by `dataset.py`
+
+One JSON file per game (written by Plan B or produced by the Plan A export tool):
+
+```json
+{
+  "game_id": "g123...",
+  "game_spec": {
+    "board_name": "tharsis",
+    "player_count": 2,
+    "expansions": ["corpEra", "venus", "prelude"],
+    "variants": {"draftVariant": true},
+    "created_at": "2026-05-01T10:00:00.000Z"
+  },
+  "players": [
+    {"playerId": "p1", "name": "Alice", "isAI": false},
+    {"playerId": "p2", "name": "Bot", "isAI": true}
+  ],
+  "turns": [
+    {
+      "step": 0,
+      "playerId": "p1",
+      "generation": 3,
+      "phase": "action",
+      "state": {"game": {"..."}, "player": {"..."}},
+      "waitingFor": {"type": "or", "title": "Take action", "options": ["..."]},
+      "input_response": {"type": "or", "responses": [{"index": 1}]},
+      "is_human": true
+    }
+  ],
+  "final_result": {
+    "endGeneration": 14,
+    "playerResults": [
+      {"playerId": "p1", "tr": 67, "vp_total": 95, "rank": 1},
+      {"playerId": "p2", "tr": 55, "vp_total": 82, "rank": 2}
+    ]
+  }
+}
 ```
 
-### `src/tm_ai_server/inference.py`
+`dataset.py` filters on `is_human: true` for supervised pretraining and uses `final_result` to compute per-player rewards.
 
-```python
-from typing import List, Tuple
+---
 
-import torch
+## Deployment
 
-from .config import AppConfig
-from .encoding import encode_state, build_action_space
-from .model import PolicyValueNet
-from .schemas import GameState, LegalAction
-
-
-class InferenceEngine:
-    def __init__(self, config: AppConfig):
-        self.config = config
-        self.device = torch.device("cpu")  # später GPU optional
-        self.model = PolicyValueNet(
-            state_dim=config.model.state_dim,
-            hidden_sizes=config.model.hidden_sizes,
-            action_space_size=config.model.action_space_size,
-        ).to(self.device)
-        self.model.eval()
-        self._load_weights_if_available(config.model.model_path)
-
-    def _load_weights_if_available(self, path: str) -> None:
-        try:
-            state_dict = torch.load(path, map_location=self.device)
-            self.model.load_state_dict(state_dict)
-        except FileNotFoundError:
-            # Für den Anfang einfach uninitialisiertes Netz benutzen
-            pass
-
-    def select_action(
-        self,
-        state: GameState,
-        legal_actions: List[LegalAction],
-    ) -> Tuple[LegalAction, torch.Tensor, float]:
-        state_vec = encode_state(state)
-        state_tensor = torch.from_numpy(state_vec).unsqueeze(0).to(self.device)
-
-        action_space, action_mask = build_action_space(legal_actions)
-        logits, value = self.model(state_tensor)
-
-        # Auf legale Aktionen einschränken (hier: simple Variante)
-        logits = logits.squeeze(0)
-        if logits.shape[0] != len(action_space):
-            # Fallback: erste legale Aktion
-            return legal_actions[0], logits.detach().cpu(), float(value.item())
-
-        masked_logits = logits.clone()
-        masked_logits[~action_mask] = -1e9
-        probs = torch.softmax(masked_logits, dim=-1)
-        idx = torch.multinomial(probs, num_samples=1).item()
-
-        chosen_action = action_space[idx]
-        return chosen_action, logits.detach().cpu(), float(value.item())
-```
-
-### `src/tm_ai_server/main.py`
-
-```python
-from fastapi import FastAPI, HTTPException
-
-from .config import AppConfig
-from .inference import InferenceEngine
-from .schemas import (
-    HealthResponse,
-    MoveRequest,
-    MoveResponse,
-    MoveDebug,
-    VersionResponse,
-    VersionConfig,
-)
-
-app = FastAPI(title="TM AI Server", version="0.1.0")
-
-config = AppConfig()
-engine = InferenceEngine(config=config)
-
-
-@app.get("/health", response_model=HealthResponse)
-async def health() -> HealthResponse:
-    return HealthResponse(status="ok")
-
-
-@app.get("/version", response_model=VersionResponse)
-async def version() -> VersionResponse:
-    return VersionResponse(
-        model_version=config.model_version,
-        git_commit=config.git_commit,
-        config=VersionConfig(
-            state_dim=config.model.state_dim,
-            hidden_sizes=list(config.model.hidden_sizes),
-            action_space_size=config.model.action_space_size,
-        ),
-    )
-
-
-@app.post("/move", response_model=MoveResponse)
-async def move(req: MoveRequest) -> MoveResponse:
-    if not req.legal_actions:
-        raise HTTPException(status_code=400, detail="No legal_actions provided")
-
-    action, logits, value = engine.select_action(req.state, req.legal_actions)
-    debug = MoveDebug(
-        policy_logits=logits.tolist(),
-        value_estimate=value,
-    )
-    return MoveResponse(
-        action_id=action.action_id,
-        parameters=action.params,
-        debug=debug,
-    )
-```
-
-**Start (lokal):**
+### Local (CPU inference)
 
 ```bash
 uv run uvicorn tm_ai_server.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-***
+### Cloud (RunPod / Vast / Synpix)
+
+- CPU inference image: `pytorch/pytorch` + FastAPI server only
+- GPU training image: add CUDA, stable-baselines3
+- Entry points: `run_inference.sh`, `run_training.sh`
+- Checkpoints written to cloud volume or S3-compatible storage after N million steps
+
+### Model versioning
+
+```
+models/
+  policy_value_v0.1.0.pt
+  policy_value_v0.1.0.config.json   # state_dim, hidden_sizes, action_space_size
+  checkpoint_latest.pt              # symlink to latest
+```
+
+Version format: `v<major>.<minor>.<patch>`. Bump minor on architecture changes, patch on weight-only updates. Validate config compatibility on load.
+
+---
+
+## Implementation Status
+
+| Component | Status | Notes |
+|---|---|---|
+| Project structure + `pyproject.toml` | ✅ Done | All deps declared |
+| FastAPI skeleton (`main.py`) | ⚠️ Bug | Duplicate `if __name__ == "__main__"` block; second calls undefined `main()` — remove it |
+| `schemas.py` | ❌ Wrong format | Uses old snake_case + nested `global_` field; replace entirely with schemas above |
+| `encoding.py` | ❌ Not started | Blocks all downstream work |
+| `model.py` | ❌ Not started | |
+| `inference.py` | ❌ Not started | |
+| `config.py` | ❌ Not started | |
+| `dataset.py` | ❌ Not started | |
+| `train_supervised.py` | ❌ Not started | |
+| `env_tm.py` + `train_ppo.py` | ❌ Not started | Phase 2 |
+
+---
+
+## Design Decisions
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| API paradigm | `provide_input` (send full `PlayerInputModel`) | Avoids the hard `PlayerInput`-flattening problem on the TM server side; AI server handles it |
+| Action space | Flatten tree to padded list (max 128), mask invalid | Simple; upgrade to attention-based if needed later |
+| State features | Essential only first (~150 dims) | Add extended features after baseline converges |
+| Reward function | Relative scoring `(vp - mean_opponent_vp) / ref` | Gives signal to all players; switch to rank-based after stabilisation |
+| Model versioning | `v<major>.<minor>.<patch>` | Minor bump on architecture, patch on weights |
+| Error fallback | Log error, no action (current) → improve to random legal option | Safe default; prevents silent bad moves |
+| Training data | Plan A (re-export DB) + Plan B (real-time hook) | Both needed: Plan A for 82 historical games, Plan B for all future games |
