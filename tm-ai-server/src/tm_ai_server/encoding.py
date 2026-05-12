@@ -268,8 +268,11 @@ def index_to_response(waiting_for: dict, index: int) -> dict:
         cards = waiting_for.get("cards", [])
         if not cards:
             return {"type": "card", "cards": []}
-        chosen = cards[index] if index < len(cards) else {}
-        return {"type": "card", "cards": [chosen.get("name", "")]}
+        min_count = max(waiting_for.get("min", 1), 1)
+        n = len(cards)
+        # Pick min_count cards starting at index, wrapping around
+        selected = [cards[(index + i) % n].get("name", "") for i in range(min(min_count, n))]
+        return {"type": "card", "cards": selected}
 
     elif node_type == "projectCard":
         cards = waiting_for.get("cards", [])
