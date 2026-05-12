@@ -1,13 +1,11 @@
 """
 Phase 2: Gymnasium environment wrapping the TM server over HTTP.
 
-The TM server must expose:
-  POST /api/ai/new-game  → {game_id, player_id, state, waitingFor}
-  POST /api/ai/step      → {input_response} → {state, waitingFor, done, result}
+The TM server exposes:
+  POST /api/ai/new-game  → {game_id, player_id, state, waitingFor, game_spec}
+  POST /api/ai/step      → {input_response} → {player_id, state, waitingFor, done, result}
 
-These endpoints are NOT yet implemented in the TM server (Phase 2 work).
-This file provides the environment skeleton so training code can be written
-and tested independently.
+Each step represents one player decision; the model plays all positions (both AI players).
 """
 
 from __future__ import annotations
@@ -23,11 +21,8 @@ from ..encoding import build_mask, encode_state, flatten_options, index_to_respo
 
 logger = logging.getLogger(__name__)
 
-# Fallback game config for reset (override via env kwargs)
 DEFAULT_GAME_CONFIG = {
-    "playerCount": 2,
     "boardName": "tharsis",
-    "corporateEra": True,
 }
 
 
@@ -37,15 +32,20 @@ class TerraformingMarsEnv(gym.Env):
 
     Observation: float32 vector of shape (STATE_DIM,)
     Action:      Discrete(ACTION_SPACE_SIZE) — index into flattened options list
-    Reward:      relative VP score at game end = (player_vp - mean_opponent_vp) / reference_vp
+    Reward:      relative VP at game end; 0 at intermediate steps
+
+    The model plays as all players alternately. After each step, the
+    observation switches to the perspective of whoever is next to act.
     """
 
     metadata = {"render_modes": []}
 
-    def __init__(self, server_url: str = TM_SERVER_URL, game_config: dict | None = None):
+    def __init__(self, server_url: str = TM_SERVER_URL, game_config: dict | None = None,
+                 log_dir: str | None = None):
         super().__init__()
         self.server_url = server_url.rstrip("/")
-        self.game_config = game_config or DEFAULT_GAME_CONFIG
+        self.game_config = {**DEFAULT_GAME_CONFIG, **(game_config or {})}
+        self.log_dir = log_dir
         self.observation_space = gym.spaces.Box(
             low=-np.inf, high=np.inf, shape=(STATE_DIM,), dtype=np.float32
         )
@@ -59,10 +59,13 @@ class TerraformingMarsEnv(gym.Env):
 
     def reset(self, *, seed: int | None = None, options: dict | None = None) -> tuple[np.ndarray, dict]:
         super().reset(seed=seed)
+        payload = dict(self.game_config)
+        if self.log_dir:
+            payload["logDir"] = self.log_dir
         resp = requests.post(
             f"{self.server_url}/api/ai/new-game",
-            json=self.game_config,
-            timeout=10,
+            json=payload,
+            timeout=30,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -73,9 +76,8 @@ class TerraformingMarsEnv(gym.Env):
         self._game_spec = data.get("game_spec")
         self._state = data["state"]
 
-        obs = encode_state(self._state, self._game_spec)
-        info = {"game_id": self._game_id, "waiting_for": self._waiting_for}
-        return obs, info
+        obs = encode_state(self._state, None)
+        return obs, {"game_id": self._game_id, "player_id": self._player_id}
 
     def step(self, action: int) -> tuple[np.ndarray, float, bool, bool, dict]:
         if self._waiting_for is None or self._game_id is None:
@@ -92,23 +94,33 @@ class TerraformingMarsEnv(gym.Env):
                 "player_id": self._player_id,
                 "input_response": input_response,
             },
-            timeout=10,
+            timeout=30,
         )
         resp.raise_for_status()
         data = resp.json()
 
-        self._state = data["state"]
-        self._waiting_for = data.get("waitingFor")
         done = data.get("done", False)
-        result = data.get("result", {})
+        result = data.get("result") or {}
 
-        obs = encode_state(self._state, self._game_spec)
-        reward = self._compute_reward(result) if done else 0.0
-        info = {"waiting_for": self._waiting_for, "result": result}
+        if done:
+            # Return zero obs on game end; reset() will provide the next obs
+            obs = np.zeros(STATE_DIM, dtype=np.float32)
+            reward = self._compute_reward(result)
+            self._state = None
+            self._waiting_for = None
+            self._player_id = None
+        else:
+            self._state = data["state"]
+            self._waiting_for = data.get("waitingFor")
+            self._player_id = data["player_id"]
+            obs = encode_state(self._state, None)
+            reward = 0.0
+
+        info = {"player_id": self._player_id, "result": result, "game_id": self._game_id}
         return obs, reward, done, False, info
 
     def action_masks(self) -> np.ndarray:
-        """Return the valid-action boolean mask for the current step (MaskablePPO)."""
+        """Return valid-action mask for current step (used by MaskablePPO)."""
         if self._waiting_for is None:
             return np.zeros(ACTION_SPACE_SIZE, dtype=bool)
         options = flatten_options(self._waiting_for)
@@ -119,11 +131,12 @@ class TerraformingMarsEnv(gym.Env):
         if not player_results:
             return 0.0
         vps = [r.get("vp_total", 0) for r in player_results]
+        # The last _player_id before done was the one who triggered game end
         my_vp = next(
             (r.get("vp_total", 0) for r in player_results if r.get("playerId") == self._player_id),
-            0,
+            sum(vps) / len(vps) if vps else 0,
         )
-        other_vps = [v for r, v in zip(player_results, vps) if r.get("playerId") != self._player_id]
+        other_vps = [r.get("vp_total", 0) for r in player_results if r.get("playerId") != self._player_id]
         mean_other = sum(other_vps) / len(other_vps) if other_vps else 0
         reference_vp = max(vps) if vps else 1
         return (my_vp - mean_other) / max(reference_vp, 1)

@@ -31,7 +31,9 @@ The existing game loop must remain intact; AI behavior is a clean extension poin
 | `isAI` flag from game creation API | ✅ Done | `src/server/routes/ApiCreateGame.ts` |
 | AI toggle in `CreateGameForm.vue` | ✅ Done | `src/client/components/create/CreateGameForm.vue` |
 | `isAI` exposed in `ServerModel` / `PlayerModel` | ✅ Done | `src/server/models/ServerModel.ts` |
-| Plan A: `export_training_data.ts` (re-run engine on DB saves) | ❌ Not started | `src/server/tools/export_training_data.ts` |
+| Plan A: `export_training_data.ts` (re-run engine on DB saves) | ✅ Done | `src/server/tools/export_training_data.ts` |
+| Self-play `POST /api/ai/new-game` + `/api/ai/step` | ✅ Done | `src/server/routes/ApiAiSelfPlay.ts` |
+| `game.isSelfPlay` flag (suppresses auto AI trigger) | ✅ Done | `src/server/Game.ts`, `IGame.ts`, `Player.ts` |
 
 ---
 
@@ -148,7 +150,56 @@ Three record types, one per line:
 
 ---
 
-## Plan A: Re-run Engine on DB Saves (remaining work)
+## Self-Play API (Phase 2)
+
+Two endpoints for PPO self-play training, implemented in `src/server/routes/ApiAiSelfPlay.ts`.
+
+### `POST /api/ai/new-game`
+Creates a 2-player self-play game (both players have `isAI=true`, `game.isSelfPlay=true`).
+`isSelfPlay` suppresses the auto `requestAiMove()` trigger in `setWaitingFor()`.
+
+Request body (all optional):
+```json
+{"boardName": "tharsis", "logDir": "logs/selfplay/<run_id>"}
+```
+
+Response:
+```json
+{
+  "game_id": "g...",
+  "player_id": "p...",
+  "state": {...},
+  "waitingFor": {...},
+  "game_spec": {...}
+}
+```
+
+### `POST /api/ai/step`
+Applies one player's `InputResponse`, returns the next player's state or end-of-game result.
+
+Request:
+```json
+{"game_id": "g...", "player_id": "p...", "input_response": {...}}
+```
+
+Response (mid-game):
+```json
+{"done": false, "player_id": "p...", "state": {...}, "waitingFor": {...}, "result": null}
+```
+
+Response (game over):
+```json
+{
+  "done": true, "player_id": null, "state": null, "waitingFor": null,
+  "result": {"endGeneration": 14, "playerResults": [{"playerId":"p...","tr":67,"vp_total":95,"rank":1},...]}
+}
+```
+
+The Python env (`env_tm.py`) calls these endpoints sequentially; the model plays both AI players.
+
+---
+
+## Plan A: Re-run Engine on DB Saves
 
 **Goal:** Extract training tuples from the 82 existing historical games in the SQLite DB.
 
@@ -192,4 +243,7 @@ Full union of types: `OrOptions | AndOptions | SelectInitialCards | SelectOption
 | `src/common/game/NewGameConfig.ts` | isAI field on NewPlayerModel | ✅ Done |
 | `src/client/components/create/CreateGameForm.vue` | AI player checkbox in game setup UI | ✅ Done |
 | `src/server/tools/export_all_logs.ts` | Exports game display logs (not training data) | ✅ Done |
-| `src/server/tools/export_training_data.ts` | Re-run engine on DB saves (Plan A) | ❌ To create |
+| `src/server/tools/export_training_data.ts` | Re-run engine on DB saves (Plan A) | ✅ Done |
+| `src/server/routes/ApiAiSelfPlay.ts` | POST /api/ai/new-game + /api/ai/step | ✅ Done |
+| `src/server/IGame.ts` | `isSelfPlay: boolean` field | ✅ Done |
+| `src/common/app/paths.ts` | `API_AI_NEW_GAME` + `API_AI_STEP` path constants | ✅ Done |

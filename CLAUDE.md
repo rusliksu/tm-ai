@@ -17,7 +17,7 @@ All Python commands run from `tm-ai-server/` using `uv`:
 
 ```bash
 # Run the AI server
-cd tm-ai-server && uv run uvicorn tm_ai_server.main:app --reload --host 0.0.0.0 --port 8000
+cd tm-ai-server && MODEL_PATH=../models/checkpoint_best.pt uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000
 
 # Run tests
 cd tm-ai-server && uv run pytest tests/ -v
@@ -27,7 +27,15 @@ cd tm-ai-server && uv run pytest tests/test_encoding.py::test_flatten_or_options
 
 # Phase 1 supervised training
 cd tm-ai-server && uv run python -m tm_ai_server.training.train_supervised \
-    --data-dir logs/training --output-dir models --epochs 50
+    --data-dir ../logs/training --output-dir ../models --epochs 50
+
+# Phase 2 PPO self-play training (TM server must be running)
+cd tm-ai-server && uv run python -m tm_ai_server.training.train_ppo \
+    --checkpoint ../models/checkpoint_best.pt \
+    --output-dir ../models \
+    --log-dir ../logs/selfplay \
+    --total-steps 5_000_000 \
+    --checkpoint-interval 100
 
 # Add a dependency
 cd tm-ai-server && uv add <package>
@@ -39,11 +47,11 @@ For the TM game server (`/home/pmunk/workspace/terraforming-mars`):
 # Build TypeScript
 npm run build:server
 
-# Re-export display logs from SQLite DB → logs/json/
-npx tsx src/server/tools/export_all_logs.ts logs/json
+# Start TM server
+node build/src/server/server.js >> /tmp/tm-server.log 2>&1 &
 
-# Copy exported logs to tm-ai
-cp /home/pmunk/workspace/terraforming-mars/logs/json/*.json /home/pmunk/workspace/tm-ai/logs/json/
+# Re-export historical training data
+npx tsx src/server/tools/export_training_data.ts /home/pmunk/workspace/tm-ai/logs/training
 ```
 
 ## Project Structure
@@ -55,22 +63,23 @@ tm-ai-server/
   src/tm_ai_server/
     main.py                   # FastAPI app — /move, /health, /version
     schemas.py                # Pydantic models matching TM server camelCase output
-    config.py                 # STATE_DIM=55, constants for phases/boards/tags/expansions
+    config.py                 # STATE_DIM=492, 199-card vocab, normalisation caps
     model.py                  # PolicyValueNet (backbone + policy head + value head)
     encoding.py               # encode_state(), flatten_options(), index_to_response(), response_to_index()
     inference.py              # load_model(), select_action(); random fallback if no checkpoint
     training/
       dataset.py              # TMDataset: reads per-game JSONL logs from Plan B
       train_supervised.py     # Phase 1: cross-entropy policy + MSE value, checkpointing
-      env_tm.py               # Phase 2: Gymnasium env (skeleton; needs TM server Phase-2 endpoints)
-      train_ppo.py            # Phase 2: MaskablePPO (skeleton; needs sb3-contrib + env_tm)
+      env_tm.py               # Phase 2: Gymnasium env wrapping /api/ai/new-game + /api/ai/step
+      train_ppo.py            # Phase 2: MaskablePPO with full per-run logging
   tests/
     test_encoding.py          # 16 tests for encode_state, flatten_options, index_to_response
     test_schemas.py           # 4 tests for Pydantic schema parsing
 
-logs/json/                    # 82 exported game display logs (gitignored) — NOT training data
-logs/training/                # Plan B JSONL files — written by TM server during live games
-models/                       # Model checkpoints (checkpoint_best.pt, checkpoint_latest.pt)
+logs/training/                # Plan B JSONL files — live human/AI games
+logs/selfplay/                # Self-play run directories: <run_id>/manifest.json, metrics.jsonl, game JSONLs
+models/                       # Supervised checkpoints (checkpoint_best.pt, checkpoint_latest.pt)
+models/selfplay/<run_id>/     # PPO checkpoints: checkpoint_<N>.pt, checkpoint_best.pt, checkpoint_latest.pt
 specs/
   TM-AI.md                   # AI server spec: schemas, model arch, training pipeline
   TM-adaption.md             # TM server integration spec (canonical — only copy)
@@ -80,9 +89,9 @@ specs/
 
 The TM game server calls `POST /move` with:
 - `state.game` — global state (camelCase: `generation`, `oxygen`, `temperature`, `oceanCount`)
-- `state.player` — active player resources/production/tags/playedCards
-- `state.opponents` — all other players (same fields)
-- `state.board` — placed tiles (spaceId, x, y, tileType, playerColor)
+- `state.player` — active player resources/production/tags/playedCards/cardResources (per-card)
+- `state.opponents` — all other players (same fields including handSize)
+- `state.board` — placed tiles (id, x, y, tileType, playerColor)
 - `state.milestones` / `state.awards` — claimed/funded
 - `state.waitingFor` — full `PlayerInputModel` decision tree
 - `legal_actions[0]` — always `{action_id:"provide_input", payload:{input:<PlayerInputModel>}}`
@@ -91,37 +100,61 @@ Response: `{input_response:{...}, debug:{...}}` — `input_response` goes direct
 
 **Critical:** `OrOptions` response is `{type:"or", index:N, response:<InputResponse>}` — **not** `responses:[{index:N}]`. See `encoding.py` docstring for all types.
 
+## Self-Play API (Phase 2)
+
+Two new TM server endpoints for PPO training:
+
+**`POST /api/ai/new-game`** — creates a 2-player self-play game (both AI, `isSelfPlay=true` suppresses auto `requestAiMove()`):
+```json
+{"boardName":"tharsis", "logDir":"logs/selfplay/<run_id>"}
+→ {"game_id":"g...", "player_id":"p...", "state":{...}, "waitingFor":{...}, "game_spec":{...}}
+```
+
+**`POST /api/ai/step`** — applies one player's decision, returns next state:
+```json
+{"game_id":"g...", "player_id":"p...", "input_response":{...}}
+→ {"done":false, "player_id":"p...", "state":{...}, "waitingFor":{...}, "result":null}
+→ {"done":true, "player_id":null, "state":null, "waitingFor":null, "result":{...}}
+```
+
+`game.isSelfPlay=true` prevents `setWaitingFor()` from auto-triggering `requestAiMove()`.
+
 ## State Encoding
 
-`STATE_DIM = 55` (essential features):
+`STATE_DIM = 492`:
 - Global (9): generation, temperature, oxygen, oceans, phase one-hot (5 classes)
-- Player (27): 7 resources + 6 production + 13 tags + 1 handSize
+- Self (230): 7 resources + 6 production + 13 tags + 1 handSize + 199 per-card resources + 1 played_count + 3 board_tiles
+- Opponent (230): same as self (handSize visible to all players)
+- Milestones/Awards (4): ms_self, ms_total, aw_self, aw_total
 - Config (19): player_count + 5 board one-hot + 13 expansion flags
 
-Note: `state.opponents`, `state.board`, `state.milestones`, `state.awards` are now sent by the TM server but not yet encoded. Add them to `encoding.py` and update `STATE_DIM` when extending features.
+`cardResources` is sent as `{cardName: count}` per-card (199-card vocab in `config.py`).
+Config dims are always zeroed (game_spec=None) for train/inference consistency.
 
 ## Training Data
 
-**`logs/json/`** — display-message logs only, not usable for training.
+**`logs/training/`** — supervised training data (human + AI live games). JSONL format:
+- Line 1: `{type:"meta", game_spec:{...}, players:[...]}`
+- Middle: `{type:"turn", state:{...}, waitingFor:{...}, input_response:{...}, is_human:bool}`
+- Last: `{type:"result", endGeneration:N, playerResults:[...]}`
 
-**`logs/training/`** — real training data from Plan B (live games). JSONL format:
-- Line 1: `{type:"meta", game_spec:{...}, players:[...]}` — written at game creation
-- Middle lines: `{type:"turn", state:{...}, waitingFor:{...}, input_response:{...}, is_human:bool}`
-- Last line: `{type:"result", endGeneration:N, playerResults:[...]}`
-
-`dataset.py` reads this format and skips games missing meta or result lines.
+**`logs/selfplay/<run_id>/`** — self-play game JSONLs (same format, written by TrainingLogger with per-run `logDir`).
 
 ## TM Server Integration Points
 
 Key files in `/home/pmunk/workspace/terraforming-mars/src/server/`:
-- `Player.ts` — isAI, setWaitingFor (captures pendingTrainingState), process (logs turn), requestAiMove with fallback, takeAction (saveBeforeTakingAction fixed)
-  - `_aiMoveInProgress` flag prevents infinite retry loop when `process()` throws
-  - After successful `process()`, `requestAiMove()` is re-triggered if a new `waitingFor` was set by the callback chain (fixes AI getting stuck mid-phase)
-- `Game.ts` — writeResult in gotoEndGame
+- `Player.ts` — isAI, setWaitingFor (Plan B capture + AI trigger), process (logs turn), requestAiMove with fallback
+  - `_aiMoveInProgress` flag prevents infinite retry loop
+  - `!game.isSelfPlay` guard prevents auto-trigger during self-play
+  - After successful `process()`, re-triggers `requestAiMove()` if new `waitingFor` was set
+- `Game.ts` — `isSelfPlay: boolean` field; set via `newInstance(..., isSelfPlay=true)` before `gotoInitialPhase()`; writeResult in gotoEndGame
+- `IGame.ts` — `isSelfPlay: boolean` in interface
 - `ai/AiClient.ts` — HTTP client to AI server (5s timeout, reads `AI_SERVER_URL` from env)
-- `ai/stateMapping.ts` — full state (player + opponents + board + milestones + awards + playedCards)
-- `ai/TrainingLogger.ts` — writeMeta / appendTurn / writeResult; per-game JSONL
+- `ai/stateMapping.ts` — full state; `cardResources` is per-card `{name: count}`
+- `ai/TrainingLogger.ts` — accepts optional `logDir` in constructor; writeMeta/appendTurn/writeResult
+- `routes/ApiAiSelfPlay.ts` — `POST /api/ai/new-game` and `POST /api/ai/step`
 - `routes/ApiCreateGame.ts` — isAI flag, writeMeta at game creation
+- `common/app/paths.ts` — `API_AI_NEW_GAME` and `API_AI_STEP` path constants
 
 ## Running the Stack
 
@@ -134,11 +167,11 @@ npm run build:server
 node build/src/server/server.js >> /tmp/tm-server.log 2>&1 &
 
 # 3. Open http://localhost:8080 and create a game with an AI player
+# — or run PPO self-play training (see Commands above)
 ```
 
 ## Remaining Work
 
-- **Evaluate model**: play several human-vs-AI games; compare win rate and game length vs random policy
-- **Collect more live data**: after 5–10 more games retrain (`train_supervised.py`) to improve action-phase decisions
-- **Extend `encode_state()`**: add opponent features, board tile encoding, milestones/awards (data is already in the request; update `STATE_DIM` and retrain)
-- **Phase 2 (self-play)**: implement TM server endpoints `/api/ai/new-game` and `/api/ai/step` for Gymnasium env / PPO training; see Phase 6 in `TODO.md` for full logging requirements
+- **PPO self-play**: run `train_ppo.py` locally, monitor win rate in `metrics.jsonl`
+- **Spatial board encoding**: add x/y grid tile positions to `encode_state()` (data already in request)
+- **Phase 3 (cloud)**: Docker images + cloud deployment for GPU PPO training (Phase 7 in TODO.md)

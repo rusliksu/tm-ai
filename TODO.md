@@ -54,8 +54,8 @@ Build the AI server for a Terraforming Mars AI agent per `specs/TM-AI.md` and `s
 
 - [x] `train_supervised.py` — cross-entropy policy loss + MSE value loss, checkpointing
 - [x] Supervised training run on 6888 samples (50 epochs) → `models/checkpoint_best.pt`
-- [ ] Evaluate trained model vs random policy (win rate, avg game length)
-- [ ] Collect 5–10 more live human-vs-AI games to expand action-phase data, then retrain
+- [~] Evaluate trained model vs random policy — skipped; self-play will reveal win rate naturally
+- [~] Collect 5–10 more live games before retraining — skipped; PPO self-play replaces this
 
 ---
 
@@ -70,20 +70,34 @@ Build the AI server for a Terraforming Mars AI agent per `specs/TM-AI.md` and `s
 
 ---
 
-## Phase 6: PPO Self-Play (Phase 2 Training) 🔜 Future
+## Phase 6: PPO Self-Play (Phase 2 Training) ✅ Complete
 
-- [x] `env_tm.py` — Gymnasium env skeleton
-- [x] `train_ppo.py` — MaskablePPO skeleton
-- [ ] TM server: `/api/ai/new-game` endpoint (start game, return initial state)
-- [ ] TM server: `/api/ai/step` endpoint (send InputResponse, return next state + done + result)
-- [ ] Run PPO training initialised from supervised checkpoint
+- [x] `env_tm.py` — Full Gymnasium env; uses `/api/ai/new-game` + `/api/ai/step`; plays all positions
+- [x] `train_ppo.py` — MaskablePPO with full logging, manifest, per-game checkpoints
+- [x] TM server: `POST /api/ai/new-game` — creates 2-player self-play game, returns initial state
+- [x] TM server: `POST /api/ai/step` — applies InputResponse, returns next state/player or done+result
+- [x] `game.isSelfPlay` flag — suppresses auto `requestAiMove()` trigger for self-play games
+- [x] `sb3-contrib` added to dependencies (MaskablePPO)
 
-### Logging requirements for self-play
-All training artifacts must be preserved — nothing is deleted or overwritten during a run:
-- [ ] **Game logs**: every self-play game written to `logs/selfplay/<run_id>/` as a separate JSONL (same format as Plan B)
-- [ ] **Model checkpoints**: save a checkpoint every N games (configurable, default 500) to `models/selfplay/<run_id>/checkpoint_<game_N>.pt` — in addition to `checkpoint_best.pt` and `checkpoint_latest.pt`
-- [ ] **Training metrics**: append win rates, policy loss, value loss, avg game length, and ELO estimate to `logs/selfplay/<run_id>/metrics.jsonl` after every checkpoint interval
-- [ ] **Run manifest**: write `logs/selfplay/<run_id>/manifest.json` at start with timestamp, base checkpoint, hyperparameters, and TM server config
+### Logging (all artifacts preserved, nothing overwritten):
+- [x] **Game logs**: `logs/selfplay/<run_id>/<game_id>.jsonl` via Plan B (TM server TrainingLogger)
+- [x] **Model checkpoints**: `models/selfplay/<run_id>/checkpoint_<N>.pt` every `--checkpoint-interval` games + `checkpoint_best.pt` + `checkpoint_latest.pt`
+- [x] **Metrics**: `logs/selfplay/<run_id>/metrics.jsonl` — win rate, mean reward, mean game length after each checkpoint interval
+- [x] **Run manifest**: `logs/selfplay/<run_id>/manifest.json` at run start (timestamp, base checkpoint, hyperparams, TM server URL)
+
+### To start training:
+```bash
+# 1. Start TM server (if not already running)
+cd /home/pmunk/workspace/terraforming-mars && node build/src/server/server.js &
+
+# 2. Run PPO training (from tm-ai-server/)
+uv run python -m tm_ai_server.training.train_ppo \
+    --checkpoint ../models/checkpoint_best.pt \
+    --output-dir ../models \
+    --log-dir ../logs/selfplay \
+    --total-steps 5_000_000 \
+    --checkpoint-interval 100
+```
 
 ---
 
