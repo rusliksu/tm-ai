@@ -115,14 +115,30 @@ Note: `state.opponents`, `state.board`, `state.milestones`, `state.awards` are n
 
 Key files in `/home/pmunk/workspace/terraforming-mars/src/server/`:
 - `Player.ts` — isAI, setWaitingFor (captures pendingTrainingState), process (logs turn), requestAiMove with fallback, takeAction (saveBeforeTakingAction fixed)
+  - `_aiMoveInProgress` flag prevents infinite retry loop when `process()` throws
+  - After successful `process()`, `requestAiMove()` is re-triggered if a new `waitingFor` was set by the callback chain (fixes AI getting stuck mid-phase)
 - `Game.ts` — writeResult in gotoEndGame
-- `ai/AiClient.ts` — HTTP client to AI server
+- `ai/AiClient.ts` — HTTP client to AI server (5s timeout, reads `AI_SERVER_URL` from env)
 - `ai/stateMapping.ts` — full state (player + opponents + board + milestones + awards + playedCards)
 - `ai/TrainingLogger.ts` — writeMeta / appendTurn / writeResult; per-game JSONL
 - `routes/ApiCreateGame.ts` — isAI flag, writeMeta at game creation
 
+## Running the Stack
+
+```bash
+# 1. Start AI server (from tm-ai-server/)
+MODEL_PATH=../models/checkpoint_best.pt uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000
+
+# 2. Build and start TM server (from terraforming-mars/)
+npm run build:server
+node build/src/server/server.js >> /tmp/tm-server.log 2>&1 &
+
+# 3. Open http://localhost:8080 and create a game with an AI player
+```
+
 ## Remaining Work
 
-- **Plan A** (`export_training_data.ts`): re-run engine on 82 historical DB saves to extract training tuples without live games
-- **Extend `encode_state()`**: add opponent features, board tile encoding, milestones/awards (data is already in the request)
-- **Phase 2**: implement TM server endpoints `/api/ai/new-game` and `/api/ai/step` for Gymnasium env / PPO training
+- **Evaluate model**: play several human-vs-AI games; compare win rate and game length vs random policy
+- **Collect more live data**: after 5–10 more games retrain (`train_supervised.py`) to improve action-phase decisions
+- **Extend `encode_state()`**: add opponent features, board tile encoding, milestones/awards (data is already in the request; update `STATE_DIM` and retrain)
+- **Phase 2 (self-play)**: implement TM server endpoints `/api/ai/new-game` and `/api/ai/step` for Gymnasium env / PPO training; see Phase 6 in `TODO.md` for full logging requirements

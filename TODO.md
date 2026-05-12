@@ -33,6 +33,8 @@ Build the AI server for a Terraforming Mars AI agent per `specs/TM-AI.md` and `s
 - [x] `Game.ts` — writeResult at game end (gotoEndGame)
 - [x] `CreateGameForm.vue` — AI player checkbox in game setup UI
 - [x] `ServerModel.ts` — isAI exposed in game/player models
+- [x] `_aiMoveInProgress` flag — prevents infinite retry loop when `process()` throws InputError
+- [x] Re-trigger `requestAiMove()` after successful `process()` — fixes AI getting stuck when `process()` chains into a new `setWaitingFor()` while the flag is still set
 
 ---
 
@@ -42,22 +44,22 @@ Build the AI server for a Terraforming Mars AI agent per `specs/TM-AI.md` and `s
 - [x] `dataset.py` — reads JSONL format, extracts (state, mask, action, reward) tuples
 - [x] **Plan A**: `export_training_data.ts` — re-run engine on 82 historical DB saves
   - Captures research + drafting phases via cardsInHand/draftedCards diffs
-  - **Now also captures action phase** via log message matching (globalInitialize fix + inferResponseFromLogs)
-  - Produces 62 games / 8235 turns / 6888 usable training samples; output in logs/training/
-  - fix: `dataset.py` now passes `None` for game_spec (train/inference consistency)
+  - Captures action phase via log message matching (globalInitialize fix + inferResponseFromLogs)
+  - 62 games / 8235 turns / 6888 usable training samples; output in logs/training/
+  - `dataset.py` passes `None` for game_spec (train/inference consistency)
 
 ---
 
-## Phase 4: Training ⏳ In Progress
+## Phase 4: Training ✅ Complete (supervised baseline)
 
 - [x] `train_supervised.py` — cross-entropy policy loss + MSE value loss, checkpointing
-- [x] Run Phase 1 supervised training — **6888 samples** (research + drafting + action phase)
-  - Training running now: `uv run python -m tm_ai_server.training.train_supervised --data-dir ../logs/training --output-dir ../models --epochs 50`
-- [ ] Evaluate trained model vs random policy
+- [x] Supervised training run on 6888 samples (50 epochs) → `models/checkpoint_best.pt`
+- [ ] Evaluate trained model vs random policy (win rate, avg game length)
+- [ ] Collect 5–10 more live human-vs-AI games to expand action-phase data, then retrain
 
 ---
 
-## Phase 5: Extended Features
+## Phase 5: Extended State Features
 
 - [ ] Extend `encode_state()` to use `state.opponents` (already in request, not yet encoded)
 - [ ] Extend `encode_state()` to encode `state.board` tile positions
@@ -72,7 +74,14 @@ Build the AI server for a Terraforming Mars AI agent per `specs/TM-AI.md` and `s
 - [x] `train_ppo.py` — MaskablePPO skeleton
 - [ ] TM server: `/api/ai/new-game` endpoint (start game, return initial state)
 - [ ] TM server: `/api/ai/step` endpoint (send InputResponse, return next state + done + result)
-- [ ] Run PPO training on GPU (RunPod/Vast/Synpix), initialise from supervised checkpoint
+- [ ] Run PPO training initialised from supervised checkpoint
+
+### Logging requirements for self-play
+All training artifacts must be preserved — nothing is deleted or overwritten during a run:
+- [ ] **Game logs**: every self-play game written to `logs/selfplay/<run_id>/` as a separate JSONL (same format as Plan B)
+- [ ] **Model checkpoints**: save a checkpoint every N games (configurable, default 500) to `models/selfplay/<run_id>/checkpoint_<game_N>.pt` — in addition to `checkpoint_best.pt` and `checkpoint_latest.pt`
+- [ ] **Training metrics**: append win rates, policy loss, value loss, avg game length, and ELO estimate to `logs/selfplay/<run_id>/metrics.jsonl` after every checkpoint interval
+- [ ] **Run manifest**: write `logs/selfplay/<run_id>/manifest.json` at start with timestamp, base checkpoint, hyperparameters, and TM server config
 
 ---
 
