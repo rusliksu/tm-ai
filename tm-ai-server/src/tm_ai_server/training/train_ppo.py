@@ -68,8 +68,12 @@ class SelfPlayCallback:
         self._ep_reward = 0.0
         self._ep_len = 0
         self._metrics_path = run_dir / "metrics.jsonl"
+        # Per-game VP tracking (filled on done steps from result info)
+        self._winner_vps: list[float] = []
+        self._mean_vps: list[float] = []
+        self._end_generations: list[int] = []
 
-    def on_step(self, reward: float, done: bool) -> None:
+    def on_step(self, reward: float, done: bool, info: dict | None = None) -> None:
         self._ep_reward += reward
         self._ep_len += 1
         if done:
@@ -78,6 +82,15 @@ class SelfPlayCallback:
             self.episode_lengths.append(self._ep_len)
             self._ep_reward = 0.0
             self._ep_len = 0
+            # Extract VP scores and generation from game result
+            result = (info or {}).get("result") or {}
+            player_results = result.get("playerResults", [])
+            if player_results:
+                vps = [r.get("vp_total", 0) for r in player_results]
+                self._winner_vps.append(float(max(vps)))
+                self._mean_vps.append(float(sum(vps) / len(vps)))
+            if result.get("endGeneration"):
+                self._end_generations.append(int(result["endGeneration"]))
             if self.games_completed % self.checkpoint_interval == 0:
                 self._checkpoint()
 
@@ -85,14 +98,33 @@ class SelfPlayCallback:
         n = self.games_completed
         recent_rewards = self.episode_rewards[-self.checkpoint_interval:]
         recent_lengths = self.episode_lengths[-self.checkpoint_interval:]
+        recent_winner_vps = self._winner_vps[-self.checkpoint_interval:]
+        recent_mean_vps = self._mean_vps[-self.checkpoint_interval:]
+        recent_gens = self._end_generations[-self.checkpoint_interval:]
         mean_reward = float(np.mean(recent_rewards)) if recent_rewards else 0.0
         mean_length = float(np.mean(recent_lengths)) if recent_lengths else 0.0
         win_rate = float(np.mean([r > 0 for r in recent_rewards])) if recent_rewards else 0.0
+        mean_winner_vp = float(np.mean(recent_winner_vps)) if recent_winner_vps else 0.0
+        mean_vp = float(np.mean(recent_mean_vps)) if recent_mean_vps else 0.0
+        mean_generation = float(np.mean(recent_gens)) if recent_gens else 0.0
+
+        # Write custom scalars to TensorBoard
+        tb_logger = getattr(self.model_ref, "logger", None)
+        if tb_logger is not None:
+            tb_logger.record("selfplay/win_rate", win_rate)
+            tb_logger.record("selfplay/mean_reward", mean_reward)
+            tb_logger.record("selfplay/winner_vp", mean_winner_vp)
+            tb_logger.record("selfplay/mean_vp", mean_vp)
+            tb_logger.record("selfplay/mean_game_length", mean_length)
+            tb_logger.record("selfplay/mean_generation", mean_generation)
+            tb_logger.record("selfplay/games_completed", float(n))
+            tb_logger.dump(step=n)
 
         # Periodic numbered checkpoint
         ckpt_path = self.model_dir / f"checkpoint_{n}.pt"
         self.model_ref.save(str(ckpt_path))
-        logger.info("Saved checkpoint at game %d → %s (win_rate=%.3f)", n, ckpt_path, win_rate)
+        logger.info("Saved checkpoint at game %d → %s (win_rate=%.3f, winner_vp=%.1f)",
+                    n, ckpt_path, win_rate, mean_winner_vp)
 
         # Always update latest
         self.model_ref.save(str(self.model_dir / "checkpoint_latest"))
@@ -109,6 +141,9 @@ class SelfPlayCallback:
             "win_rate": win_rate,
             "mean_reward": mean_reward,
             "mean_game_length": mean_length,
+            "winner_vp": mean_winner_vp,
+            "mean_vp": mean_vp,
+            "mean_generation": mean_generation,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         with open(self._metrics_path, "a") as f:
@@ -213,8 +248,9 @@ def _train_with_callback(model: Any, env: Any, total_steps: int, cb: SelfPlayCal
             def _on_step(self) -> bool:
                 rewards = self.locals.get("rewards", [])
                 dones = self.locals.get("dones", [])
-                for r, d in zip(rewards, dones):
-                    self._outer.on_step(float(r), bool(d))
+                infos = self.locals.get("infos", [{}] * len(rewards))
+                for r, d, info in zip(rewards, dones, infos):
+                    self._outer.on_step(float(r), bool(d), info)
                 return True
 
         model.learn(total_timesteps=total_steps, callback=_GameCallback(cb), progress_bar=True)

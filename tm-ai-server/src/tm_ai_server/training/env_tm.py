@@ -84,6 +84,11 @@ class TerraformingMarsEnv(gym.Env):
             raise RuntimeError("Call reset() before step()")
 
         options = flatten_options(self._waiting_for)
+        if not options:
+            # No selectable options (shouldn't happen after encoding fixes, but guard anyway)
+            logger.warning("Empty options for game %s wf_type=%s; skipping step",
+                           self._game_id, self._waiting_for.get("type"))
+            return np.zeros(STATE_DIM, dtype=np.float32), 0.0, True, False, {"error": "empty_options"}
         option_index = options[min(action, len(options) - 1)]["index"]
         input_response = index_to_response(self._waiting_for, option_index)
 
