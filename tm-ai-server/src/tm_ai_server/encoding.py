@@ -80,7 +80,7 @@ def encode_state(state: dict, game_spec: dict | None = None) -> np.ndarray:
     # --- Player tags (13 dims) ---
     tags = player.get("tags", {})
     for tag in TAG_TYPES:
-        vec[pos] = min(tags.get(tag, 0), 20) / 20.0
+        vec[pos] = min(tags.get(tag) or 0, 20) / 20.0
         pos += 1
 
     # --- Hand size (1 dim) ---

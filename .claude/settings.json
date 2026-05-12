@@ -18,7 +18,8 @@
       "Bash(cp *)",
       "Bash(mkdir *)",
       "Bash(python3 *)",
-      "Bash(sqlite3 *)"
+      "Bash(sqlite3 *)",
+      "Bash(uv run *)"
     ]
   }
 }
