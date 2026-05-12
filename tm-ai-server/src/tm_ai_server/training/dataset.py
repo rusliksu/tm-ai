@@ -99,7 +99,7 @@ class TMDataset(Dataset):
             if action_idx >= len(options):
                 continue
 
-            state_vec = encode_state(state, game_spec)
+            state_vec = encode_state(state, None)
             mask = build_mask(len(options))
 
             player_result = player_results.get(player_id, {})

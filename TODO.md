@@ -36,22 +36,23 @@ Build the AI server for a Terraforming Mars AI agent per `specs/TM-AI.md` and `s
 
 ---
 
-## Phase 3: Training Data ⏳ In Progress
+## Phase 3: Training Data ✅ Complete (initial dataset)
 
 - [x] Plan B logging wired end-to-end (all future games produce JSONL training logs)
 - [x] `dataset.py` — reads JSONL format, extracts (state, mask, action, reward) tuples
-- [ ] **Plan A**: `export_training_data.ts` — re-run engine on 82 historical DB saves
-  - Load consecutive save pairs (N, N+1) from SQLite
-  - Deserialize save N → waitingFor populated automatically
-  - Diff log messages between saves to infer chosen action
-  - Write JSONL training logs compatible with dataset.py
+- [x] **Plan A**: `export_training_data.ts` — re-run engine on 82 historical DB saves
+  - Captures research + drafting phases via cardsInHand/draftedCards diffs
+  - **Now also captures action phase** via log message matching (globalInitialize fix + inferResponseFromLogs)
+  - Produces 62 games / 8235 turns / 6888 usable training samples; output in logs/training/
+  - fix: `dataset.py` now passes `None` for game_spec (train/inference consistency)
 
 ---
 
-## Phase 4: Training ⏳ Ready (waiting for data)
+## Phase 4: Training ⏳ In Progress
 
 - [x] `train_supervised.py` — cross-entropy policy loss + MSE value loss, checkpointing
-- [ ] Run Phase 1 supervised training once enough training data exists (>1000 turns)
+- [x] Run Phase 1 supervised training — **6888 samples** (research + drafting + action phase)
+  - Training running now: `uv run python -m tm_ai_server.training.train_supervised --data-dir ../logs/training --output-dir ../models --epochs 50`
 - [ ] Evaluate trained model vs random policy
 
 ---
