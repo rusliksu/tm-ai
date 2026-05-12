@@ -17,7 +17,73 @@ InputResponse wire format (from TM server InputResponse.ts):
 
 from __future__ import annotations
 import numpy as np
-from .config import PHASES, BOARDS, EXPANSION_FLAGS, TAG_TYPES, ACTION_SPACE_SIZE, STATE_DIM
+from .config import (
+    PHASES, BOARDS, EXPANSION_FLAGS, TAG_TYPES,
+    CARD_RESOURCE_TYPES, RESOURCE_CAPS, PRODUCTION_CAPS, CARD_RESOURCE_CAPS,
+    ACTION_SPACE_SIZE, STATE_DIM,
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _cap(value: float | int | None, cap: float) -> float:
+    return min(float(value or 0), cap) / cap
+
+
+def _encode_player(vec: np.ndarray, pos: int, p: dict, include_hand: bool = True) -> int:
+    """Encode a player snapshot into vec starting at pos. Returns new pos."""
+
+    # Resources (7) — including terraformRating
+    vec[pos] = _cap(p.get("terraformRating", 20), RESOURCE_CAPS["terraformRating"])
+    pos += 1
+    for res in ("megacredits", "steel", "titanium", "plants", "energy", "heat"):
+        vec[pos] = _cap(p.get(res, 0), RESOURCE_CAPS[res])
+        pos += 1
+
+    # Production (6)
+    prod = p.get("production", {})
+    mc_prod = prod.get("megacredits", 0) or 0
+    cap_mc = PRODUCTION_CAPS["megacredits"]
+    vec[pos] = (mc_prod + 5) / (cap_mc + 5)   # -5..+60 → 0..1
+    pos += 1
+    for res in ("steel", "titanium", "plants", "energy", "heat"):
+        cap = PRODUCTION_CAPS[res]
+        vec[pos] = min(float(prod.get(res, 0) or 0), cap) / cap
+        pos += 1
+
+    # Tags (13)
+    tags = p.get("tags", {})
+    for tag in TAG_TYPES:
+        vec[pos] = _cap(tags.get(tag) or 0, 20)
+        pos += 1
+
+    # Hand size (1) — omitted for opponents (hidden info)
+    if include_hand:
+        vec[pos] = _cap(p.get("handSize", 0), 10)
+        pos += 1
+
+    # Special card resources (6)
+    card_res = p.get("cardResources", {})
+    for cr in CARD_RESOURCE_TYPES:
+        vec[pos] = _cap(card_res.get(cr, 0), CARD_RESOURCE_CAPS[cr])
+        pos += 1
+
+    # Played card count (1)
+    vec[pos] = _cap(p.get("playedCardCount", len(p.get("playedCards", []))), 30)
+    pos += 1
+
+    # Board tiles (3): greenery, city, special
+    bt = p.get("boardTiles", {})
+    vec[pos] = _cap(bt.get("greenery", 0), 10)
+    pos += 1
+    vec[pos] = _cap(bt.get("city", 0), 10)
+    pos += 1
+    vec[pos] = _cap(bt.get("special", 0), 10)
+    pos += 1
+
+    return pos
 
 
 # ---------------------------------------------------------------------------
@@ -33,63 +99,51 @@ def encode_state(state: dict, game_spec: dict | None = None) -> np.ndarray:
     player = state.get("player", {})
 
     # --- Global (9 dims) ---
-    vec[pos] = game.get("generation", 1) / 20.0
+    vec[pos] = (game.get("generation", 1) or 1) / 20.0
     pos += 1
-    vec[pos] = (game.get("temperature", -30) + 30) / 38.0   # range -30..+8 → 0..1
+    vec[pos] = ((game.get("temperature", -30) or -30) + 30) / 38.0  # -30..+8 → 0..1
     pos += 1
-    vec[pos] = game.get("oxygen", 0) / 14.0
+    vec[pos] = (game.get("oxygen", 0) or 0) / 14.0
     pos += 1
-    vec[pos] = game.get("oceanCount", 0) / 9.0
+    vec[pos] = (game.get("oceanCount", 0) or 0) / 9.0
     pos += 1
     phase = game.get("phase", "action")
     if phase in PHASES:
         vec[pos + PHASES.index(phase)] = 1.0
     pos += len(PHASES)
 
-    # --- Player resources (7 dims) ---
-    vec[pos] = player.get("terraformRating", 20) / 100.0
-    pos += 1
-    vec[pos] = min(player.get("megacredits", 0), 100) / 100.0
-    pos += 1
-    vec[pos] = min(player.get("steel", 0), 20) / 20.0
-    pos += 1
-    vec[pos] = min(player.get("titanium", 0), 20) / 20.0
-    pos += 1
-    vec[pos] = min(player.get("plants", 0), 20) / 20.0
-    pos += 1
-    vec[pos] = min(player.get("energy", 0), 20) / 20.0
-    pos += 1
-    vec[pos] = min(player.get("heat", 0), 20) / 20.0
-    pos += 1
+    # --- Active player (37 dims) ---
+    pos = _encode_player(vec, pos, player, include_hand=True)
 
-    # --- Player production (6 dims) ---
-    prod = player.get("production", {})
-    vec[pos] = (prod.get("megacredits", 0) + 5) / 25.0     # range -5..+20 → 0..1
-    pos += 1
-    vec[pos] = min(prod.get("steel", 0), 10) / 10.0
-    pos += 1
-    vec[pos] = min(prod.get("titanium", 0), 10) / 10.0
-    pos += 1
-    vec[pos] = min(prod.get("plants", 0), 10) / 10.0
-    pos += 1
-    vec[pos] = min(prod.get("energy", 0), 10) / 10.0
-    pos += 1
-    vec[pos] = min(prod.get("heat", 0), 10) / 10.0
-    pos += 1
+    # --- One opponent slot (36 dims) ---
+    opponents = state.get("opponents", [])
+    if opponents:
+        # Use the strongest opponent (highest TR) as the representative
+        opp = max(opponents, key=lambda o: o.get("terraformRating", 0) or 0)
+        pos = _encode_player(vec, pos, opp, include_hand=False)
+    else:
+        pos += 36  # all zeros — solo or no opponent data
 
-    # --- Player tags (13 dims) ---
-    tags = player.get("tags", {})
-    for tag in TAG_TYPES:
-        vec[pos] = min(tags.get(tag) or 0, 20) / 20.0
-        pos += 1
-
-    # --- Hand size (1 dim) ---
-    vec[pos] = min(player.get("handSize", 0), 10) / 10.0
+    # --- Milestones / Awards (4 dims) ---
+    player_id = player.get("id", "")
+    milestones = state.get("milestones", [])
+    awards = state.get("awards", [])
+    ms_self = sum(1 for m in milestones if m.get("playerId") == player_id)
+    ms_total = len(milestones)
+    aw_self = sum(1 for a in awards if a.get("playerId") == player_id)
+    aw_total = len(awards)
+    vec[pos] = ms_self / 3.0      # max 3 milestones per player
+    pos += 1
+    vec[pos] = ms_total / 5.0     # max 5 milestones total
+    pos += 1
+    vec[pos] = aw_self / 3.0
+    pos += 1
+    vec[pos] = aw_total / 5.0
     pos += 1
 
     # --- Game config (19 dims) ---
     if game_spec:
-        vec[pos] = game_spec.get("player_count", 1) / 4.0
+        vec[pos] = (game_spec.get("player_count", 1) or 1) / 4.0
         pos += 1
         board = game_spec.get("board_name", "tharsis")
         if board in BOARDS:
@@ -102,6 +156,7 @@ def encode_state(state: dict, game_spec: dict | None = None) -> np.ndarray:
     else:
         pos += 1 + len(BOARDS) + len(EXPANSION_FLAGS)
 
+    assert pos == STATE_DIM, f"encode_state: wrote {pos} dims, expected {STATE_DIM}"
     return vec
 
 

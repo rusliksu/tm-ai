@@ -12,15 +12,84 @@ TAG_TYPES = [
     "venus", "plant", "microbe", "animal", "city", "event", "wild",
 ]
 
-# Input feature dimension (essential features):
-#   global:  generation(1) + temperature(1) + oxygen(1) + oceans(1) + phase_onehot(5) = 9
-#   player:  7 resources + 6 production + 13 tags + 1 handSize = 27
-#   config:  1 player_count + 5 board_onehot + 13 expansion_flags = 19
+# Special card resources (CardResource enum strings from TM server).
+CARD_RESOURCE_TYPES = [
+    "Animal",   # base / venus
+    "Microbe",  # base
+    "Science",  # base
+    "Floater",  # venus
+    "Asteroid", # venus
+    "Fighter",  # venus
+]
+
+# Normalisation caps derived from historical logs (ceil to nearest round number).
+RESOURCE_CAPS = {
+    "megacredits":    130,
+    "steel":           20,
+    "titanium":        30,
+    "plants":          40,
+    "energy":          20,
+    "heat":            70,
+    "terraformRating": 80,
+}
+# Production is encoded as (value + 5) / (cap + 5) to handle the -5 minimum for MC.
+PRODUCTION_CAPS = {
+    "megacredits": 60,  # raw range -5..+60
+    "steel":       10,
+    "titanium":    10,
+    "plants":      20,
+    "energy":      20,
+    "heat":        30,
+}
+CARD_RESOURCE_CAPS = {
+    "Animal":   20,
+    "Microbe":  20,
+    "Science":  10,
+    "Floater":  20,
+    "Asteroid":  5,
+    "Fighter":   5,
+}
+
+# ---------------------------------------------------------------------------
+# STATE_DIM breakdown
+# ---------------------------------------------------------------------------
+#  Global        : generation(1) + temperature(1) + oxygen(1) + oceans(1) + phase_onehot(5) =  9
+#  Player (self) : 7 resources + 6 production + 13 tags + 1 handSize
+#                  + 6 card_resources + 1 played_count + 3 board_tiles                      = 37
+#  Opponent (×1) : 7 resources + 6 production + 13 tags
+#                  + 6 card_resources + 1 played_count + 3 board_tiles                      = 36
+#                  (no handSize — hidden info)
+#  Milestones/   : ms_self(1) + ms_total(1) + aw_self(1) + aw_total(1)                     =  4
+#  Awards
+#  Config        : player_count(1) + 5 board_onehot + 13 expansion_flags                   = 19
+#  Total                                                                                    = 105
+
+_SELF_DIMS = (
+    len(RESOURCE_CAPS)          # 7 resources (incl. TR)
+    + len(PRODUCTION_CAPS)      # 6 production
+    + len(TAG_TYPES)            # 13 tags
+    + 1                         # handSize
+    + len(CARD_RESOURCE_TYPES)  # 6 card resources
+    + 1                         # played_card_count
+    + 3                         # board tiles (greenery, city, special)
+)  # = 37
+
+_OPP_DIMS = (
+    len(RESOURCE_CAPS)          # 7
+    + len(PRODUCTION_CAPS)      # 6
+    + len(TAG_TYPES)            # 13
+    + len(CARD_RESOURCE_TYPES)  # 6
+    + 1                         # played_card_count
+    + 3                         # board tiles
+)  # = 36
+
 STATE_DIM = (
-    4 + len(PHASES)                          # global
-    + 7 + 6 + len(TAG_TYPES) + 1            # player
-    + 1 + len(BOARDS) + len(EXPANSION_FLAGS) # game config
-)  # = 55
+    4 + len(PHASES)                            # global (9)
+    + _SELF_DIMS                               # active player (37)
+    + _OPP_DIMS                                # one opponent slot (36)
+    + 4                                        # milestones + awards (4)
+    + 1 + len(BOARDS) + len(EXPANSION_FLAGS)   # game config (19)
+)  # = 105
 
 ACTION_SPACE_SIZE = 128
 HIDDEN_SIZES = [512, 512, 512]
