@@ -59,12 +59,14 @@ Build the AI server for a Terraforming Mars AI agent per `specs/TM-AI.md` and `s
 
 ---
 
-## Phase 5: Extended State Features
+## Phase 5: Extended State Features ✅ Complete
 
-- [ ] Extend `encode_state()` to use `state.opponents` (already in request, not yet encoded)
-- [ ] Extend `encode_state()` to encode `state.board` tile positions
-- [ ] Extend `encode_state()` to encode milestones/awards state
-- [ ] Update `STATE_DIM` and retrain when extending
+- [x] Extend `encode_state()` to use `state.opponents` — opponent slot added (230 dims, same as self); handSize included (visible to all players)
+- [x] Encode per-card resource counts — 199-card vocabulary; each card gets its own slot instead of type aggregates
+- [x] Encode milestones/awards state — 4 dims (ms_self, ms_total, aw_self, aw_total)
+- [x] Encode board tile counts per player — 3 dims (greenery, city, special) in each player slot
+- [x] Update `STATE_DIM` to 492 and retrain from clean model (best val_loss=1.2255 at epoch 9)
+- [ ] Extend `encode_state()` to encode `state.board` full spatial tile positions (x/y grid)
 
 ---
 

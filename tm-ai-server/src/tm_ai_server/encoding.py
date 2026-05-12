@@ -19,7 +19,8 @@ from __future__ import annotations
 import numpy as np
 from .config import (
     PHASES, BOARDS, EXPANSION_FLAGS, TAG_TYPES,
-    CARD_RESOURCE_TYPES, RESOURCE_CAPS, PRODUCTION_CAPS, CARD_RESOURCE_CAPS,
+    CARD_RESOURCE_VOCAB, CARD_RESOURCE_CAP,
+    RESOURCE_CAPS, PRODUCTION_CAPS,
     ACTION_SPACE_SIZE, STATE_DIM,
 )
 
@@ -32,7 +33,7 @@ def _cap(value: float | int | None, cap: float) -> float:
     return min(float(value or 0), cap) / cap
 
 
-def _encode_player(vec: np.ndarray, pos: int, p: dict, include_hand: bool = True) -> int:
+def _encode_player(vec: np.ndarray, pos: int, p: dict) -> int:
     """Encode a player snapshot into vec starting at pos. Returns new pos."""
 
     # Resources (7) — including terraformRating
@@ -59,15 +60,14 @@ def _encode_player(vec: np.ndarray, pos: int, p: dict, include_hand: bool = True
         vec[pos] = _cap(tags.get(tag) or 0, 20)
         pos += 1
 
-    # Hand size (1) — omitted for opponents (hidden info)
-    if include_hand:
-        vec[pos] = _cap(p.get("handSize", 0), 10)
-        pos += 1
+    # Hand size (1) — visible to all players
+    vec[pos] = _cap(p.get("handSize", 0), 10)
+    pos += 1
 
-    # Special card resources (6)
+    # Per-card resource counts (199) — one slot per card in vocab
     card_res = p.get("cardResources", {})
-    for cr in CARD_RESOURCE_TYPES:
-        vec[pos] = _cap(card_res.get(cr, 0), CARD_RESOURCE_CAPS[cr])
+    for card_name in CARD_RESOURCE_VOCAB:
+        vec[pos] = _cap(card_res.get(card_name, 0), CARD_RESOURCE_CAP)
         pos += 1
 
     # Played card count (1)
@@ -112,17 +112,18 @@ def encode_state(state: dict, game_spec: dict | None = None) -> np.ndarray:
         vec[pos + PHASES.index(phase)] = 1.0
     pos += len(PHASES)
 
-    # --- Active player (37 dims) ---
-    pos = _encode_player(vec, pos, player, include_hand=True)
+    # --- Active player (230 dims) ---
+    pos = _encode_player(vec, pos, player)
 
-    # --- One opponent slot (36 dims) ---
+    # --- One opponent slot (230 dims) ---
+    from .config import _PLAYER_DIMS
     opponents = state.get("opponents", [])
     if opponents:
         # Use the strongest opponent (highest TR) as the representative
         opp = max(opponents, key=lambda o: o.get("terraformRating", 0) or 0)
-        pos = _encode_player(vec, pos, opp, include_hand=False)
+        pos = _encode_player(vec, pos, opp)
     else:
-        pos += 36  # all zeros — solo or no opponent data
+        pos += _PLAYER_DIMS  # all zeros — solo or no opponent data
 
     # --- Milestones / Awards (4 dims) ---
     player_id = player.get("id", "")
