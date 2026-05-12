@@ -190,10 +190,14 @@ def index_to_response(waiting_for: dict, index: int) -> dict:
     """Construct a valid InputResponse for choosing option at `index`."""
     node_type = waiting_for.get("type", "option")
 
-    if node_type in ("or", "initialCards"):
+    if node_type == "or":
         options = waiting_for.get("options", [])
         chosen = options[index] if index < len(options) else {}
-        return {"type": node_type, "index": index, "response": _default_response(chosen)}
+        return {"type": "or", "index": index, "response": _default_response(chosen)}
+
+    elif node_type == "initialCards":
+        options = waiting_for.get("options", [])
+        return {"type": "initialCards", "responses": [_default_response(opt) for opt in options]}
 
     elif node_type == "and":
         options = waiting_for.get("options", [])
@@ -244,7 +248,7 @@ def response_to_index(waiting_for: dict, input_response: dict) -> int | None:
     node_type = waiting_for.get("type", "")
     resp_type = input_response.get("type", "")
 
-    if node_type in ("or", "initialCards") and resp_type in ("or", "initialCards"):
+    if node_type == "or" and resp_type == "or":
         return input_response.get("index")
 
     elif node_type == "card" and resp_type == "card":
@@ -320,10 +324,13 @@ def _default_response(node: dict) -> dict:
 
     if t == "option":
         return {"type": "option"}
-    elif t in ("or", "initialCards"):
+    elif t == "or":
         opts = node.get("options", [])
         sub = _default_response(opts[0]) if opts else {"type": "option"}
-        return {"type": t, "index": 0, "response": sub}
+        return {"type": "or", "index": 0, "response": sub}
+    elif t == "initialCards":
+        opts = node.get("options", [])
+        return {"type": "initialCards", "responses": [_default_response(opt) for opt in opts]}
     elif t == "and":
         return {"type": "and", "responses": [_default_response(o) for o in node.get("options", [])]}
     elif t == "card":
@@ -366,7 +373,7 @@ def _default_response(node: dict) -> dict:
 
 def _mc_payment(amount: int) -> dict:
     return {
-        "megaCredits": max(0, amount),
+        "megacredits": max(0, amount),
         "steel": 0, "titanium": 0, "heat": 0, "plants": 0,
         "microbes": 0, "floaters": 0, "lunaArchivesScience": 0,
         "seeds": 0, "graphene": 0, "kuiperAsteroids": 0,
