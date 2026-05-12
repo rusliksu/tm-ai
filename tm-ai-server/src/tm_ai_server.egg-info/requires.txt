@@ -6,6 +6,10 @@ numpy>=1.24.0
 stable-baselines3>=2.1.0
 gymnasium>=0.29.0
 sb3-contrib>=2.8.0
+requests>=2.34.0
+tensorboard>=2.20.0
+tqdm>=4.67.3
+rich>=15.0.0
 
 [dev]
 pytest>=7.0

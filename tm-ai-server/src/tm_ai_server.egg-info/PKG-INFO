@@ -12,6 +12,10 @@ Requires-Dist: numpy>=1.24.0
 Requires-Dist: stable-baselines3>=2.1.0
 Requires-Dist: gymnasium>=0.29.0
 Requires-Dist: sb3-contrib>=2.8.0
+Requires-Dist: requests>=2.34.0
+Requires-Dist: tensorboard>=2.20.0
+Requires-Dist: tqdm>=4.67.3
+Requires-Dist: rich>=15.0.0
 Provides-Extra: dev
 Requires-Dist: pytest>=7.0; extra == "dev"
 Requires-Dist: pytest-asyncio>=0.21; extra == "dev"

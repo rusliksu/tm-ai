@@ -87,15 +87,30 @@ class TerraformingMarsEnv(gym.Env):
         option_index = options[min(action, len(options) - 1)]["index"]
         input_response = index_to_response(self._waiting_for, option_index)
 
-        resp = requests.post(
-            f"{self.server_url}/api/ai/step",
-            json={
-                "game_id": self._game_id,
-                "player_id": self._player_id,
-                "input_response": input_response,
-            },
-            timeout=30,
-        )
+        def _do_step(ir: dict) -> requests.Response:
+            return requests.post(
+                f"{self.server_url}/api/ai/step",
+                json={"game_id": self._game_id, "player_id": self._player_id, "input_response": ir},
+                timeout=30,
+            )
+
+        resp = _do_step(input_response)
+        if resp.status_code == 400:
+            # Invalid move — retry with each option from last to first until one succeeds
+            succeeded = False
+            for fallback_opt in reversed(options):
+                fb_resp = _do_step(index_to_response(self._waiting_for, fallback_opt["index"]))
+                if fb_resp.status_code == 200:
+                    resp = fb_resp
+                    succeeded = True
+                    break
+            if not succeeded:
+                # All options failed (game in bad state) — treat as episode end with zero reward
+                logger.warning("All fallback actions failed for game %s; ending episode", self._game_id)
+                self._state = None
+                self._waiting_for = None
+                self._player_id = None
+                return np.zeros(STATE_DIM, dtype=np.float32), 0.0, True, False, {"error": "all_actions_failed"}
         resp.raise_for_status()
         data = resp.json()
 

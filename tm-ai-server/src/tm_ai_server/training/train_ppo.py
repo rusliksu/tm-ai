@@ -166,7 +166,7 @@ def train(
 
     def make_env():
         env = TerraformingMarsEnv(server_url=TM_SERVER_URL, log_dir=str(run_dir))
-        return ActionMasker(env, lambda e: e.env.action_masks())
+        return ActionMasker(env, lambda e: e.action_masks())
 
     env = make_env()
 
