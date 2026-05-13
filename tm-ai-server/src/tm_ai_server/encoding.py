@@ -182,8 +182,8 @@ def flatten_options(waiting_for: dict, max_actions: int = ACTION_SPACE_SIZE) -> 
 
     elif node_type == "card":
         cards = waiting_for.get("cards", [])
-        if not cards:
-            # No cards available (e.g., "You cannot afford any cards") — only valid response is empty selection
+        if not cards or waiting_for.get("max", 1) == 0:
+            # No selection possible (empty list or max=0 notification like "You cannot afford any cards")
             options.append({"title": waiting_for.get("title", "OK") or "OK", "index": 0, "node": {}})
         else:
             for i, card in enumerate(cards):
@@ -266,7 +266,7 @@ def index_to_response(waiting_for: dict, index: int) -> dict:
 
     elif node_type == "card":
         cards = waiting_for.get("cards", [])
-        if not cards:
+        if not cards or waiting_for.get("max", 1) == 0:
             return {"type": "card", "cards": []}
         min_count = max(waiting_for.get("min", 1), 1)
         n = len(cards)
