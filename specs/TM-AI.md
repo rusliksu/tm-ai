@@ -460,38 +460,83 @@ Strategy documents are stored per `game_id` in `_game_strategies` dict for the s
 
 | Var | Default | Description |
 |-----|---------|-------------|
-| `USE_LLM` | `false` | Enable Ollama player |
+| `USE_LLM` | `false` | Enable LLM player |
+| `LLM_PROVIDER` | `ollama` | `ollama` or `gemini` |
+| `LLM_DEBUG` | `false` | Log full prompts and raw responses |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama server base URL |
-| `OLLAMA_MODEL` | `qwen3:4b` | Ollama model tag (recommended: qwen3:4b ~2.5 GB) |
-| `OLLAMA_TIMEOUT` | `600` | Per-request timeout (seconds) |
-| `LLM_DEBUG` | `false` | Log full prompts and raw responses to server log |
+| `OLLAMA_MODEL` | `qwen3:4b` | Ollama model tag |
+| `OLLAMA_TIMEOUT` | `600` | Ollama request timeout (seconds) |
+| `GEMINI_API_KEY` | _(required for Gemini)_ | Google AI Studio API key |
+| `GEMINI_MODEL` | `gemini-2.5-flash` | Gemini model name |
 
-### Model recommendations
+### Think mode
 
-| Model | RAM | Setup time | Action time | Notes |
-|-------|-----|-----------|------------|-------|
-| `qwen3:4b` | 2.5 GB | ~2–3 min | ~30–60s | **Recommended** — built-in thinking mode, free |
-| `gemma4:e4b` | 9.9 GB | ~2–3 min | ~90–120s | Larger, slower on CPU |
-| `phi4-mini` | 4 GB | ~1 min | ~20–40s | Fast, good reasoning |
+Setup phase uses `think=True` (chain-of-thought for opening decisions); action phase uses `think=False` (direct fast answer).
 
-Setup phase uses `think=True` (chain-of-thought for opening decisions); action phase uses `think=False` (direct fast answer). `think` flag is passed via Ollama `/api/chat` options — only effective on models that support it (qwen3 family).
-
-### Running
-
-```bash
-cd tm-ai-server && USE_LLM=true OLLAMA_MODEL=qwen3:4b LLM_DEBUG=true \
-  uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000
-```
+- **Ollama**: passed as `"think": true/false` in `/api/chat` payload — effective on qwen3 family.
+- **Gemini**: maps to `ThinkingConfig(thinking_budget=1024)` (on) or `thinking_budget=0` (off).
 
 ### Key functions in `llm_player.py`
 
 - `select_action_llm(state, waiting_for)` — public entry point, routes to setup or action
+- `_call_llm(system, user, think)` — provider router; logs prompts/response if `LLM_DEBUG`
+- `_call_ollama(system, user, think)` — Ollama `/api/chat` backend
+- `_call_gemini(system, user, think)` — Google Gemini backend (lazy-init client)
 - `_select_setup(state, waiting_for, game_id)` — rich prompt for `initialCards`/`prelude`
 - `_select_action(state, waiting_for, strategy, game_id)` — compact action prompt with strategy
-- `_build_setup_prompt(state, waiting_for)` — lists corporations/cards with costs
-- `_build_action_prompt(state, waiting_for, options)` — formats game state + numbered options
 - `_parse_setup_response(text, waiting_for, game_id)` — extracts CORPORATION/BUY_CARDS/STRATEGY
 - `_parse_action_response(text, options, waiting_for, game_id)` — extracts CHOICE/STRATEGY_UPDATE
+
+### Running
+
+```bash
+# Ollama (local, free)
+cd tm-ai-server && USE_LLM=true LLM_PROVIDER=ollama OLLAMA_MODEL=qwen3:4b LLM_DEBUG=true \
+  uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000
+
+# Gemini (cloud, fast — get key at aistudio.google.com/apikey)
+cd tm-ai-server && USE_LLM=true LLM_PROVIDER=gemini GEMINI_API_KEY=<key> LLM_DEBUG=true \
+  uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000
+```
+
+---
+
+## Cloud LLM Provider Comparison
+
+Cost basis: 200 moves/game × 1,000 input + 100 output tokens = 200K input / 20K output per game.
+
+| Provider / Model | Input $/1M | Output $/1M | TTFT | Speed | $/game | $/1K games | Free tier |
+|---|---|---|---|---|---|---|---|
+| Groq Llama 3.1 8B Instant | $0.05 | $0.08 | <0.3s | 660 t/s | $0.001 | $1.20 | 1K req/day |
+| Groq Llama 4 Scout | $0.11 | $0.34 | <0.4s | 447 t/s | $0.003 | $2.90 | 1K req/day |
+| Cerebras Llama 3.1 8B | $0.10 | $0.10 | <0.2s | 2,326 t/s | $0.002 | $2.20 | 1M tok/day |
+| **Gemini 2.5 Flash-Lite** | **$0.10** | **$0.40** | **0.3–0.6s** | 393 t/s | **$0.003** | **$2.80** | 1.5K req/day |
+| GPT-4.1-nano | $0.10 | $0.40 | ~0.9s | 80 t/s | $0.003 | $2.80 | none |
+| DeepSeek V3 | $0.14 | $0.28 | ~1.0s | 100 t/s | $0.003 | $3.40 | 5M tok free |
+| GPT-4o-mini | $0.15 | $0.60 | ~0.9s | 80 t/s | $0.004 | $4.20 | none |
+| **Gemini 2.5 Flash** | **$0.30** | **$2.50** | **~0.6s** | 220 t/s | **$0.011** | **$11.00** | **1.5K req/day** |
+| Groq Llama 3.3 70B | $0.59 | $0.79 | <0.5s | 276 t/s | $0.013 | $13.40 | 1K req/day |
+| Cerebras Llama 3.3 70B | $0.60 | $0.60 | <0.3s | 1,800 t/s | $0.013 | $13.20 | 1M tok/day |
+| Claude Haiku 4.5 | $1.00 | $5.00 | ~0.8s | 98 t/s | $0.030 | $30.00 | none |
+| Claude Sonnet 4.6 | $3.00 | $15.00 | ~1.2s | 75 t/s | $0.090 | $90.00 | none |
+
+**Recommendations by scenario:**
+- **Interactive play (single game)**: Gemini 2.5 Flash free tier — 1,500 req/day, sub-1s responses, zero cost to start
+- **PPO training at scale**: Groq Llama 4 Scout ($2.90/1K games) or Groq Llama 3.1 8B ($1.20/1K games)
+- **Best quality/cost for training**: Gemini 2.5 Flash-Lite ($2.80/1K games, frontier quality)
+- **Avoid**: reasoning models (o4-mini, DeepSeek-R1) — 5–30s/move; Claude Sonnet — 30–75× more expensive
+
+### Gemini Free Tier Setup
+
+1. Go to **https://aistudio.google.com/apikey** → create API key (no credit card required)
+2. Free limits for `gemini-2.5-flash`: **1,500 req/day**, 15 RPM, 1M TPM
+3. Start the AI server:
+   ```bash
+   cd tm-ai-server && USE_LLM=true LLM_PROVIDER=gemini \
+     GEMINI_API_KEY=<your-key> LLM_DEBUG=true \
+     uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000
+   ```
+4. Monitor: `tail -f /tmp/ai-server.log` — prompts and responses logged when `LLM_DEBUG=true`
 
 ---
 

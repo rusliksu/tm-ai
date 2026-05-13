@@ -1,5 +1,5 @@
 """
-LLM-based action selection using Ollama (default: gemma4:e4b).
+LLM-based action selection — supports Ollama (local) and Gemini (cloud).
 
 Two-phase approach:
 - Setup (initialCards / prelude): rich prompt with full rules → corporation/card
@@ -9,10 +9,17 @@ Two-phase approach:
 
 Env vars:
   USE_LLM=true              Enable this module (checked in inference.py)
-  OLLAMA_URL                Ollama base URL  (default: http://localhost:11434)
-  OLLAMA_MODEL              Model tag        (default: gemma4:e4b)
-  OLLAMA_TIMEOUT            Request timeout seconds (default: 600)
+  LLM_PROVIDER              'ollama' (default) or 'gemini'
   LLM_DEBUG=true            Log full prompts and raw responses
+
+  Ollama (LLM_PROVIDER=ollama):
+    OLLAMA_URL              Base URL  (default: http://localhost:11434)
+    OLLAMA_MODEL            Model tag (default: qwen3:4b)
+    OLLAMA_TIMEOUT          Request timeout seconds (default: 600)
+
+  Gemini (LLM_PROVIDER=gemini):
+    GEMINI_API_KEY          Google AI Studio API key (required)
+    GEMINI_MODEL            Model name (default: gemini-2.5-flash)
 """
 
 from __future__ import annotations
@@ -26,10 +33,19 @@ from .encoding import flatten_options, index_to_response, _default_response
 
 logger = logging.getLogger(__name__)
 
-_OLLAMA_URL   = os.getenv("OLLAMA_URL",    "http://localhost:11434")
-_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL",  "gemma4:e4b")
+_LLM_PROVIDER   = os.getenv("LLM_PROVIDER", "ollama").lower()
+_LLM_DEBUG      = os.getenv("LLM_DEBUG", "false").lower() == "true"
+
+# Ollama settings
+_OLLAMA_URL     = os.getenv("OLLAMA_URL",   "http://localhost:11434")
+_OLLAMA_MODEL   = os.getenv("OLLAMA_MODEL", "qwen3:4b")
 _OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "600"))
-_LLM_DEBUG    = os.getenv("LLM_DEBUG", "false").lower() == "true"
+
+# Gemini settings
+_GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+_GEMINI_MODEL   = os.getenv("GEMINI_MODEL",  "gemini-2.5-flash")
+
+_gemini_client = None  # lazy-initialised
 
 SETUP_TYPES = {"initialCards", "prelude"}
 
@@ -149,7 +165,7 @@ STRATEGIC TIPS:
 # ---------------------------------------------------------------------------
 
 def select_action_llm(state: dict, waiting_for: dict) -> tuple[dict, dict]:
-    """Return (input_response, debug) using Ollama for decision making."""
+    """Return (input_response, debug) using the configured LLM provider."""
     game_id = state.get("game", {}).get("id", "unknown")
     wf_type  = waiting_for.get("type", "")
 
@@ -168,17 +184,27 @@ def select_action_llm(state: dict, waiting_for: dict) -> tuple[dict, dict]:
 
 
 # ---------------------------------------------------------------------------
-# Ollama helper
+# LLM provider helpers
 # ---------------------------------------------------------------------------
 
-def _ollama(system: str, user: str, think: bool = False) -> str:
-    """Call Ollama /api/chat. Logs prompt + response when LLM_DEBUG=true.
-    think=True enables qwen3-style chain-of-thought (slower, better quality).
-    """
+def _call_llm(system: str, user: str, think: bool = False) -> str:
+    """Route to the configured LLM provider. Logs prompts/response if LLM_DEBUG."""
     if _LLM_DEBUG:
-        logger.info("=== OLLAMA PROMPT (system) ===\n%s", system)
-        logger.info("=== OLLAMA PROMPT (user) ===\n%s", user)
+        logger.info("=== LLM PROMPT (system, provider=%s) ===\n%s", _LLM_PROVIDER, system)
+        logger.info("=== LLM PROMPT (user) ===\n%s", user)
 
+    if _LLM_PROVIDER == "gemini":
+        text = _call_gemini(system, user, think)
+    else:
+        text = _call_ollama(system, user, think)
+
+    if _LLM_DEBUG:
+        logger.info("=== LLM RESPONSE ===\n%s", text)
+    return text
+
+
+def _call_ollama(system: str, user: str, think: bool = False) -> str:
+    """Call Ollama /api/chat. think=True enables qwen3-style chain-of-thought."""
     payload = {
         "model":  _OLLAMA_MODEL,
         "stream": False,
@@ -190,11 +216,31 @@ def _ollama(system: str, user: str, think: bool = False) -> str:
     }
     r = requests.post(f"{_OLLAMA_URL}/api/chat", json=payload, timeout=_OLLAMA_TIMEOUT)
     r.raise_for_status()
-    text = r.json()["message"]["content"]
+    return r.json()["message"]["content"]
 
-    if _LLM_DEBUG:
-        logger.info("=== OLLAMA RESPONSE ===\n%s", text)
-    return text
+
+def _call_gemini(system: str, user: str, think: bool = False) -> str:
+    """Call Google Gemini via the google-genai SDK.
+    think=True uses a 1024-token thinking budget; think=False disables it.
+    """
+    global _gemini_client
+    if not _GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not set")
+    if _gemini_client is None:
+        from google import genai
+        _gemini_client = genai.Client(api_key=_GEMINI_API_KEY)
+
+    from google.genai import types
+    thinking_budget = 1024 if think else 0
+    response = _gemini_client.models.generate_content(
+        model=_GEMINI_MODEL,
+        contents=user,
+        config=types.GenerateContentConfig(
+            system_instruction=system,
+            thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget),
+        ),
+    )
+    return response.text
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +256,7 @@ def _select_setup(state: dict, waiting_for: dict, game_id: str) -> tuple[dict, d
     )
     user = _build_setup_prompt(state, waiting_for, game_id)
     logger.info("Ollama setup call (game=%s type=%s)", game_id, waiting_for.get("type"))
-    text = _ollama(system, user, think=True)
+    text = _call_llm(system, user, think=True)
     logger.info("Setup LLM response (game=%s):\n%s", game_id, text[:1000])
 
     input_response, strategy = _parse_setup_response(text, waiting_for, game_id)
@@ -460,7 +506,7 @@ def _select_action(
     user = _build_action_prompt(state, waiting_for, options)
     logger.debug("Ollama action call (game=%s type=%s options=%d)",
                  game_id, waiting_for.get("type"), len(options))
-    text = _ollama(system, user, think=False)
+    text = _call_llm(system, user, think=False)
     logger.debug("Action response (game=%s): %s", game_id, text[:300])
 
     return _parse_action_response(text, options, waiting_for, game_id)
