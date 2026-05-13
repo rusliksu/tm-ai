@@ -155,6 +155,48 @@ STRATEGIC TIPS:
   • Science tags matter for the Scientist award and many card requirements.
   • Greenery placement near your cities multiplies your end-game VP.
   • Passing early saves MC but gives opponents tempo; balance carefully.
+  • Calculate MC cost per VP — 15 MC per VP is the rough benchmark.
+  • Slow the game deliberately if your per-generation card VP > opponent's.
+  • Accelerate terraforming if you have high TR or need to end before opponents
+    can catch up.
+
+ADVANCED STRATEGIES:
+  Science/Jupiter engine:
+    – Science tags reduce costs and unlock many cards — chain them.
+    – Jupiter tags are rare; the few cards that score them are extremely valuable.
+      Prioritise all Jupiter-tagged cards and pair with Titan production
+      (most Jupiter cards use titanium for payment).
+    – Physics Complex: +2 VP/generation once energy production ≥ 6.
+
+  Titanium engine:
+    – High titanium production makes expensive space-tag cards nearly free.
+    – Asteroid events also damage opponents' plants, slowing their greenery.
+
+  Card-VP vs board-VP (depends on player count):
+    – Many players → focus on card-based VPs (animals, science, Jupiter).
+      Board VP (city × greenery) is harder when space is contested.
+    – Fewer players → board VP is viable; you have more turns to build.
+
+  Pace control:
+    – If your engine generates more points per generation, SLOW terraforming:
+      avoid raising global parameters unless the card benefit outweighs the
+      tempo gift to opponents.
+    – If you are behind in VP but ahead in TR, ACCELERATE — end the game
+      before opponents' engines overtake you.
+
+OPPONENT ANALYSIS — read opponents constantly:
+  • Their played cards reveal their engine (energy → heat, plant engine, etc.).
+  • Funded awards signal what they are optimising for — don't help them win it.
+  • Claimed milestones tell you what to block or race for next.
+  • High hand size + few played cards → they are building toward a big combo.
+  • Low MC + many played cards → they over-extended; they may pass soon.
+
+DRAFTING (when research phase offers card selection):
+  • Do not pass a card that strongly benefits an opponent's visible engine
+    UNLESS you have a card that is strictly better for YOUR own engine.
+  • Deny opponent synergy cards (e.g. an opponent building Jupiter engine —
+    withhold Jupiter-tag cards even at personal cost).
+  • In late game, pass weak cards freely; in early game, card denial matters more.
 
 === END RULES REFERENCE ===
 """
@@ -315,6 +357,7 @@ def _build_setup_prompt(state: dict, waiting_for: dict, game_id: str) -> str:
             "",
             "Analyse the corporations and project cards. Choose the corporation that best",
             "synergises with the available project cards and write a clear strategic plan.",
+            "This strategy is your persistent memory for the whole game — be specific.",
             "",
             "Respond in EXACTLY this format (copy card/corporation names exactly as listed):",
             "CORPORATION: <exact name from list above>",
@@ -326,7 +369,8 @@ def _build_setup_prompt(state: dict, waiting_for: dict, game_id: str) -> str:
             lines.append("CEO_CARD: <exact name of 1 CEO card>")
         lines += [
             "STRATEGY:",
-            "<100-200 words: engine type, priority tags, milestone/award targets, key synergies>",
+            "<150-250 words: engine type, priority tags, milestone/award targets, key card",
+            " synergies, pace plan (accelerate or slow terraforming), opponent watch-outs>",
         ]
 
     elif wf_type == "prelude":
@@ -353,7 +397,9 @@ def _build_setup_prompt(state: dict, waiting_for: dict, game_id: str) -> str:
             "",
             "Respond in EXACTLY this format:",
             "CHOICE: <option number>",
-            "STRATEGY_UPDATE: <revised strategy or 'no change'>",
+            "STRATEGY_UPDATE: <your full updated strategy — repeat every element you want to",
+            " keep plus any changes; this REPLACES your memory entirely. Write 'no change'",
+            " only if truly nothing has changed.>",
         ]
 
     return "\n".join(lines)
@@ -497,11 +543,15 @@ def _select_action(
     system = (
         TM_RULES + "\n"
         "You are a Terraforming Mars player executing a strategic plan.\n\n"
-        f"YOUR CURRENT STRATEGY:\n{strategy}\n\n"
-        "Pick the single best action from the numbered list. "
+        f"YOUR CURRENT STRATEGY (this is your memory — it persists across turns):\n{strategy}\n\n"
+        "Before choosing, briefly analyse: what engine are opponents building from their "
+        "played cards, funded awards, and claimed milestones? Does that change your priority?\n\n"
+        "Pick the single best action from the numbered list.\n"
         "Respond in EXACTLY this format (nothing else):\n"
         "CHOICE: <number>\n"
-        "STRATEGY_UPDATE: <revised strategy, or 'no change'>"
+        "STRATEGY_UPDATE: <your full updated strategy — repeat every element you want to keep "
+        "plus any changes; this REPLACES your memory entirely, so omitting something means "
+        "forgetting it. Write 'no change' only if truly nothing has changed.>"
     )
     user = _build_action_prompt(state, waiting_for, options)
     logger.debug("Ollama action call (game=%s type=%s options=%d)",
@@ -515,7 +565,6 @@ def _select_action(
 def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict]) -> str:
     g    = state.get("game", {})
     p    = state.get("player", {})
-    opp  = (state.get("opponents") or [{}])[0]
     prod = {k: v for k, v in p.get("production", {}).items() if v}
     tags = {k: v for k, v in p.get("tags", {}).items() if v}
     played = [c.get("name","") for c in p.get("playedCards", [])]
@@ -537,12 +586,19 @@ def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict]) ->
         lines.append(f"Played ({len(played)}): {', '.join(played[:14])}"
                      f"{'…' if len(played) > 14 else ''}")
     lines.append(f"Hand: {p.get('handSize', 0)} cards")
-    if opp:
-        opp_prod = {k: v for k, v in opp.get("production", {}).items() if v}
+    opponents = state.get("opponents") or []
+    for i, opp in enumerate(opponents, 1):
+        opp_prod  = {k: v for k, v in opp.get("production", {}).items() if v}
+        opp_tags  = {k: v for k, v in opp.get("tags", {}).items() if v}
+        opp_cards = [c.get("name","") for c in opp.get("playedCards", [])]
+        label = f"Opponent{'' if len(opponents)==1 else i}"
         lines.append(
-            f"Opponent: TR:{opp.get('terraformRating',20)}  MC:{opp.get('megacredits',0)}  "
-            f"played:{opp.get('playedCardCount',0)}  prod:{opp_prod}"
+            f"{label}: TR:{opp.get('terraformRating',20)}  MC:{opp.get('megacredits',0)}  "
+            f"prod:{opp_prod}  tags:{opp_tags}"
         )
+        if opp_cards:
+            lines.append(f"  {label} played: {', '.join(opp_cards[:16])}"
+                         f"{'…' if len(opp_cards) > 16 else ''}")
     if ms:
         lines.append(f"Milestones claimed: {ms}")
     if aw:
