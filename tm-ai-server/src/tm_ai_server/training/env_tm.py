@@ -110,8 +110,15 @@ class TerraformingMarsEnv(gym.Env):
                     succeeded = True
                     break
             if not succeeded:
-                # All options failed (game in bad state) — treat as episode end with zero reward
-                logger.warning("All fallback actions failed for game %s; ending episode", self._game_id)
+                import json as _json
+                _errs = []
+                for _opt in list(reversed(options))[:6]:
+                    _ir = index_to_response(self._waiting_for, _opt["index"])
+                    _r = _do_step(_ir)
+                    _errs.append(f"idx={_opt['index']} {_r.status_code} {_r.json().get('error','?')[:50]!r} {_json.dumps(_ir)[:70]}")
+                logger.warning("All fallback failed game=%s type=%r title=%r\n  %s",
+                    self._game_id, self._waiting_for.get("type"),
+                    self._waiting_for.get("title", ""), "\n  ".join(_errs))
                 self._state = None
                 self._waiting_for = None
                 self._player_id = None
