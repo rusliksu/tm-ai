@@ -246,16 +246,18 @@ def _call_llm(system: str, user: str, think: bool = False) -> str:
 
 
 def _call_ollama(system: str, user: str, think: bool = False) -> str:
-    """Call Ollama /api/chat. think=True enables qwen3-style chain-of-thought."""
-    payload = {
+    """Call Ollama /api/chat. think=True enables chain-of-thought for models that support it."""
+    payload: dict = {
         "model":  _OLLAMA_MODEL,
         "stream": False,
-        "think":  think,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user",   "content": user},
         ],
     }
+    # "think" is only supported by qwen3 family; other models return 400
+    if _OLLAMA_MODEL.startswith("qwen3"):
+        payload["think"] = think
     r = requests.post(f"{_OLLAMA_URL}/api/chat", json=payload, timeout=_OLLAMA_TIMEOUT)
     r.raise_for_status()
     return r.json()["message"]["content"]
