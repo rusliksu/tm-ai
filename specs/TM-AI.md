@@ -440,17 +440,21 @@ Version format: `v<major>.<minor>.<patch>`. Bump minor on architecture changes, 
 
 ## LLM Player (`llm_player.py`)
 
-An alternative to the trained neural net that uses a local Ollama model for strategic decision-making. Activated via `USE_LLM=true` env var; `inference.py` routes to it before any NN logic.
+An alternative to the trained neural net that uses an LLM for strategic decision-making. Activated via `USE_LLM=true`; `inference.py` routes to it before any NN logic. Supports two providers via `LLM_PROVIDER`:
+
+- **`ollama`** (default) — local inference, no API cost, requires Ollama daemon running
+- **`gemini`** — Google Gemini cloud API, fast (~1s/move), free tier available
 
 ### Architecture
 
 ```
 Game start (initialCards / prelude)
-    → Ollama model (default: qwen3:4b), think=True for chain-of-thought
+    → configured LLM, think=True (chain-of-thought for opening decisions)
     → outputs: corporation/card selection + strategy document (100-200 words)
 
 All subsequent decisions
-    → Ollama model, think=False for fast direct answers + strategy doc as system context
+    → configured LLM, think=False (fast direct answer)
+    → strategy document passed as system context
     → outputs: action choice + optional strategy revision
 ```
 
@@ -487,16 +491,36 @@ Setup phase uses `think=True` (chain-of-thought for opening decisions); action p
 - `_parse_setup_response(text, waiting_for, game_id)` — extracts CORPORATION/BUY_CARDS/STRATEGY
 - `_parse_action_response(text, options, waiting_for, game_id)` — extracts CHOICE/STRATEGY_UPDATE
 
+### Ollama local models
+
+Install: https://ollama.com — then `ollama pull <model>`.
+
+| Model | RAM | Action time | Notes |
+|-------|-----|-------------|-------|
+| `qwen3:4b` | 2.5 GB | ~30–60s | **Recommended** — built-in think mode, free |
+| `phi4-mini` | 4 GB | ~20–40s | Fast, strong reasoning |
+| `gemma4:e4b` | 9.9 GB | ~90–120s | Larger, slower; needs 14 GB RAM total |
+
+```bash
+ollama pull qwen3:4b   # one-time download
+```
+
+### Gemini free tier setup
+
+1. Go to **https://aistudio.google.com/apikey** → "Create API key" (no credit card needed)
+2. Free limits for `gemini-2.5-flash`: **1,500 req/day**, 15 RPM
+3. Set `GEMINI_API_KEY=<key>` when starting the server
+
 ### Running
 
 ```bash
-# Ollama (local, free)
+# Ollama (local, free — Ollama daemon must be running)
 cd tm-ai-server && USE_LLM=true LLM_PROVIDER=ollama OLLAMA_MODEL=qwen3:4b LLM_DEBUG=true \
-  uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000
+  uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000 >> /tmp/ai-server.log 2>&1 &
 
-# Gemini (cloud, fast — get key at aistudio.google.com/apikey)
+# Gemini (cloud, ~1s/move, free tier — get key at aistudio.google.com/apikey)
 cd tm-ai-server && USE_LLM=true LLM_PROVIDER=gemini GEMINI_API_KEY=<key> LLM_DEBUG=true \
-  uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000
+  uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000 >> /tmp/ai-server.log 2>&1 &
 ```
 
 ---
@@ -551,7 +575,7 @@ Cost basis: 200 moves/game × 1,000 input + 100 output tokens = 200K input / 20K
 | `model.py` | ✅ Done | PolicyValueNet with LayerNorm + Dropout |
 | `encoding.py` | ✅ Done | encode_state, flatten_options, index_to_response, response_to_index |
 | `inference.py` | ✅ Done | load_model, select_action; routes to LLM if USE_LLM=true, else random fallback |
-| `llm_player.py` | ✅ Done | Ollama LLM player — setup prompt + action prompt + strategy doc per game |
+| `llm_player.py` | ✅ Done | LLM player (Ollama + Gemini) — setup prompt + action prompt + strategy doc per game |
 | `training/dataset.py` | ✅ Done | TMDataset from Plan-B training log format |
 | `training/train_supervised.py` | ✅ Done | Cross-entropy + MSE, checkpoint_best/latest |
 | `training/env_tm.py` | ✅ Skeleton | Gymnasium env; requires TM server Phase-2 HTTP endpoints |

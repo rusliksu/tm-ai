@@ -67,7 +67,7 @@ tm-ai-server/
     model.py                  # PolicyValueNet (backbone + policy head + value head)
     encoding.py               # encode_state(), flatten_options(), index_to_response(), response_to_index()
     inference.py              # load_model(), select_action(); routes to LLM if USE_LLM=true
-    llm_player.py             # Ollama/gemma4:e4b player: setup prompt (initialCards/prelude) + action prompt with strategy doc
+    llm_player.py             # LLM player (Ollama local or Gemini cloud): setup prompt + action prompt + strategy doc per game
     training/
       dataset.py              # TMDataset: reads per-game JSONL logs from Plan B
       train_supervised.py     # Phase 1: cross-entropy policy + MSE value, checkpointing
@@ -182,7 +182,7 @@ node build/src/server/server.js >> /tmp/tm-server.log 2>&1 &
 
 ## LLM Player (llm_player.py)
 
-Uses Ollama locally — no API cost. Env vars:
+Supports Ollama (local, free) and Gemini (cloud, fast). Select via `LLM_PROVIDER`. Env vars:
 
 | Var | Default | Description |
 |-----|---------|-------------|
