@@ -567,9 +567,14 @@ def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict]) ->
     p    = state.get("player", {})
     prod = {k: v for k, v in p.get("production", {}).items() if v}
     tags = {k: v for k, v in p.get("tags", {}).items() if v}
-    played = [c.get("name","") for c in p.get("playedCards", [])]
-    ms   = [m.get("name","?") for m in state.get("milestones", [])]
-    aw   = [a.get("name","?") for a in state.get("awards", [])]
+    played = p.get("playedCards", [])  # list of strings from stateMapping
+    my_id = p.get("id", "")
+    ms_raw = state.get("milestones", [])
+    aw_raw = state.get("awards", [])
+    ms = [f"{m.get('name','?')} ({'you' if m.get('playerId')==my_id else 'opponent'})"
+          for m in ms_raw]
+    aw = [f"{a.get('name','?')} ({'you' if a.get('playerId')==my_id else 'opponent'})"
+          for a in aw_raw]
 
     lines = [
         f"Gen {g.get('generation',1)} | Temp {g.get('temperature',-30)}°C | "
@@ -590,7 +595,7 @@ def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict]) ->
     for i, opp in enumerate(opponents, 1):
         opp_prod  = {k: v for k, v in opp.get("production", {}).items() if v}
         opp_tags  = {k: v for k, v in opp.get("tags", {}).items() if v}
-        opp_cards = [c.get("name","") for c in opp.get("playedCards", [])]
+        opp_cards = opp.get("playedCards", [])  # list of strings
         label = f"Opponent{'' if len(opponents)==1 else i}"
         lines.append(
             f"{label}: TR:{opp.get('terraformRating',20)}  MC:{opp.get('megacredits',0)}  "

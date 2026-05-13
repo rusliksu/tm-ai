@@ -35,12 +35,21 @@ class PlayerContext(BaseModel):
     production: PlayerProduction
     tags: Dict[str, int] = {}
     isAI: bool = False
+    playedCards: List[str] = []
+    playedCardCount: int = 0
+    corporations: List[str] = []
+    cardResources: Dict[str, Any] = {}
+    boardTiles: Dict[str, int] = {}
 
 
 class MoveRequestState(BaseModel):
     game: GameContext
     player: PlayerContext
     waitingFor: Optional[Dict[str, Any]] = None
+    opponents: List[Dict[str, Any]] = []
+    milestones: List[Dict[str, Any]] = []
+    awards: List[Dict[str, Any]] = []
+    board: List[Dict[str, Any]] = []
 
 
 class LegalAction(BaseModel):
