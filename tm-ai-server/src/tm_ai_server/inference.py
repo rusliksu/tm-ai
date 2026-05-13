@@ -68,6 +68,10 @@ def select_action(
       - input_response: valid InputResponse dict for the TM server
       - debug: dict with policy_logits and value_estimate (may be empty)
     """
+    if os.getenv("USE_LLM", "false").lower() == "true":
+        from .llm_player import select_action_llm
+        return select_action_llm(state, waiting_for)
+
     options = flatten_options(waiting_for)
     if not options:
         logger.warning("No options found in waitingFor node type=%s", waiting_for.get("type"))

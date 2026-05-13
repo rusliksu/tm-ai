@@ -37,7 +37,8 @@ tm-ai-server/
       schemas.py        # Pydantic models for request/response
       encoding.py       # State JSON → feature tensors
       model.py          # PolicyValueNet (PyTorch)
-      inference.py      # Model loading and action selection
+      inference.py      # Model loading and action selection; routes to LLM if USE_LLM=true
+    llm_player.py     # Ollama LLM player (setup + action phases, strategy document)
       config.py         # Hyperparameters and env var config
       training/
         __init__.py
@@ -437,6 +438,56 @@ Version format: `v<major>.<minor>.<patch>`. Bump minor on architecture changes, 
 
 ---
 
+## LLM Player (`llm_player.py`)
+
+An alternative to the trained neural net that uses a local Ollama model for strategic decision-making. Activated via `USE_LLM=true` env var; `inference.py` routes to it before any NN logic.
+
+### Architecture
+
+```
+Game start (initialCards / prelude)
+    → gemma4:e4b (Ollama), rich chain-of-thought prompt
+    → outputs: corporation/card selection + strategy document (100-200 words)
+
+All subsequent decisions
+    → gemma4:e4b, compact state prompt + strategy document as system context
+    → outputs: action choice + optional strategy revision
+```
+
+Strategy documents are stored per `game_id` in `_game_strategies` dict for the server lifetime.
+
+### Env vars
+
+| Var | Default | Description |
+|-----|---------|-------------|
+| `USE_LLM` | `false` | Enable Ollama player |
+| `OLLAMA_URL` | `http://localhost:11434` | Ollama server base URL |
+| `OLLAMA_MODEL` | `gemma4:e4b` | Ollama model tag |
+| `OLLAMA_TIMEOUT` | `120` | Per-request timeout (seconds) |
+
+### Memory requirement
+
+`gemma4:e4b` requires ~9.9 GB RAM. With the TM server + AI server running, approximately 14 GB total is needed. Close Firefox, Evolution, and Dropbox before starting a game in LLM mode.
+
+### Running
+
+```bash
+cd tm-ai-server && USE_LLM=true OLLAMA_MODEL=gemma4:e4b \
+  uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000
+```
+
+### Key functions in `llm_player.py`
+
+- `select_action_llm(state, waiting_for)` — public entry point, routes to setup or action
+- `_select_setup(state, waiting_for, game_id)` — rich prompt for `initialCards`/`prelude`
+- `_select_action(state, waiting_for, strategy, game_id)` — compact action prompt with strategy
+- `_build_setup_prompt(state, waiting_for)` — lists corporations/cards with costs
+- `_build_action_prompt(state, waiting_for, options)` — formats game state + numbered options
+- `_parse_setup_response(text, waiting_for, game_id)` — extracts CORPORATION/BUY_CARDS/STRATEGY
+- `_parse_action_response(text, options, waiting_for, game_id)` — extracts CHOICE/STRATEGY_UPDATE
+
+---
+
 ## Implementation Status
 
 | Component | Status | Notes |
@@ -447,7 +498,8 @@ Version format: `v<major>.<minor>.<patch>`. Bump minor on architecture changes, 
 | `config.py` | ✅ Done | STATE_DIM=55, constants for phases/boards/expansions/tags |
 | `model.py` | ✅ Done | PolicyValueNet with LayerNorm + Dropout |
 | `encoding.py` | ✅ Done | encode_state, flatten_options, index_to_response, response_to_index |
-| `inference.py` | ✅ Done | load_model, select_action; falls back to random when no checkpoint |
+| `inference.py` | ✅ Done | load_model, select_action; routes to LLM if USE_LLM=true, else random fallback |
+| `llm_player.py` | ✅ Done | Ollama LLM player — setup prompt + action prompt + strategy doc per game |
 | `training/dataset.py` | ✅ Done | TMDataset from Plan-B training log format |
 | `training/train_supervised.py` | ✅ Done | Cross-entropy + MSE, checkpoint_best/latest |
 | `training/env_tm.py` | ✅ Skeleton | Gymnasium env; requires TM server Phase-2 HTTP endpoints |

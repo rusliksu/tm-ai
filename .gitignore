@@ -6,3 +6,4 @@ tm-ai-server/src/**/__pycache__/
 tm-ai-server/**/*.pyc
 models/
 ai_training_logs/
+.env

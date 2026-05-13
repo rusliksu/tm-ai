@@ -12,6 +12,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import time
+
 import gymnasium as gym
 import numpy as np
 import requests
@@ -62,12 +64,21 @@ class TerraformingMarsEnv(gym.Env):
         payload = dict(self.game_config)
         if self.log_dir:
             payload["logDir"] = self.log_dir
-        resp = requests.post(
-            f"{self.server_url}/api/ai/new-game",
-            json=payload,
-            timeout=30,
-        )
-        resp.raise_for_status()
+        for attempt in range(5):
+            try:
+                resp = requests.post(
+                    f"{self.server_url}/api/ai/new-game",
+                    json=payload,
+                    timeout=60,
+                )
+                resp.raise_for_status()
+                break
+            except requests.exceptions.ReadTimeout:
+                wait = 5 * (attempt + 1)
+                logger.warning("reset() timeout (attempt %d/5); retrying in %ds", attempt + 1, wait)
+                time.sleep(wait)
+        else:
+            raise RuntimeError("TM server unresponsive after 5 reset() attempts")
         data = resp.json()
 
         self._game_id = data["game_id"]
@@ -93,11 +104,18 @@ class TerraformingMarsEnv(gym.Env):
         input_response = index_to_response(self._waiting_for, option_index)
 
         def _do_step(ir: dict) -> requests.Response:
-            return requests.post(
-                f"{self.server_url}/api/ai/step",
-                json={"game_id": self._game_id, "player_id": self._player_id, "input_response": ir},
-                timeout=30,
-            )
+            for attempt in range(4):
+                try:
+                    return requests.post(
+                        f"{self.server_url}/api/ai/step",
+                        json={"game_id": self._game_id, "player_id": self._player_id, "input_response": ir},
+                        timeout=60,
+                    )
+                except requests.exceptions.ReadTimeout:
+                    wait = 5 * (attempt + 1)
+                    logger.warning("step() timeout (attempt %d/4); retrying in %ds", attempt + 1, wait)
+                    time.sleep(wait)
+            raise RuntimeError("TM server unresponsive after 4 step() attempts")
 
         resp = _do_step(input_response)
         if resp.status_code == 400:

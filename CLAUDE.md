@@ -66,7 +66,8 @@ tm-ai-server/
     config.py                 # STATE_DIM=492, 199-card vocab, normalisation caps
     model.py                  # PolicyValueNet (backbone + policy head + value head)
     encoding.py               # encode_state(), flatten_options(), index_to_response(), response_to_index()
-    inference.py              # load_model(), select_action(); random fallback if no checkpoint
+    inference.py              # load_model(), select_action(); routes to LLM if USE_LLM=true
+    llm_player.py             # Ollama/gemma4:e4b player: setup prompt (initialCards/prelude) + action prompt with strategy doc
     training/
       dataset.py              # TMDataset: reads per-game JSONL logs from Plan B
       train_supervised.py     # Phase 1: cross-entropy policy + MSE value, checkpointing
@@ -159,8 +160,14 @@ Key files in `/home/pmunk/workspace/terraforming-mars/src/server/`:
 ## Running the Stack
 
 ```bash
-# 1. Start AI server (from tm-ai-server/)
-MODEL_PATH=../models/checkpoint_best.pt uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000
+# 1. Start AI server — neural net mode (default)
+cd tm-ai-server && MODEL_PATH=../models/checkpoint_best.pt \
+  uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000
+
+# 1. Start AI server — Ollama/LLM mode (strategic play, requires Ollama running)
+#    NOTE: gemma4:e4b needs ~9.9 GB RAM. Close Firefox/Evolution/Dropbox first.
+cd tm-ai-server && USE_LLM=true OLLAMA_MODEL=gemma4:e4b \
+  uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000 >> /tmp/ai-server.log 2>&1 &
 
 # 2. Build and start TM server (from terraforming-mars/)
 npm run build:server
@@ -169,6 +176,23 @@ node build/src/server/server.js >> /tmp/tm-server.log 2>&1 &
 # 3. Open http://localhost:8080 and create a game with an AI player
 # — or run PPO self-play training (see Commands above)
 ```
+
+## LLM Player (llm_player.py)
+
+Uses Ollama locally — no API cost. Env vars:
+
+| Var | Default | Description |
+|-----|---------|-------------|
+| `USE_LLM` | `false` | Enable Ollama player |
+| `OLLAMA_URL` | `http://localhost:11434` | Ollama server URL |
+| `OLLAMA_MODEL` | `gemma4:e4b` | Model tag |
+| `OLLAMA_TIMEOUT` | `120` | Per-request timeout (s) |
+
+**Setup phase** (`initialCards`/`prelude`): rich prompt → model chooses corporation + cards to buy, writes a strategy document (100–200 words) stored per `game_id`.
+
+**Action phase**: compact state + numbered options → model picks choice, optionally rewrites strategy.
+
+Strategy document persists in `llm_player._game_strategies` dict for the server lifetime.
 
 ## Remaining Work
 
