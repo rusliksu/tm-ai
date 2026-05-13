@@ -2,6 +2,14 @@ import logging
 import subprocess
 from fastapi import FastAPI, HTTPException
 
+_app_logger = logging.getLogger("tm_ai_server")
+_app_logger.setLevel(logging.INFO)
+if not _app_logger.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(levelname)s:     %(name)s - %(message)s"))
+    _app_logger.addHandler(_h)
+    _app_logger.propagate = False
+
 from .config import STATE_DIM, HIDDEN_SIZES, ACTION_SPACE_SIZE, PORT
 from .inference import select_action
 from .schemas import HealthResponse, MoveDebug, MoveRequest, MoveResponse, VersionResponse

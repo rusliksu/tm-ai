@@ -107,6 +107,7 @@ The TM server uses a **`provide_input` paradigm**: it sends the full `PlayerInpu
 ### Error Handling
 
 - Timeout or non-OK HTTP status: fallback to `aiFallbackResponse()` (last `SelectOption` in `OrOptions`, or first option as best-effort)
+- Timeout is controlled by `AI_TIMEOUT_MS` env var (default 600000ms / 10 min). A custom `undici.Agent` is used with matching `headersTimeout`/`bodyTimeout` to prevent Node.js undici's internal 300s headers timeout from firing before `AbortController`.
 - If no fallback found: error logged, no action applied (AI player stalls)
 
 ---

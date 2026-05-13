@@ -165,8 +165,7 @@ cd tm-ai-server && MODEL_PATH=../models/checkpoint_best.pt \
   uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000
 
 # 1. Start AI server — Ollama/LLM mode (strategic play, requires Ollama running)
-#    NOTE: gemma4:e4b needs ~9.9 GB RAM. Close Firefox/Evolution/Dropbox first.
-cd tm-ai-server && USE_LLM=true OLLAMA_MODEL=gemma4:e4b \
+cd tm-ai-server && USE_LLM=true OLLAMA_MODEL=qwen3:4b LLM_DEBUG=true \
   uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000 >> /tmp/ai-server.log 2>&1 &
 
 # 2. Build and start TM server (from terraforming-mars/)
@@ -185,12 +184,13 @@ Uses Ollama locally — no API cost. Env vars:
 |-----|---------|-------------|
 | `USE_LLM` | `false` | Enable Ollama player |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama server URL |
-| `OLLAMA_MODEL` | `gemma4:e4b` | Model tag |
-| `OLLAMA_TIMEOUT` | `120` | Per-request timeout (s) |
+| `OLLAMA_MODEL` | `qwen3:4b` | Model tag (recommended: qwen3:4b) |
+| `OLLAMA_TIMEOUT` | `600` | Per-request timeout (s) |
+| `LLM_DEBUG` | `false` | Log full prompts/responses |
 
-**Setup phase** (`initialCards`/`prelude`): rich prompt → model chooses corporation + cards to buy, writes a strategy document (100–200 words) stored per `game_id`.
+**Setup phase** (`initialCards`/`prelude`): `think=True` → model reasons through corp + card selection, writes a strategy document (100–200 words) stored per `game_id`. ~2–3 min.
 
-**Action phase**: compact state + numbered options → model picks choice, optionally rewrites strategy.
+**Action phase**: `think=False` → fast direct answer, model picks choice from numbered list, optionally rewrites strategy. ~30–60s.
 
 Strategy document persists in `llm_player._game_strategies` dict for the server lifetime.
 

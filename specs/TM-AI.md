@@ -446,11 +446,11 @@ An alternative to the trained neural net that uses a local Ollama model for stra
 
 ```
 Game start (initialCards / prelude)
-    → gemma4:e4b (Ollama), rich chain-of-thought prompt
+    → Ollama model (default: qwen3:4b), think=True for chain-of-thought
     → outputs: corporation/card selection + strategy document (100-200 words)
 
 All subsequent decisions
-    → gemma4:e4b, compact state prompt + strategy document as system context
+    → Ollama model, think=False for fast direct answers + strategy doc as system context
     → outputs: action choice + optional strategy revision
 ```
 
@@ -462,17 +462,24 @@ Strategy documents are stored per `game_id` in `_game_strategies` dict for the s
 |-----|---------|-------------|
 | `USE_LLM` | `false` | Enable Ollama player |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama server base URL |
-| `OLLAMA_MODEL` | `gemma4:e4b` | Ollama model tag |
-| `OLLAMA_TIMEOUT` | `120` | Per-request timeout (seconds) |
+| `OLLAMA_MODEL` | `qwen3:4b` | Ollama model tag (recommended: qwen3:4b ~2.5 GB) |
+| `OLLAMA_TIMEOUT` | `600` | Per-request timeout (seconds) |
+| `LLM_DEBUG` | `false` | Log full prompts and raw responses to server log |
 
-### Memory requirement
+### Model recommendations
 
-`gemma4:e4b` requires ~9.9 GB RAM. With the TM server + AI server running, approximately 14 GB total is needed. Close Firefox, Evolution, and Dropbox before starting a game in LLM mode.
+| Model | RAM | Setup time | Action time | Notes |
+|-------|-----|-----------|------------|-------|
+| `qwen3:4b` | 2.5 GB | ~2–3 min | ~30–60s | **Recommended** — built-in thinking mode, free |
+| `gemma4:e4b` | 9.9 GB | ~2–3 min | ~90–120s | Larger, slower on CPU |
+| `phi4-mini` | 4 GB | ~1 min | ~20–40s | Fast, good reasoning |
+
+Setup phase uses `think=True` (chain-of-thought for opening decisions); action phase uses `think=False` (direct fast answer). `think` flag is passed via Ollama `/api/chat` options — only effective on models that support it (qwen3 family).
 
 ### Running
 
 ```bash
-cd tm-ai-server && USE_LLM=true OLLAMA_MODEL=gemma4:e4b \
+cd tm-ai-server && USE_LLM=true OLLAMA_MODEL=qwen3:4b LLM_DEBUG=true \
   uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000
 ```
 

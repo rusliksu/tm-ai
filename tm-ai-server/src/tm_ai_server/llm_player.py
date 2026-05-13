@@ -11,7 +11,7 @@ Env vars:
   USE_LLM=true              Enable this module (checked in inference.py)
   OLLAMA_URL                Ollama base URL  (default: http://localhost:11434)
   OLLAMA_MODEL              Model tag        (default: gemma4:e4b)
-  OLLAMA_TIMEOUT            Request timeout seconds (default: 120)
+  OLLAMA_TIMEOUT            Request timeout seconds (default: 600)
   LLM_DEBUG=true            Log full prompts and raw responses
 """
 
@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 _OLLAMA_URL   = os.getenv("OLLAMA_URL",    "http://localhost:11434")
 _OLLAMA_MODEL = os.getenv("OLLAMA_MODEL",  "gemma4:e4b")
-_OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "120"))
+_OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "600"))
 _LLM_DEBUG    = os.getenv("LLM_DEBUG", "false").lower() == "true"
 
 SETUP_TYPES = {"initialCards", "prelude"}
@@ -171,8 +171,10 @@ def select_action_llm(state: dict, waiting_for: dict) -> tuple[dict, dict]:
 # Ollama helper
 # ---------------------------------------------------------------------------
 
-def _ollama(system: str, user: str) -> str:
-    """Call Ollama /api/chat. Logs prompt + response when LLM_DEBUG=true."""
+def _ollama(system: str, user: str, think: bool = False) -> str:
+    """Call Ollama /api/chat. Logs prompt + response when LLM_DEBUG=true.
+    think=True enables qwen3-style chain-of-thought (slower, better quality).
+    """
     if _LLM_DEBUG:
         logger.info("=== OLLAMA PROMPT (system) ===\n%s", system)
         logger.info("=== OLLAMA PROMPT (user) ===\n%s", user)
@@ -180,6 +182,7 @@ def _ollama(system: str, user: str) -> str:
     payload = {
         "model":  _OLLAMA_MODEL,
         "stream": False,
+        "think":  think,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user",   "content": user},
@@ -207,7 +210,7 @@ def _select_setup(state: dict, waiting_for: dict, game_id: str) -> tuple[dict, d
     )
     user = _build_setup_prompt(state, waiting_for, game_id)
     logger.info("Ollama setup call (game=%s type=%s)", game_id, waiting_for.get("type"))
-    text = _ollama(system, user)
+    text = _ollama(system, user, think=True)
     logger.info("Setup LLM response (game=%s):\n%s", game_id, text[:1000])
 
     input_response, strategy = _parse_setup_response(text, waiting_for, game_id)
@@ -457,7 +460,7 @@ def _select_action(
     user = _build_action_prompt(state, waiting_for, options)
     logger.debug("Ollama action call (game=%s type=%s options=%d)",
                  game_id, waiting_for.get("type"), len(options))
-    text = _ollama(system, user)
+    text = _ollama(system, user, think=False)
     logger.debug("Action response (game=%s): %s", game_id, text[:300])
 
     return _parse_action_response(text, options, waiting_for, game_id)
