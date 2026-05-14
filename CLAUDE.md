@@ -162,7 +162,15 @@ Key files in `/home/pmunk/workspace/terraforming-mars/src/server/`:
 
 ## Running the Stack
 
+**API keys and env vars live in `tm-ai/.env`. Always load them with `source`, never read the file directly:**
 ```bash
+source /home/pmunk/workspace/tm-ai/.env
+```
+
+```bash
+# Load env vars first
+source /home/pmunk/workspace/tm-ai/.env
+
 # 1. Start AI server — neural net mode (default)
 cd tm-ai-server && MODEL_PATH=../models/checkpoint_best.pt \
   uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000
@@ -172,7 +180,7 @@ cd tm-ai-server && USE_LLM=true LLM_PROVIDER=ollama OLLAMA_MODEL=qwen3:4b LLM_DE
   uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000 >> /tmp/ai-server.log 2>&1 &
 
 # 1. Start AI server — Gemini mode (cloud, fast — get key at aistudio.google.com/apikey)
-cd tm-ai-server && USE_LLM=true LLM_PROVIDER=gemini GEMINI_API_KEY=<key> LLM_DEBUG=true \
+cd tm-ai-server && USE_LLM=true LLM_PROVIDER=gemini GEMINI_API_KEY=$GEMINI_API_KEY LLM_DEBUG=true \
   uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000 >> /tmp/ai-server.log 2>&1 &
 
 # 2. Build and start TM server (from terraforming-mars/)
