@@ -178,6 +178,7 @@ STRATEGIC TIPS:
   • Passing early saves MC but gives opponents tempo; balance carefully.
   • Calculate MC cost per VP — 15 MC per VP is the rough benchmark.
   • Slow the game deliberately if your per-generation card VP > opponent's.
+  • Don't fund awards in early phase as this gives opponents a clear target to contest.
   • Accelerate terraforming if you have high TR or need to end before opponents
     can catch up.
 
@@ -379,7 +380,8 @@ def _capture_strategy_then_trim(game_id: str, session: list[dict]) -> None:
         "role": "user",
         "content": (
             "Before we continue: write out your current strategy in 150-200 words — "
-            "engine type, priority tags, milestone/award targets, pace plan, key watch-outs."
+            "engine type, priority tags, milestone/award targets, pace plan, key watch-outs. "
+            "Include a TABLEAU section listing every card you have played and its key ongoing effect."
         ),
     })
     payload: dict = {"model": _OLLAMA_MODEL, "stream": False, "messages": session}
@@ -514,6 +516,9 @@ def _select_setup(state: dict, waiting_for: dict, game_id: str) -> tuple[dict, d
             "and awards listed above, and any active game variants. "
             "Remember everything in this session — you will continue playing this game in "
             "subsequent messages without receiving these rules again. "
+            "IMPORTANT: Memorize every card you play and its ongoing effects. "
+            "Subsequent prompts will NOT list your played cards — that is your session memory. "
+            "Your strategy should always include a TABLEAU section listing what you have in play. "
             "Follow the EXACT output format requested — no extra text before or after."
         )
         text = _call_llm_init(game_id, system, user, think=True)
@@ -883,12 +888,26 @@ def _format_payment_section(waiting_for: dict, player: dict) -> str:
     return "\n".join(lines)
 
 
+def _get_card_desc_for_option(opt: dict) -> str:
+    """Return a short description if the option title references a played card action."""
+    title = opt.get("title", "")
+    if not isinstance(title, str):
+        return ""
+    m = re.match(r"Use (.+?)(?:'s)? action\b", title, re.IGNORECASE)
+    if m:
+        card_name = m.group(1).strip()
+        entry = CARD_DB.get(card_name)
+        if entry and entry.get("description"):
+            desc = entry["description"]
+            return desc[:100] if len(desc) > 100 else desc
+    return ""
+
+
 def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict], last_error: str | None = None) -> str:
     g    = state.get("game", {})
     p    = state.get("player", {})
     prod = {k: v for k, v in p.get("production", {}).items() if v}
     tags = {k: v for k, v in p.get("tags", {}).items() if v}
-    played = p.get("playedCards", [])  # list of strings from stateMapping
     my_id = p.get("id", "")
     ms_raw = state.get("milestones", [])
     aw_raw = state.get("awards", [])
@@ -915,34 +934,37 @@ def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict], la
         lines.append(f"Production: {prod}")
     if tags:
         lines.append(f"Tags: {tags}")
-    if played:
-        lines.append(f"Played ({len(played)}): {', '.join(played[:14])}"
-                     f"{'…' if len(played) > 14 else ''}")
-    lines.append(f"Hand: {p.get('handSize', 0)} cards")
+    # Played cards are in session memory — not repeated each turn.
+
+    # Cards in hand with descriptions
+    hand_cards = p.get("cardsInHand", [])
+    if hand_cards:
+        ctx = format_card_context(hand_cards, header=f"Your hand ({len(hand_cards)} cards):", max_cards=30)
+        lines += ["", ctx]
+
+    # Opponents
     opponents = state.get("opponents") or []
     for i, opp in enumerate(opponents, 1):
-        opp_prod  = {k: v for k, v in opp.get("production", {}).items() if v}
-        opp_tags  = {k: v for k, v in opp.get("tags", {}).items() if v}
-        opp_cards = opp.get("playedCards", [])  # list of strings
-        label = f"Opponent{'' if len(opponents)==1 else i}"
+        opp_prod = {k: v for k, v in opp.get("production", {}).items() if v}
+        opp_tags = {k: v for k, v in opp.get("tags", {}).items() if v}
+        opp_name = opp.get("name", f"Opponent{'' if len(opponents) == 1 else i}")
         lines.append(
-            f"{label}: TR:{opp.get('terraformRating',20)}  MC:{opp.get('megacredits',0)}  "
+            f"{opp_name}: TR:{opp.get('terraformRating',20)}  MC:{opp.get('megacredits',0)}  "
             f"prod:{opp_prod}  tags:{opp_tags}"
         )
-        if opp_cards:
-            ctx = format_card_context(opp_cards, max_cards=14)
-            if ctx:
-                lines.append(f"  {label} played:")
-                for cl in ctx.splitlines():
-                    lines.append(f"  {cl}")
-            else:
-                lines.append(f"  {label} played: {', '.join(opp_cards[:14])}"
-                             f"{'…' if len(opp_cards) > 14 else ''}")
     if ms:
         lines.append(f"Milestones claimed: {ms}")
     if aw:
         lines.append(f"Awards funded: {aw}")
 
+    # Recent game events (current generation log)
+    recent_log = g.get("recentLog") or []
+    if recent_log:
+        lines += ["", f"Recent events ({len(recent_log)}):"]
+        for entry in recent_log:
+            lines.append(f"  {entry}")
+
+    # Decision title
     title_raw = waiting_for.get("title")
     if isinstance(title_raw, str):
         title = title_raw.strip()
@@ -953,21 +975,27 @@ def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict], la
     if title:
         lines += ["", f"Decision: {title}"]
 
-    # Inject card descriptions if this decision involves selecting specific cards
-    card_names_in_decision = _extract_card_names(waiting_for)
-    if card_names_in_decision:
-        ctx = format_card_context(card_names_in_decision, header="Card descriptions:", max_cards=20)
-        if ctx:
-            lines += ["", ctx]
-
-    # Payment section for projectCard and payment types
+    # Card descriptions for explicit card-selection decisions (research, discard, etc.)
     wf_type = waiting_for.get("type", "")
+    if wf_type == "card":
+        card_names_in_decision = _extract_card_names(waiting_for)
+        if card_names_in_decision:
+            ctx = format_card_context(card_names_in_decision, header="Cards to choose from:", max_cards=20)
+            if ctx:
+                lines += ["", ctx]
+
+    # Payment section
     if wf_type in ("projectCard", "payment"):
         lines.append(_format_payment_section(waiting_for, p))
 
+    # Options list — annotate card-action options with inline descriptions
     lines.append("\nChoose from:")
     for i, opt in enumerate(options, 1):
-        lines.append(f"  {i}. {opt['title']}")
+        card_desc = _get_card_desc_for_option(opt)
+        if card_desc:
+            lines.append(f"  {i}. {opt['title']}  — {card_desc}")
+        else:
+            lines.append(f"  {i}. {opt['title']}")
 
     if wf_type in ("projectCard", "payment"):
         lines += ["", "CHOICE: <number>", "PAYMENT: MC=<n>[, STEEL=<n>][, TITANIUM=<n>][, HEAT=<n>]..."]
