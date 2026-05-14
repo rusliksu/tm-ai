@@ -67,7 +67,8 @@ tm-ai-server/
     model.py                  # PolicyValueNet (backbone + policy head + value head)
     encoding.py               # encode_state(), flatten_options(), index_to_response(), response_to_index()
     inference.py              # load_model(), select_action(); routes to LLM if USE_LLM=true
-    llm_player.py             # LLM player (Ollama local or Gemini cloud): setup prompt + action prompt + strategy doc per game
+    llm_player.py             # LLM player (Ollama local or Gemini cloud): setup + action prompts + strategy doc + board/card context injection
+    game_knowledge.py         # CARD_DB (970 cards), BOARD_INFO, EXPANSION_INFO; format_card_context/format_game_context
     training/
       dataset.py              # TMDataset: reads per-game JSONL logs from Plan B
       train_supervised.py     # Phase 1: cross-entropy policy + MSE value, checkpointing
@@ -77,6 +78,8 @@ tm-ai-server/
     test_encoding.py          # 16 tests for encode_state, flatten_options, index_to_response
     test_schemas.py           # 4 tests for Pydantic schema parsing
 
+data/
+  card_db.json              # 970-card DB from TM server; regenerate: cd terraforming-mars && npx tsx src/server/tools/extract_card_db.ts > ../tm-ai/data/card_db.json
 logs/training/                # Plan B JSONL files — live human/AI games
 logs/selfplay/                # Self-play run directories: <run_id>/manifest.json, metrics.jsonl, game JSONLs
 models/                       # Supervised checkpoints (checkpoint_best.pt, checkpoint_latest.pt)

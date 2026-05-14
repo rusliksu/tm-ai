@@ -9,6 +9,8 @@ class GameContext(BaseModel):
     oxygen: int
     temperature: int
     oceanCount: int
+    boardName: str = "tharsis"
+    expansions: List[str] = []
 
 
 class PlayerProduction(BaseModel):

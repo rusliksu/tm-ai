@@ -30,6 +30,7 @@ import re
 import requests
 
 from .encoding import flatten_options, index_to_response, _default_response
+from .game_knowledge import CARD_DB, format_card_context, format_game_context
 
 logger = logging.getLogger(__name__)
 
@@ -292,14 +293,22 @@ def _call_gemini(system: str, user: str, think: bool = False) -> str:
 # ---------------------------------------------------------------------------
 
 def _select_setup(state: dict, waiting_for: dict, game_id: str) -> tuple[dict, dict]:
+    g = state.get("game", {})
+    game_ctx = format_game_context(
+        g.get("boardName", "tharsis"),
+        g.get("expansions") or [],
+    )
     system = (
-        TM_RULES + "\n"
+        TM_RULES + "\n\n" + game_ctx + "\n\n"
         "You are an expert Terraforming Mars strategist making the opening decisions. "
-        "Think step by step about card synergies, engine building, milestones, and awards. "
+        "Think step by step about card synergies, engine building, milestones, and awards "
+        "available on this specific board. "
         "Follow the EXACT output format requested — no extra text before or after."
     )
     user = _build_setup_prompt(state, waiting_for, game_id)
-    logger.info("Ollama setup call (game=%s type=%s)", game_id, waiting_for.get("type"))
+    logger.info("LLM setup call (game=%s type=%s board=%s exps=%s)",
+                game_id, waiting_for.get("type"),
+                g.get("boardName", "?"), g.get("expansions", []))
     text = _call_llm(system, user, think=True)
     logger.info("Setup LLM response (game=%s):\n%s", game_id, text[:1000])
 
@@ -330,7 +339,10 @@ def _build_setup_prompt(state: dict, waiting_for: dict, game_id: str) -> str:
             "## Corporation Choices (choose exactly 1)",
         ]
         for i, c in enumerate(corps, 1):
-            lines.append(f"  {i}. {c.get('name', f'Corp {i}')}")
+            name = c.get("name", f"Corp {i}")
+            entry = CARD_DB.get(name)
+            desc = f" — {entry['description']}" if entry and entry.get("description") else ""
+            lines.append(f"  {i}. {name}{desc}")
 
         if buyable:
             lines += [
@@ -340,20 +352,31 @@ def _build_setup_prompt(state: dict, waiting_for: dict, game_id: str) -> str:
                 "  You cannot buy more cards than: floor(chosen_corporation_starting_MC / 3).",
             ]
             for i, c in enumerate(buyable, 1):
+                name = c.get("name", f"Card {i}")
                 play_cost = c.get("calculatedCost", "?")
-                lines.append(f"  {i}. {c.get('name', f'Card {i}')}  [play cost: {play_cost} MC]")
+                entry = CARD_DB.get(name)
+                tags = entry.get("tags") or [] if entry else []
+                tag_str = f" [{', '.join(tags)}]" if tags else ""
+                desc = f" — {entry['description']}" if entry and entry.get("description") else ""
+                lines.append(f"  {i}. {name}{tag_str}  [play cost: {play_cost} MC]{desc}")
 
         if prelude_opt:
             preludes = prelude_opt.get("cards", [])
             lines += ["", "## Prelude Cards (choose 2 from these)"]
             for i, c in enumerate(preludes, 1):
-                lines.append(f"  {i}. {c.get('name', f'Prelude {i}')}")
+                name = c.get("name", f"Prelude {i}")
+                entry = CARD_DB.get(name)
+                desc = f" — {entry['description']}" if entry and entry.get("description") else ""
+                lines.append(f"  {i}. {name}{desc}")
 
         if ceo_opt:
             ceos = ceo_opt.get("cards", [])
             lines += ["", "## CEO Card (choose 1)"]
             for i, c in enumerate(ceos, 1):
-                lines.append(f"  {i}. {c.get('name', f'CEO {i}')}")
+                name = c.get("name", f"CEO {i}")
+                entry = CARD_DB.get(name)
+                desc = f" — {entry['description']}" if entry and entry.get("description") else ""
+                lines.append(f"  {i}. {name}{desc}")
 
         lines += [
             "",
@@ -542,8 +565,13 @@ def _select_action(
     if not options:
         return _default_response(waiting_for), {}
 
+    g = state.get("game", {})
+    game_ctx = format_game_context(
+        g.get("boardName", "tharsis"),
+        g.get("expansions") or [],
+    )
     system = (
-        TM_RULES + "\n"
+        TM_RULES + "\n\n" + game_ctx + "\n\n"
         "You are a Terraforming Mars player executing a strategic plan.\n\n"
         f"YOUR CURRENT STRATEGY (this is your memory — it persists across turns):\n{strategy}\n\n"
         "Before choosing, briefly analyse: what engine are opponents building from their "
@@ -615,6 +643,13 @@ def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict]) ->
     if title:
         lines += ["", f"Decision: {title}"]
 
+    # Inject card descriptions if this decision involves selecting specific cards
+    card_names_in_decision = _extract_card_names(waiting_for)
+    if card_names_in_decision:
+        ctx = format_card_context(card_names_in_decision, header="Card descriptions:", max_cards=20)
+        if ctx:
+            lines += ["", ctx]
+
     lines.append("\nChoose from:")
     for i, opt in enumerate(options, 1):
         lines.append(f"  {i}. {opt['title']}")
@@ -655,3 +690,22 @@ def _node_title(node: dict, fallback: int) -> str:
     if isinstance(title, dict):
         return str(title.get("message", f"Option {fallback}"))
     return f"Option {fallback}"
+
+
+def _extract_card_names(waiting_for: dict, max_depth: int = 3) -> list[str]:
+    """Recursively collect card names from a waitingFor node (for card-selection decisions)."""
+    if max_depth <= 0:
+        return []
+    names: list[str] = []
+    wf_type = waiting_for.get("type", "")
+    if wf_type == "card":
+        for c in waiting_for.get("cards", []):
+            name = c.get("name", "") if isinstance(c, dict) else str(c)
+            if name and name not in names:
+                names.append(name)
+    elif wf_type in ("or", "and"):
+        for opt in waiting_for.get("options", []):
+            for n in _extract_card_names(opt, max_depth - 1):
+                if n not in names:
+                    names.append(n)
+    return names
