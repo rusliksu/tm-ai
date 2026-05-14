@@ -14,6 +14,7 @@ class GameContext(BaseModel):
     availableMilestones: List[Dict[str, str]] = []
     availableAwards: List[Dict[str, str]] = []
     gameVariants: Dict[str, Any] = {}
+    recentLog: List[str] = []
 
 
 class PlayerProduction(BaseModel):
@@ -45,6 +46,8 @@ class PlayerContext(BaseModel):
     corporations: List[str] = []
     cardResources: Dict[str, Any] = {}
     boardTiles: Dict[str, int] = {}
+    cardsInHand: List[str] = []
+    victoryPoints: Optional[int] = None
 
 
 class MoveRequestState(BaseModel):
@@ -55,6 +58,7 @@ class MoveRequestState(BaseModel):
     milestones: List[Dict[str, Any]] = []
     awards: List[Dict[str, Any]] = []
     board: List[Dict[str, Any]] = []
+    boardSpaces: List[Dict[str, Any]] = []
 
 
 class LegalAction(BaseModel):

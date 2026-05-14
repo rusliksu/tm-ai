@@ -42,7 +42,7 @@ import time
 import requests
 
 from .encoding import flatten_options, index_to_response, _default_response
-from .game_knowledge import CARD_DB, format_card_context, format_config_context
+from .game_knowledge import CARD_DB, format_card_context, format_config_context, format_board_layout
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +151,7 @@ AWARDS (5 VP 1st / 2 VP 2nd; costs 8/14/20 MC; only 3 total funded per game):
   5. Miner:      most steel + titanium resource cubes.
 
 TILE PLACEMENT:
-  • Ocean:   only on reserved blue spaces; other players placing next to it get +2 MC.
+  • Ocean:   only on reserved blue spaces; any tile placed next to it gets its player +2 MC.
   • Greenery: must place next to own tile if possible; otherwise any free space.
   • City:    cannot be adjacent to another city (exception: Noctis City).
   • Scoring: greenery = 1 VP; city = 1 VP per adjacent greenery (end of game).
@@ -509,9 +509,12 @@ def _select_setup(state: dict, waiting_for: dict, game_id: str) -> tuple[dict, d
         # format_config_context includes board, expansions, variants, AND the actual
         # milestones/awards for this specific game (even if randomised).
         game_ctx = format_config_context(g)
+        board_spaces = state.get("boardSpaces") or []
+        board_layout = format_board_layout(board_spaces)
         system = (
             TM_RULES + "\n\n" + game_ctx + "\n\n"
-            "You are an expert Terraforming Mars strategist making the opening decisions. "
+            + (board_layout + "\n\n" if board_layout else "")
+            + "You are an expert Terraforming Mars strategist making the opening decisions. "
             "Think step by step about card synergies, engine building, the specific milestones "
             "and awards listed above, and any active game variants. "
             "Remember everything in this session — you will continue playing this game in "
@@ -903,6 +906,14 @@ def _get_card_desc_for_option(opt: dict) -> str:
     return ""
 
 
+_BONUS_ABBREV = {
+    "steel": "St", "titanium": "Ti", "plant": "Pl", "card": "Cd",
+    "heat": "He", "MC": "MC", "ocean": "Oc", "animal": "An",
+    "microbe": "Mi", "energy": "En", "data": "Da", "science": "Sc",
+    "energy production": "EP", "temperature": "Tp",
+}
+
+
 def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict], last_error: str | None = None) -> str:
     g    = state.get("game", {})
     p    = state.get("player", {})
@@ -911,6 +922,13 @@ def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict], la
     my_id = p.get("id", "")
     ms_raw = state.get("milestones", [])
     aw_raw = state.get("awards", [])
+
+    # Build a spaceId → space_info lookup for annotating tile placement options
+    _space_index: dict[str, dict] = {}
+    for s in (state.get("boardSpaces") or []):
+        sid = s.get("id")
+        if sid:
+            _space_index[sid] = s
     ms = [f"{m.get('name','?')} ({'you' if m.get('playerId')==my_id else 'opponent'})"
           for m in ms_raw]
     aw = [f"{a.get('name','?')} ({'you' if a.get('playerId')==my_id else 'opponent'})"
@@ -923,10 +941,13 @@ def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict], la
             "Please choose a different option or correct your payment/selection.",
             "",
         ]
+
+    my_vp = p.get("victoryPoints")
+    vp_str = f"  VP:{my_vp}" if my_vp is not None else ""
     lines += [
         f"Gen {g.get('generation',1)} | Temp {g.get('temperature',-30)}°C | "
         f"O₂ {g.get('oxygen',0)}% | Oceans {g.get('oceanCount',0)}/9",
-        f"TR:{p.get('terraformRating',20)}  MC:{p.get('megacredits',0)}  "
+        f"TR:{p.get('terraformRating',20)}{vp_str}  MC:{p.get('megacredits',0)}  "
         f"St:{p.get('steel',0)}  Ti:{p.get('titanium',0)}  "
         f"Pl:{p.get('plants',0)}  En:{p.get('energy',0)}  He:{p.get('heat',0)}",
     ]
@@ -937,7 +958,7 @@ def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict], la
     # Played cards are in session memory — not repeated each turn.
 
     # Cards in hand with descriptions
-    hand_cards = p.get("cardsInHand", [])
+    hand_cards = p.get("cardsInHand") or []
     if hand_cards:
         ctx = format_card_context(hand_cards, header=f"Your hand ({len(hand_cards)} cards):", max_cards=30)
         lines += ["", ctx]
@@ -948,8 +969,10 @@ def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict], la
         opp_prod = {k: v for k, v in opp.get("production", {}).items() if v}
         opp_tags = {k: v for k, v in opp.get("tags", {}).items() if v}
         opp_name = opp.get("name", f"Opponent{'' if len(opponents) == 1 else i}")
+        opp_vp = opp.get("victoryPoints")
+        opp_vp_str = f" VP:{opp_vp}" if opp_vp is not None else ""
         lines.append(
-            f"{opp_name}: TR:{opp.get('terraformRating',20)}  MC:{opp.get('megacredits',0)}  "
+            f"{opp_name}: TR:{opp.get('terraformRating',20)}{opp_vp_str}  MC:{opp.get('megacredits',0)}  "
             f"prod:{opp_prod}  tags:{opp_tags}"
         )
     if ms:
@@ -988,14 +1011,24 @@ def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict], la
     if wf_type in ("projectCard", "payment"):
         lines.append(_format_payment_section(waiting_for, p))
 
-    # Options list — annotate card-action options with inline descriptions
+    # Options list — annotate card-action and space options with inline info
     lines.append("\nChoose from:")
     for i, opt in enumerate(options, 1):
+        title = opt["title"]
         card_desc = _get_card_desc_for_option(opt)
-        if card_desc:
-            lines.append(f"  {i}. {opt['title']}  — {card_desc}")
+        # Annotate space options with placement bonuses and type
+        if wf_type == "space" and _space_index:
+            space_info = _space_index.get(title, {})
+            bonuses: list[str] = space_info.get("b") or []
+            stype: str = space_info.get("t", "land")
+            x, y = space_info.get("x", "?"), space_info.get("y", "?")
+            bonus_str = "+".join(_BONUS_ABBREV.get(b, b) for b in bonuses) if bonuses else "no bonus"
+            volcanic_tag = " [volcanic]" if space_info.get("v") else ""
+            lines.append(f"  {i}. hex-{title} ({x},{y}) [{stype}]{volcanic_tag}  placement bonus: {bonus_str}")
+        elif card_desc:
+            lines.append(f"  {i}. {title}  — {card_desc}")
         else:
-            lines.append(f"  {i}. {opt['title']}")
+            lines.append(f"  {i}. {title}")
 
     if wf_type in ("projectCard", "payment"):
         lines += ["", "CHOICE: <number>", "PAYMENT: MC=<n>[, STEEL=<n>][, TITANIUM=<n>][, HEAT=<n>]..."]

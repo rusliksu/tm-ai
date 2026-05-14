@@ -116,6 +116,11 @@ uv run python -m tm_ai_server.training.train_ppo \
 
 - [ ] **Payment type handling in NN encoder**: `encoding.py:index_to_response` still uses `_mc_payment` (MC-only) for `projectCard` and `payment` types in the NN path. When the NN is trained to handle payment decisions, the encoder and response builder need to be extended to output per-resource payment amounts as part of the action.
 
+
+- [ ] **self-training biased**: in ApiAiSelfPlay the game setup is quite deterministic. I want the ai to train with 2-4 player but 80% of games with 2 players only. I want it to use random official boards. I want it to use random awards and milestones. I want the prelude, prelude 2, and venus packs enabled always, and in 20% of cases the promo packs. I want the terraforming world government disabled and express mode enabled always. 
+
+- [ ] **board information missing**: the AI has no information of the board. add a generic description of the board (what do the tile placement IDs mean, which IDs have which neighbours etc.) and for each board the placement bonus per placement tile, the placement tile type (normal, ocean, volcano, special - with description) and add this information to the initial prompt with the selected board.
+
 ## Future ideas
 - use the llm as trainer for a human.
   - exnted the new game ui with a switch called AI Trainer, default off.

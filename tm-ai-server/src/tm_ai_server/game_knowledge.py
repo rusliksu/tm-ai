@@ -381,6 +381,75 @@ def format_config_context(game: dict) -> str:
     return "\n".join(lines)
 
 
+def format_board_layout(board_spaces: list[dict]) -> str:
+    """Generate a compact board layout for the initial LLM system prompt.
+
+    board_spaces is the boardSpaces array from the AI request state — each entry has:
+      id, x, y, t (spaceType), b (bonus names list), v (volcanic bool, optional),
+      tile (placed tile type, optional), pc (playerColor, optional).
+    """
+    if not board_spaces:
+        return ""
+
+    BONUS_ABBREV = {
+        "steel": "St", "titanium": "Ti", "plant": "Pl", "card": "Cd",
+        "heat": "He", "MC": "MC", "ocean": "Oc", "animal": "An",
+        "microbe": "Mi", "energy": "En", "data": "Da", "science": "Sc",
+        "energy production": "EP", "temperature": "Tp",
+    }
+
+    # Separate spaces by type
+    ocean_spaces: list[str] = []
+    volcanic_spaces: list[str] = []
+    bonus_land: list[str] = []
+
+    for s in board_spaces:
+        sid = s.get("id", "?")
+        x, y = s.get("x", 0), s.get("y", 0)
+        stype = s.get("t", "land")
+        bonuses: list[str] = s.get("b") or []
+        bonus_str = "+".join(BONUS_ABBREV.get(b, b) for b in bonuses) if bonuses else ""
+
+        if stype in ("ocean", "cove"):
+            tag = f"{bonus_str}" if bonus_str else "—"
+            ocean_spaces.append(f"  hex-{sid}({x},{y}):{tag}")
+        elif s.get("v"):
+            tag = f" [{bonus_str}]" if bonus_str else ""
+            volcanic_spaces.append(f"  hex-{sid}({x},{y}){tag}")
+        elif bonuses:
+            bonus_land.append(f"  hex-{sid}({x},{y}): {bonus_str}")
+
+    lines = ["=== BOARD LAYOUT ===",
+             "Space IDs: hex-NN where NN is the ID shown during tile placement.",
+             "Position (x,y): x=column (0=leftmost in row), y=row (0=top).",
+             "Hex adjacency: spaces are adjacent if they share an edge (differ by at most 1 in",
+             "  x and y, following the offset hex grid pattern).",
+             "Greenery MUST be placed adjacent to your own tile if possible.",
+             "City CANNOT be adjacent to another city.",
+             ""]
+
+    if ocean_spaces:
+        lines.append(f"Ocean-only spaces ({len(ocean_spaces)} total) — format: hex-ID(x,y):placement_bonuses:")
+        # Show in rows for readability
+        row_size = 6
+        for i in range(0, len(ocean_spaces), row_size):
+            lines.append("  " + "  ".join(ocean_spaces[i:i + row_size]).replace("  hex-", " hex-"))
+        lines.append("  → Placing ocean gives +1 TR and +2 MC to each adjacent tile owner.")
+
+    if volcanic_spaces:
+        lines.append(f"\nVolcanic spaces — targeted by volcanic-event cards (Lava Flows etc.):")
+        lines.append("  " + ",  ".join(volcanic_spaces))
+
+    if bonus_land:
+        lines.append(f"\nLand spaces with placement bonuses — format: hex-ID(x,y): bonuses:")
+        for entry in bonus_land:
+            lines.append(entry)
+
+    lines.append("\nBonus abbreviations: St=steel, Ti=titanium, Pl=plant, Cd=card, He=heat, MC=MC.")
+    lines.append("=== END BOARD LAYOUT ===")
+    return "\n".join(lines)
+
+
 def format_game_context(board_name: str, expansions: list[str]) -> str:
     """Legacy/fallback: board + expansions only (no milestones/awards/variants).
 
