@@ -2,14 +2,14 @@
 Game knowledge database for the LLM player.
 
 Provides:
-  CARD_DB         — dict[card_name, card_entry] loaded from data/card_db.json
-  format_card_context(names)          — formatted card descriptions for prompt injection
-  format_game_context(board, exps)    — board + expansion context for system prompt
+  CARD_DB                     — dict[name, entry] loaded from data/card_db.json
+  format_card_context(names)  — formatted card descriptions for prompt injection
+  format_config_context(game) — comprehensive setup block: board + expansions +
+                                 game variants + actual milestones/awards for this game
 """
 
 from __future__ import annotations
 import json
-import os
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -32,10 +32,8 @@ def _vp_str(vp) -> str:
     if isinstance(vp, (int, float)):
         return f" [{int(vp)} VP]"
     if isinstance(vp, dict):
-        per = vp.get("per")
-        if per:
-            return f" [VP/resource]"
-    return f" [VP]"
+        return " [VP/resource]"
+    return " [VP]"
 
 
 def format_card_context(card_names: list[str], header: str = "", max_cards: int = 30) -> str:
@@ -66,264 +64,99 @@ def format_card_context(card_names: list[str], header: str = "", max_cards: int 
 
 
 # ---------------------------------------------------------------------------
-# Board descriptions
+# Board descriptions — special tiles and strategic notes only
+# (Milestones/awards come from the live game state, not hardcoded here)
 # ---------------------------------------------------------------------------
 
 BOARD_INFO: dict[str, dict] = {
     "tharsis": {
         "display": "Tharsis",
         "special_tiles": [
-            "Noctis City — pre-placed city on the western edge; counts toward Mayor milestone.",
+            "Noctis City — pre-placed city on the western plateau; counts toward Mayor milestone "
+            "and adjacency scoring. Cannot place another city adjacent to it.",
         ],
-        "milestones": [
-            "Terraformer (TR ≥ 35)",
-            "Mayor (own ≥ 3 city tiles)",
-            "Gardener (own ≥ 3 greenery tiles)",
-            "Builder (≥ 8 building tags in play)",
-            "Planner (≥ 16 cards in hand)",
-        ],
-        "awards": [
-            "Landlord (most tiles on board)",
-            "Scientist (most science tags)",
-            "Banker (highest MC production)",
-            "Thermalist (most heat cubes)",
-            "Miner (most steel + titanium cubes)",
-        ],
-        "notes": "Classic board. Noctis City is already placed — useful for city adjacency scoring.",
+        "notes": (
+            "Classic, well-balanced board. Noctis City gives you a free adjacency "
+            "target — placing greenery next to it scores VP without needing another city."
+        ),
     },
     "hellas": {
         "display": "Hellas (Southern Hemisphere)",
         "special_tiles": [
-            "Hellas Ocean — special space at −6°C row; costs 6 MC to place an ocean tile here "
-            "(counts as raising an ocean +1 TR); also grants you +6 heat.",
-            "South Pole — space with extra heat placement bonuses (up to +3 heat).",
-        ],
-        "milestones": [
-            "Diversifier (8 different tag types in play)",
-            "Tactician (4+ cards with requirements)",
-            "Polar Explorer (3+ tiles on the bottom two rows)",
-            "Energizer (energy production ≥ 6)",
-            "Rim Settler (3+ Jovian tags)",
-        ],
-        "awards": [
-            "Cultivator (most greenery tiles)",
-            "Magnate (most automated cards played)",
-            "Space Baron (most space tags, excluding event cards)",
-            "Excentric (most resources on cards)",
-            "Contractor (most building tags including events)",
+            "Hellas Ocean — special space on the −6°C row; placing an ocean tile here costs "
+            "only 6 MC (vs 18 MC for Aquifer standard project), raises an ocean +1 TR, "
+            "and grants you +6 heat. Excellent early value.",
+            "South Pole — bottom-left space with up to +3 heat placement bonuses.",
+            "No starting pre-placed tile (unlike Tharsis).",
         ],
         "notes": (
-            "Hellas rewards energy production (Energizer milestone), Jovian tags (Rim Settler), "
-            "and space strategies (Space Baron award). The Hellas Ocean space is a great early "
-            "ocean placement — the 6 MC cost is well below the Aquifer standard project (18 MC)."
+            "Hellas favours energy/heat engines (Energizer milestone), Jovian strategies "
+            "(Rim Settler milestone), and space-tag decks (Space Baron award). "
+            "The cheap Hellas Ocean enables fast TR gain early game."
         ),
     },
     "elysium": {
         "display": "Elysium (Eastern Hemisphere)",
         "special_tiles": [
-            "Elysium Space — top-right area with high placement bonuses (up to 8 resources).",
-        ],
-        "milestones": [
-            "Generalist (raised all 6 production tracks by at least 1)",
-            "Specialist (one production track ≥ 10)",
-            "Ecologist (4+ plant, animal, or microbe tags)",
-            "Tycoon (15+ project cards with ≥ 1 tag each)",
-            "Legend (5+ event cards played)",
-        ],
-        "awards": [
-            "Celebrity (12+ cards with cost ≥ 20 MC)",
-            "Industrialist (most steel + energy resources on cards)",
-            "Desert Settler (most tiles in the bottom 3 rows)",
-            "Estate Dealer (most tiles adjacent to ocean tiles)",
-            "Benefactor (TR ≥ 40 at end of game)",
+            "Elysium Space (top-right) — cluster of bonus spaces giving up to 8 mixed resources.",
+            "Ascraeus Mons / Pavonis Mons — marked special spaces with extra production bonuses.",
         ],
         "notes": (
-            "Elysium rewards versatile engines (Generalist), event chains (Legend milestone, "
-            "event-based corporations), and expensive high-impact cards (Celebrity award). "
-            "Estate Dealer makes ocean adjacency extra valuable."
+            "Elysium rewards versatile engines (Generalist milestone), event chains "
+            "(Legend milestone), and expensive high-impact cards (Celebrity award). "
+            "Estate Dealer makes ocean adjacency especially valuable."
         ),
     },
     "arabia terra": {
         "display": "Arabia Terra",
         "special_tiles": [
-            "Arsia Mons — gives extra plant resources on placement.",
-            "Multiple ocean-only spaces clustered together.",
+            "Arsia Mons — grants extra plant resources on placement.",
+            "Multiple ocean-only spaces clustered together in the center.",
         ],
-        "milestones": [
-            "Economizer (energy production ≥ 3 AND heat production ≥ 3)",
-            "Pioneer (2+ colony tiles, if Colonies expansion active)",
-            "Land Specialist (6+ non-ocean tiles placed)",
-            "Martian (5+ Mars tags in play)",
-            "Terran (5+ Earth tags in play)",
-        ],
-        "awards": [
-            "Cosmic Settler (most colony markers, or tiles in bottom rows)",
-            "Botanist (most plant resources on cards)",
-            "Promoter (most cards with special resource types)",
-            "Zoologist (most animal resources)",
-            "Manufacturer (most steel + titanium resources on cards)",
-        ],
-        "notes": "Fan-designed board. Rich in ocean spots; favours plant and animal engines.",
+        "notes": "Fan board with rich ocean placement options; favours plant and animal engines.",
     },
     "vastitas borealis": {
         "display": "Vastitas Borealis",
         "special_tiles": [
-            "Restricted zones with high placement bonuses on the outer edges.",
-        ],
-        "milestones": [
-            "Electrician (energy production ≥ 4)",
-            "Smith (produce both steel and titanium ≥ 2 each)",
-            "Tradesman (3+ different resource types on cards)",
-            "Irrigator (own ≥ 3 ocean tiles)",
-            "Capitalist (MC production ≥ 15)",
-        ],
-        "awards": [
-            "Forecaster (most tags including wild)",
-            "Edgedancer (most tiles in the outer ring)",
-            "Visionary (most science tags)",
-            "Naturalist (most plant resources)",
-            "Voyager (most Jovian tags + space tags)",
+            "Outer ring spaces have elevated placement bonuses.",
         ],
         "notes": "Fan board focused on resource diversity and production engines.",
     },
     "t. cimmeria": {
         "display": "Terra Cimmeria",
         "special_tiles": [
-            "Multiple mountain spaces (restricted); bonus resources on surrounding areas.",
+            "Multiple mountain (restricted) spaces; bonus resources on surrounding hexes.",
         ],
-        "milestones": [
-            "Collector (8+ resource markers total on cards)",
-            "Firestarter (4+ temperature increases contributed)",
-            "Terra Pioneer (own tile in north + south regions)",
-            "Spacefarer (4+ Jovian or space tags)",
-            "Gambler (4+ event cards played)",
-        ],
-        "awards": [
-            "Biologist (most microbe + animal + plant tags)",
-            "Incorporator (most blue active cards)",
-            "Politician (highest TR at game end — Turmoil style)",
-            "Urbanist (most city tiles)",
-            "Warmonger (most event cards)",
-        ],
-        "notes": "Fan board with diverse engine paths; Gambler/Warmonger reward event-heavy strategies.",
+        "notes": "Fan board; Gambler/Warmonger milestones/awards reward event-heavy strategies.",
     },
     "utopia planitia": {
         "display": "Utopia Planitia",
         "special_tiles": [],
-        "milestones": [
-            "Land Specialist (6+ non-ocean tiles placed)",
-            "Pioneer (2+ colony tiles)",
-            "Tradesman (3+ different resource types on cards)",
-            "Smith (produce steel ≥ 2 AND titanium ≥ 2)",
-            "Researcher (5+ science tags)",
-        ],
-        "awards": [
-            "Edgedancer (most tiles in outer ring)",
-            "Investor (highest MC production)",
-            "Botanist (most plant resources on cards)",
-            "Incorporator (most blue active cards)",
-            "Metropolist (most city tiles)",
-        ],
         "notes": "Balanced fan board; Metropolist award makes city building rewarding.",
     },
     "vastitas borealis nova": {
         "display": "Vastitas Borealis Nova",
         "special_tiles": [],
-        "milestones": [
-            "Agronomist (5+ plant production)",
-            "Spacefarer (V. Spacefarer — 4+ space tags)",
-            "Geologist (3+ tiles on special spaces)",
-            "Engineer (3+ blue cards in play)",
-            "Farmer (5+ plant resources)",
-        ],
-        "awards": [
-            "Traveller (most tiles on the board)",
-            "Landscaper (most greenery tiles)",
-            "Highlander (tiles in the north + south regions)",
-            "Promoter (most special resource cards)",
-            "Blacksmith (most steel + titanium resources)",
-        ],
         "notes": "Fan board variant; rewards plant production and blue-card engines.",
     },
     "terra cimmeria nova": {
         "display": "Terra Cimmeria Nova",
         "special_tiles": [],
-        "milestones": [
-            "Planetologist (4+ different tag types)",
-            "Architect (4+ blue active cards)",
-            "Coastguard (3+ ocean tiles on coast spaces)",
-            "Forester (C. Forester — 4+ greenery tiles)",
-            "Fundraiser (MC production ≥ 8)",
-        ],
-        "awards": [
-            "Electrician (most energy production)",
-            "Founder (highest TR at end)",
-            "Mogul (most unique tags including wild)",
-            "Zoologist (most animal resources)",
-            "Forecaster (most tags including wild)",
-        ],
         "notes": "Fan board variant.",
     },
     "amazonis p.": {
         "display": "Amazonis Planitia",
         "special_tiles": [
-            "Amazonis Planitia marked zones — extra placement bonuses.",
-        ],
-        "milestones": [
-            "Colonizer (2+ colony tiles)",
-            "Forester (4+ greenery tiles)",
-            "Minimalist (low hand size at milestone claim — 3 or fewer)",
-            "Terran (5+ Earth tags)",
-            "Tropicalist (4+ plant production + plant resources)",
-        ],
-        "awards": [
-            "Curator (most unique tag types)",
-            "Engineer (most blue active cards)",
-            "Promoter (most special resource cards)",
-            "Tourist (most VP on played cards)",
-            "Zoologist (most animal resources)",
+            "Amazonis zones with extra placement bonuses.",
         ],
         "notes": "Fan board; Minimalist milestone rewards playing cards quickly then going lean.",
     },
     "Hollandia": {
         "display": "Hollandia",
         "special_tiles": [],
-        "milestones": [],
-        "awards": [],
-        "notes": "Community board with custom milestone/award rules.",
+        "notes": "Community board with custom rules.",
     },
 }
-
-
-def format_game_context(board_name: str, expansions: list[str]) -> str:
-    """Return a prompt block describing the active board and expansions."""
-    board_key = board_name.lower().strip()
-    info = BOARD_INFO.get(board_key) or BOARD_INFO.get("tharsis")
-    assert info is not None
-
-    lines = [
-        f"=== GAME CONFIGURATION ===",
-        f"Board: {info['display']}",
-    ]
-    if info["special_tiles"]:
-        lines.append("Special tiles:")
-        for t in info["special_tiles"]:
-            lines.append(f"  • {t}")
-    if info["milestones"]:
-        lines.append(f"Milestones: {' | '.join(info['milestones'])}")
-    if info["awards"]:
-        lines.append(f"Awards: {' | '.join(info['awards'])}")
-    if info["notes"]:
-        lines.append(f"Note: {info['notes']}")
-
-    if expansions:
-        exp_descs = [EXPANSION_INFO.get(e, e) for e in expansions]
-        lines.append(f"Active expansions: {', '.join(expansions)}")
-        for e, d in zip(expansions, exp_descs):
-            lines.append(f"  {e}: {d}")
-
-    lines.append("=== END GAME CONFIGURATION ===")
-    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -332,55 +165,244 @@ def format_game_context(board_name: str, expansions: list[str]) -> str:
 
 EXPANSION_INFO: dict[str, str] = {
     "venus": (
-        "Venus Next — adds the Venus parameter track (−20° to +10°, 49 steps); "
-        "raises give +1 TR. Adds Venus cards and corporations. "
-        "Hoverlord milestone (7+ Venus tags). Venuphile award (most Venus tags). "
-        "Special board tiles: Dawn City, Luna Metropolis, Maxwell Base, Stratopolis."
+        "Venus Next — adds a Venus parameter track (−20° to +10°, 49 steps); each raise = +1 TR. "
+        "New Venus-tag cards and corporations. "
+        "Board tiles: Dawn City, Luna Metropolis, Maxwell Base, Stratopolis."
     ),
     "colonies": (
-        "Colonies — adds Colony tiles (Moon, Ganymede, Titan, Callisto, etc.). "
-        "Players build colony markers and trade for resources every generation. "
-        "Titan colony gives titanium. Ganymede gives cards. Enceladus gives microbes. "
-        "Trade fleets are limited — timing your trade matters."
+        "Colonies — Colony tiles (Moon, Ganymede, Titan, Callisto, Enceladus, etc.). "
+        "Each generation you can trade one colony for resources (titanium from Titan, "
+        "cards from Ganymede, microbes from Enceladus…). "
+        "Build colony markers to improve trade bonuses. Trade fleets are limited — timing matters."
     ),
     "prelude": (
-        "Prelude — each player plays 2 Prelude cards before generation 1, "
-        "giving a strong engine head-start. Preludes can give production boosts, "
-        "free cards, TR increases, or resources. Prelude choice dramatically shapes "
-        "the opening strategy."
+        "Prelude — each player plays 2 Prelude cards before generation 1, giving a strong "
+        "engine head-start (production boosts, free cards, TR increases, or resources). "
+        "Prelude choice dramatically shapes opening strategy."
     ),
     "prelude2": (
-        "Prelude 2 — second set of Prelude cards, same mechanic as Prelude."
+        "Prelude 2 — second set of Prelude cards, same mechanic as original Prelude."
     ),
     "turmoil": (
-        "Turmoil — adds a Politics track with five Parties (Mars First, Scientists, "
-        "Greens, Unity, Reds). Dominant party at generation end applies a Global Event "
-        "affecting all players. Delegates placed each generation influence party control. "
-        "Chairman bonus: −1 TR for non-ruling party players. Careful delegate management "
-        "can give ongoing TR and MC benefits."
+        "Turmoil — Politics track with five Parties (Mars First, Scientists, Greens, Unity, Reds). "
+        "Dominant party at generation end applies a Global Event. "
+        "Delegates placed each generation influence party control. "
+        "Ruling party bonus affects all players; Chairman position gives extra TR each generation."
     ),
     "moon": (
-        "The Moon — adds a Moon mini-board with three tracks: Colony Rate, Mining Rate, "
-        "Road Network. Cards place tiles on the Moon and raise these tracks. "
-        "Lunarchitect milestone (3+ Moon tiles). One Giant Step milestone."
+        "The Moon — mini Moon board with Colony Rate / Mining Rate / Road Network tracks. "
+        "Cards place tiles on the Moon and raise these tracks (+1 TR each). "
+        "New milestones (One Giant Step, Lunarchitect) and Moon-tag cards."
     ),
     "pathfinders": (
-        "Pathfinders — adds Data and Preservation tags. Planetary track bonuses "
-        "for each planet in the solar system. New starting conditions and corporations."
+        "Pathfinders — Data and Preservation tags; planetary tracks for bonuses "
+        "across the solar system. New starting conditions."
     ),
     "underworld": (
-        "Underworld — adds underground excavation mechanic. Players dig for resources "
-        "and artifacts on special underground spaces. Adds corruption tokens and "
-        "new Risktaker/Tunneler milestones."
+        "Underworld — underground excavation for resources and artifacts. "
+        "Corruption tokens; Risktaker and Tunneler milestones."
     ),
     "ares": (
-        "Ares — adds Hazard tiles (dust storms, erosion) that slow terraforming "
-        "but give adjacency bonuses when mitigated. Networker milestone, "
-        "Entrepreneur/Rugged awards."
+        "Ares — Hazard tiles (dust storms, erosion) that slow but reward mitigation. "
+        "Improved adjacency bonuses. Networker milestone, Entrepreneur/Rugged awards."
     ),
     "corpera": (
-        "Corporate Era — players start at 0 production for all resources "
-        "(instead of 1 for base game). More project cards and corporations. "
-        "Stronger production ramp-up is essential."
+        "Corporate Era — players start at 0 production (vs 1 in Base). "
+        "More cards and corporations. Strong production ramp-up is essential."
     ),
 }
+
+
+# ---------------------------------------------------------------------------
+# Game variant descriptions — all configuration options with strategic impact
+# ---------------------------------------------------------------------------
+
+GAME_VARIANT_DESCRIPTIONS: dict[str, str] = {
+    "draftVariant": (
+        "Research Phase Draft — instead of drawing 4 cards and keeping any, players pass cards "
+        "around the table (like a card draft). You see all 4 cards but keep only 1 before passing. "
+        "Strategic impact: CARD DENIAL is possible — withhold cards that synergise with an "
+        "opponent's engine even if they aren't your best pick."
+    ),
+    "initialDraftVariant": (
+        "Initial Cards Draft — the 10 starting project cards are drafted rather than dealt directly. "
+        "You pass cards around and pick sequentially. "
+        "Strategic impact: you can deny opponent key synergy cards; your initial hand is more curated."
+    ),
+    "preludeDraftVariant": (
+        "Prelude Draft — prelude cards are drafted. "
+        "Strategic impact: you can block strong engine-boosting preludes from opponents."
+    ),
+    "ceosDraftVariant": (
+        "CEO Draft — CEO cards are drafted. "
+        "Strategic impact: pick the CEO that best matches your engine; deny powerful ones."
+    ),
+    "twoCorpsVariant": (
+        "Two Corporations Variant — each player starts with 2 corporations (plays both). "
+        "Strategic impact: doubled starting resources and combined corporation abilities. "
+        "Synergy between the two corps is crucial — look for complementary abilities."
+    ),
+    "solarPhaseOption": (
+        "World Government Terraforming (Solar Phase) — at the start of each generation, "
+        "one player (rotating) acts as World Government and raises one global parameter for free "
+        "(temperature +2°C, oxygen +1%, place ocean, or raise Venus). No TR gained. "
+        "Strategic impact: SIGNIFICANTLY speeds up the game — expect 2-3 fewer generations than normal. "
+        "Accelerate your engine early; slow starts are punished heavily. "
+        "When it's your turn as World Government, raise whichever parameter benefits your strategy most."
+    ),
+    "soloTR": (
+        "Solo Mode (TR 63 Victory) — must reach Terraform Rating 63 by game end to win. "
+        "Standard VP scoring is replaced by a binary win/lose condition. "
+        "Strategic impact: maximise TR gain above all else; card VP matters much less."
+    ),
+    "randomMA": (
+        "Randomized Milestones & Awards — the 5 milestones and 5 awards are randomly selected "
+        "rather than board-specific. The actual milestones and awards are listed below. "
+        "Study them carefully — your engine should target at least 1-2 milestones and compete "
+        "for 1-2 awards."
+    ),
+    "modularMA": (
+        "Modular Milestones & Awards — milestones/awards drawn from the expanded modular pool "
+        "(broader variety including fan-designed ones). See the actual list below."
+    ),
+    "requiresVenusTrackCompletion": (
+        "Venus Must Be Completed — the game does not end until Venus reaches +10°C (max). "
+        "Strategic impact: invest in Venus cards even if the track isn't your primary focus; "
+        "the game extends until Venus is done, giving more time for engines to develop."
+    ),
+    "requiresMoonTrackCompletion": (
+        "Moon Tracks Must Be Completed — all three Moon tracks must be maxed before game ends. "
+        "Strategic impact: Moon investment is mandatory; plan Moon tile placement early."
+    ),
+    "politicalAgendasExtension:Random": (
+        "Political Agendas (Random) — Turmoil party bonuses and policies are randomly assigned "
+        "at the start of the game and remain fixed. "
+        "Strategic impact: study the fixed policies; some may heavily favour certain strategies "
+        "(e.g. Kelvinists policy giving +2 MC for heat production is very powerful)."
+    ),
+    "politicalAgendasExtension:Chairman": (
+        "Political Agendas (Chairman) — the Chairman chooses party bonuses/policies each generation. "
+        "Strategic impact: being Chairman is very powerful — compete for Chairman position."
+    ),
+    "removeNegativeGlobalEventsOption": (
+        "No Negative Global Events — Turmoil Global Events only have neutral or positive effects "
+        "(negative effects are removed). "
+        "Strategic impact: less variance; global events are less threatening to your plans."
+    ),
+    "altVenusBoard": (
+        "Alt Venus Board — an alternative Venus parameter arrangement. "
+        "Standard strategic principles still apply for Venus-tag engines."
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
+# Main format functions
+# ---------------------------------------------------------------------------
+
+def format_config_context(game: dict) -> str:
+    """Return a comprehensive setup block for the initial LLM system prompt.
+
+    Includes: board (special tiles + notes), active expansions with descriptions,
+    game variant settings, and the ACTUAL milestones/awards for this specific game
+    (which may differ from board defaults if randomised).
+    """
+    board_key = game.get("boardName", "tharsis")
+    expansions = game.get("expansions") or []
+    variants = game.get("gameVariants") or {}
+    milestones = game.get("availableMilestones") or []
+    awards = game.get("availableAwards") or []
+
+    board_info = BOARD_INFO.get(str(board_key).lower()) or BOARD_INFO.get("tharsis", {})
+
+    lines = ["=== GAME CONFIGURATION ==="]
+
+    # --- Board ---
+    board_display = board_info.get("display", str(board_key))
+    lines.append(f"Board: {board_display}")
+    special = board_info.get("special_tiles") or []
+    if special:
+        lines.append("Special spaces:")
+        for t in special:
+            lines.append(f"  • {t}")
+    note = board_info.get("notes", "")
+    if note:
+        lines.append(f"Board note: {note}")
+
+    # --- Active expansions ---
+    if expansions:
+        lines.append(f"\nExpansions active: {', '.join(expansions)}")
+        for e in expansions:
+            desc = EXPANSION_INFO.get(e)
+            if desc:
+                lines.append(f"  [{e}] {desc}")
+
+    # --- Game variants ---
+    if variants:
+        lines.append("\nGame variants / rule changes:")
+        for key, val in variants.items():
+            # Build a lookup key — for politicalAgendasExtension include the value
+            if key == "politicalAgendasExtension":
+                lookup_key = f"{key}:{val}"
+            else:
+                lookup_key = key
+            desc = GAME_VARIANT_DESCRIPTIONS.get(lookup_key) or GAME_VARIANT_DESCRIPTIONS.get(key)
+            if desc:
+                lines.append(f"  [{key}] {desc}")
+            else:
+                lines.append(f"  [{key}] = {val}")
+
+    # --- Milestones ---
+    if milestones:
+        lines.append("\nMilestones available (5 VP to claim; costs 8 MC; max 3 per game):")
+        for m in milestones:
+            name = m.get("name", "?")
+            desc = m.get("description", "")
+            lines.append(f"  • {name}: {desc}")
+        lines.append(
+            "  Tip: claim early if you meet the requirement — being blocked costs 0 MC "
+            "but losing 5 VP is enormous."
+        )
+
+    # --- Awards ---
+    if awards:
+        lines.append("\nAwards available (5 VP 1st / 2 VP 2nd; fund costs 8/14/20 MC; max 3 per game):")
+        for a in awards:
+            name = a.get("name", "?")
+            desc = a.get("description", "?")
+            lines.append(f"  • {name}: {desc}")
+        lines.append(
+            "  Tip: fund an award you are already winning, before opponents can fund it. "
+            "Funding late is wasteful (20 MC for 3rd). "
+            "Multiple awards can be won by the same player."
+        )
+
+    lines.append("=== END GAME CONFIGURATION ===")
+    return "\n".join(lines)
+
+
+def format_game_context(board_name: str, expansions: list[str]) -> str:
+    """Legacy/fallback: board + expansions only (no milestones/awards/variants).
+
+    Prefer format_config_context(game_state) when the full game dict is available.
+    """
+    board_key = str(board_name).lower()
+    board_info = BOARD_INFO.get(board_key) or BOARD_INFO.get("tharsis", {})
+    lines = [
+        "=== GAME CONFIGURATION ===",
+        f"Board: {board_info.get('display', board_name)}",
+    ]
+    special = board_info.get("special_tiles") or []
+    for t in special:
+        lines.append(f"  • {t}")
+    note = board_info.get("notes", "")
+    if note:
+        lines.append(f"Note: {note}")
+    if expansions:
+        lines.append(f"Expansions: {', '.join(expansions)}")
+        for e in expansions:
+            desc = EXPANSION_INFO.get(e)
+            if desc:
+                lines.append(f"  [{e}] {desc}")
+    lines.append("=== END GAME CONFIGURATION ===")
+    return "\n".join(lines)

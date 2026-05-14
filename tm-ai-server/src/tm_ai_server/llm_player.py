@@ -41,7 +41,7 @@ import re
 import requests
 
 from .encoding import flatten_options, index_to_response, _default_response
-from .game_knowledge import CARD_DB, format_card_context, format_game_context
+from .game_knowledge import CARD_DB, format_card_context, format_config_context
 
 logger = logging.getLogger(__name__)
 
@@ -457,16 +457,16 @@ def _select_setup(state: dict, waiting_for: dict, game_id: str) -> tuple[dict, d
 
     if wf_type == "initialCards" or not has_session:
         # First call of the game: send full system prompt and start a new session.
-        game_ctx = format_game_context(
-            g.get("boardName", "tharsis"),
-            g.get("expansions") or [],
-        )
+        # format_config_context includes board, expansions, variants, AND the actual
+        # milestones/awards for this specific game (even if randomised).
+        game_ctx = format_config_context(g)
         system = (
             TM_RULES + "\n\n" + game_ctx + "\n\n"
             "You are an expert Terraforming Mars strategist making the opening decisions. "
-            "Think step by step about card synergies, engine building, milestones, and awards "
-            "available on this specific board. Remember everything in this session — you will "
-            "continue playing this game in subsequent messages. "
+            "Think step by step about card synergies, engine building, the specific milestones "
+            "and awards listed above, and any active game variants. "
+            "Remember everything in this session — you will continue playing this game in "
+            "subsequent messages without receiving these rules again. "
             "Follow the EXACT output format requested — no extra text before or after."
         )
         text = _call_llm_init(game_id, system, user, think=True)

@@ -11,6 +11,9 @@ class GameContext(BaseModel):
     oceanCount: int
     boardName: str = "tharsis"
     expansions: List[str] = []
+    availableMilestones: List[Dict[str, str]] = []
+    availableAwards: List[Dict[str, str]] = []
+    gameVariants: Dict[str, Any] = {}
 
 
 class PlayerProduction(BaseModel):
