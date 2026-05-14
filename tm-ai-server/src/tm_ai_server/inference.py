@@ -62,6 +62,7 @@ def select_action(
     waiting_for: dict,
     game_spec: dict | None = None,
     model: PolicyValueNet | None = None,
+    last_error: str | None = None,
 ) -> tuple[dict, dict]:
     """
     Given the game state and the current decision node, return:
@@ -70,7 +71,7 @@ def select_action(
     """
     if os.getenv("USE_LLM", "false").lower() == "true":
         from .llm_player import select_action_llm
-        return select_action_llm(state, waiting_for)
+        return select_action_llm(state, waiting_for, last_error=last_error)
 
     options = flatten_options(waiting_for)
     if not options:

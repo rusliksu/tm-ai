@@ -7,8 +7,8 @@ Session-per-game architecture:
 - All subsequent decisions (prelude / action): continue the same session. Only the
   current game state and numbered options are sent — rules/board context are in
   session memory, so they are NOT repeated each turn.
-- Strategy: requested at setup, updated on demand via STRATEGY_UPDATE in action prompts.
-  Stored in _game_strategies for logging and context-trim recovery.
+- Strategy: written at setup (and at prelude). NOT requested on every action turn to save tokens.
+  Captured before Ollama context trim; stored in _game_strategies for trim recovery / fallback.
 - Context trimming: if an Ollama session grows beyond MAX_SESSION_MESSAGES, it is
   rebuilt as: original system + strategy reminder + last 40 messages.
 
@@ -37,6 +37,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 
 import requests
 
@@ -226,7 +227,7 @@ DRAFTING (when research phase offers card selection):
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def select_action_llm(state: dict, waiting_for: dict) -> tuple[dict, dict]:
+def select_action_llm(state: dict, waiting_for: dict, last_error: str | None = None) -> tuple[dict, dict]:
     """Return (input_response, debug) using the configured LLM provider."""
     game_id = state.get("game", {}).get("id", "unknown")
     wf_type  = waiting_for.get("type", "")
@@ -235,7 +236,7 @@ def select_action_llm(state: dict, waiting_for: dict) -> tuple[dict, dict]:
         if wf_type in SETUP_TYPES:
             return _select_setup(state, waiting_for, game_id)
         else:
-            return _select_action(state, waiting_for, game_id)
+            return _select_action(state, waiting_for, game_id, last_error=last_error)
     except Exception as exc:
         logger.error("LLM selection failed (game=%s type=%s): %s — using default",
                      game_id, wf_type, exc, exc_info=True)
@@ -315,20 +316,19 @@ def _stateless_fallback(game_id: str, user: str) -> str:
         "You are a Terraforming Mars player. Your current strategy:\n"
         f"{strategy}\n\n"
         "Pick the single best action. Respond ONLY:\n"
-        "CHOICE: <number>\n"
-        "STRATEGY_UPDATE: <full updated strategy or 'no change'>"
+        "CHOICE: <number>"
     )
     if _LLM_PROVIDER == "gemini":
         _ensure_gemini_client()
         from google.genai import types
-        response = _gemini_client.models.generate_content(  # type: ignore[union-attr]
+        response = _gemini_with_retry(lambda: _gemini_client.models.generate_content(  # type: ignore[union-attr]
             model=_GEMINI_MODEL,
             contents=user,
             config=types.GenerateContentConfig(
                 system_instruction=system,
                 thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
-        )
+        ))
         return response.text
     else:
         payload: dict = {
@@ -365,9 +365,9 @@ def _init_ollama_session(game_id: str, system: str, user: str, think: bool) -> s
 
 def _continue_ollama_session(game_id: str, user: str, session: list[dict]) -> str:
     session.append({"role": "user", "content": user})
-    _trim_ollama_session_if_needed(game_id, session)
+    if len(session) > _MAX_SESSION_MESSAGES:
+        _capture_strategy_then_trim(game_id, session)
     payload: dict = {"model": _OLLAMA_MODEL, "stream": False, "messages": session}
-    # think=False for action phase
     if _OLLAMA_MODEL.startswith("qwen3"):
         payload["think"] = False
     r = requests.post(f"{_OLLAMA_URL}/api/chat", json=payload, timeout=_OLLAMA_TIMEOUT)
@@ -377,28 +377,77 @@ def _continue_ollama_session(game_id: str, user: str, session: list[dict]) -> st
     return text
 
 
-def _trim_ollama_session_if_needed(game_id: str, session: list[dict]) -> None:
-    """If the session is too long, rebuild it: base system+strategy + last 40 messages."""
-    if len(session) <= _MAX_SESSION_MESSAGES:
-        return
+def _capture_strategy_then_trim(game_id: str, session: list[dict]) -> None:
+    """Ask the model for its current strategy, save it, then rebuild the session."""
+    # Temporarily swap in the strategy-capture request (keep the pending user msg aside)
+    pending_user = session.pop()
+    session.append({
+        "role": "user",
+        "content": (
+            "Before we continue: write out your current strategy in 150-200 words — "
+            "engine type, priority tags, milestone/award targets, pace plan, key watch-outs."
+        ),
+    })
+    payload: dict = {"model": _OLLAMA_MODEL, "stream": False, "messages": session}
+    if _OLLAMA_MODEL.startswith("qwen3"):
+        payload["think"] = False
+    try:
+        r = requests.post(f"{_OLLAMA_URL}/api/chat", json=payload, timeout=_OLLAMA_TIMEOUT)
+        r.raise_for_status()
+        strategy = r.json()["message"]["content"].strip()
+        _game_strategies[game_id] = strategy
+        logger.info("Captured strategy before Ollama trim (game=%s): %.100s…", game_id, strategy)
+    except Exception as exc:
+        logger.warning("Strategy capture before trim failed (game=%s): %s", game_id, exc)
+
+    # Restore the pending user message and rebuild the trimmed session
+    session.pop()  # remove strategy_request
+    session.append(pending_user)
+
     strategy = _game_strategies.get(game_id, "")
     base = _session_base_system.get(game_id, session[0]["content"])
-    system_with_reminder = base
-    if strategy:
-        system_with_reminder = (
-            base + f"\n\n[CONTEXT TRIM — current strategy to continue with:\n{strategy}]"
-        )
-    tail = session[-40:]  # keep last 20 exchanges
+    system_with_reminder = (
+        base + f"\n\n[CONTEXT TRIM — current strategy:\n{strategy}]" if strategy else base
+    )
+    tail = session[-40:]
     session.clear()
     session.append({"role": "system", "content": system_with_reminder})
     session.extend(tail)
-    logger.info("Ollama session trimmed for game %s — kept last 40 messages + strategy reminder",
-                game_id)
+    logger.info("Ollama session trimmed for game %s — kept last 40 messages + strategy", game_id)
 
 
 # ---------------------------------------------------------------------------
 # Gemini session management
 # ---------------------------------------------------------------------------
+
+_GEMINI_RETRY_ATTEMPTS = 3
+_GEMINI_RETRY_DELAY    = 5  # seconds (doubles on each retry: 5, 10)
+
+
+def _is_transient_gemini_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(k in msg for k in ("503", "unavailable", "429", "rate limit", "overloaded", "resource exhausted"))
+
+
+def _gemini_with_retry(fn):
+    """Call fn() with exponential back-off on transient Gemini errors."""
+    last_exc: Exception | None = None
+    for attempt in range(_GEMINI_RETRY_ATTEMPTS):
+        try:
+            return fn()
+        except Exception as exc:
+            if attempt < _GEMINI_RETRY_ATTEMPTS - 1 and _is_transient_gemini_error(exc):
+                wait = _GEMINI_RETRY_DELAY * (2 ** attempt)
+                logger.warning(
+                    "Gemini transient error (attempt %d/%d): %s — retrying in %ds",
+                    attempt + 1, _GEMINI_RETRY_ATTEMPTS, exc, wait,
+                )
+                time.sleep(wait)
+                last_exc = exc
+            else:
+                raise
+    raise last_exc  # type: ignore[misc]
+
 
 def _init_gemini_session(game_id: str, system: str, user: str, think: bool) -> str:
     """Setup via generate_content (supports think=True), then create Chat with history."""
@@ -406,14 +455,18 @@ def _init_gemini_session(game_id: str, system: str, user: str, think: bool) -> s
     from google.genai import types
 
     thinking_budget = 1024 if think else 0
-    response = _gemini_client.models.generate_content(  # type: ignore[union-attr]
-        model=_GEMINI_MODEL,
-        contents=user,
-        config=types.GenerateContentConfig(
-            system_instruction=system,
-            thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget),
-        ),
-    )
+
+    def _call_init():
+        return _gemini_client.models.generate_content(  # type: ignore[union-attr]
+            model=_GEMINI_MODEL,
+            contents=user,
+            config=types.GenerateContentConfig(
+                system_instruction=system,
+                thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget),
+            ),
+        )
+
+    response = _gemini_with_retry(_call_init)
     text: str = response.text
 
     # Create chat with the setup exchange as initial history.
@@ -435,7 +488,7 @@ def _init_gemini_session(game_id: str, system: str, user: str, think: bool) -> s
 
 
 def _continue_gemini_session(game_id: str, user: str, chat: object) -> str:
-    response = chat.send_message(user)  # type: ignore[attr-defined]
+    response = _gemini_with_retry(lambda: chat.send_message(user))  # type: ignore[attr-defined]
     return response.text
 
 
@@ -546,9 +599,9 @@ def _build_setup_prompt(state: dict, waiting_for: dict, game_id: str) -> str:
             "",
             "Analyse the corporations and project cards. Choose the corporation that best",
             "synergises with the available project cards and write a clear strategic plan.",
-            "This strategy is your memory for the whole game — you will update it each turn.",
+            "This strategy is your memory for the whole game — keep it in mind as you play.",
             "After this, each game turn you will receive game state + numbered options and",
-            "must reply CHOICE: <number> and STRATEGY_UPDATE: <full strategy or 'no change'>.",
+            "must reply with only: CHOICE: <number>",
             "",
             "Respond in EXACTLY this format (copy card/corporation names exactly as listed):",
             "CORPORATION: <exact name from list above>",
@@ -722,12 +775,12 @@ def _parse_setup_response(
 # Action phase
 # ---------------------------------------------------------------------------
 
-def _select_action(state: dict, waiting_for: dict, game_id: str) -> tuple[dict, dict]:
+def _select_action(state: dict, waiting_for: dict, game_id: str, last_error: str | None = None) -> tuple[dict, dict]:
     options = flatten_options(waiting_for)
     if not options:
         return _default_response(waiting_for), {}
 
-    user = _build_action_prompt(state, waiting_for, options)
+    user = _build_action_prompt(state, waiting_for, options, last_error=last_error)
     logger.debug("LLM action (game=%s type=%s options=%d)",
                  game_id, waiting_for.get("type"), len(options))
     text = _call_llm_continue(game_id, user)
@@ -736,7 +789,107 @@ def _select_action(state: dict, waiting_for: dict, game_id: str) -> tuple[dict, 
     return _parse_action_response(text, options, waiting_for, game_id)
 
 
-def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict]) -> str:
+# Payment resource values (MC equivalent per unit)
+_PAYMENT_VALUES = {
+    "steel": 2, "titanium": 3, "heat": 1, "plants": 3,
+    "microbes": 2, "floaters": 3, "seeds": 5, "graphene": 4,
+    "lunaArchivesScience": 1, "kuiperAsteroids": 1, "auroraiData": 3, "spireScience": 2,
+}
+
+# Mapping from prompt keyword to Payment field name
+_PAYMENT_KEYS = {
+    "MC": "megacredits", "MEGACREDITS": "megacredits",
+    "STEEL": "steel", "TITANIUM": "titanium", "HEAT": "heat", "PLANTS": "plants",
+    "MICROBES": "microbes", "FLOATERS": "floaters", "SEEDS": "seeds",
+    "GRAPHENE": "graphene", "LUNA": "lunaArchivesScience",
+    "LUNAARCHIVESSCIENCE": "lunaArchivesScience", "KUIPER": "kuiperAsteroids",
+    "KUIPERASTEROIDS": "kuiperAsteroids", "AURORA": "auroraiData",
+    "AURORAIDATA": "auroraiData", "SPIRE": "spireScience", "SPIRESCIENCE": "spireScience",
+}
+
+def _empty_payment() -> dict:
+    return {
+        "megacredits": 0, "steel": 0, "titanium": 0, "heat": 0, "plants": 0,
+        "microbes": 0, "floaters": 0, "lunaArchivesScience": 0, "spireScience": 0,
+        "seeds": 0, "auroraiData": 0, "graphene": 0, "kuiperAsteroids": 0,
+    }
+
+
+def _parse_payment_line(text: str) -> dict | None:
+    """Parse PAYMENT: MC=5, STEEL=2, TITANIUM=3 into a full Payment dict, or None if absent."""
+    m = re.search(r"PAYMENT:\s*(.+?)(?:\n|$)", text, re.IGNORECASE)
+    if not m:
+        return None
+    parts = re.findall(r"([A-Z_]+)\s*=\s*(\d+)", m.group(1), re.IGNORECASE)
+    if not parts:
+        return None
+    payment = _empty_payment()
+    for k, v in parts:
+        field = _PAYMENT_KEYS.get(k.upper())
+        if field:
+            payment[field] = int(v)
+    return payment
+
+
+def _format_payment_section(waiting_for: dict, player: dict) -> str:
+    """Build the payment options block shown in the action prompt."""
+    wf_type = waiting_for.get("type", "")
+    po = waiting_for.get("paymentOptions") or {}
+
+    mc    = player.get("megacredits", 0)
+    steel = player.get("steel", 0)
+    ti    = player.get("titanium", 0)
+    heat  = player.get("heat", 0)
+
+    lines = ["", "Payment resources available:"]
+    lines.append(f"  MC: {mc} (always, 1:1)")
+
+    if wf_type == "projectCard":
+        if steel > 0:
+            lines.append(f"  STEEL: {steel} cubes @ 2 MC each  — only for cards with [building] tag")
+        if ti > 0:
+            if po.get("lunaTradeFederationTitanium"):
+                lines.append(f"  TITANIUM: {ti} cubes @ 3 MC each  — any card (Luna Trade Federation)")
+            else:
+                lines.append(f"  TITANIUM: {ti} cubes @ 3 MC each  — only for cards with [space] tag")
+
+    if po.get("heat") and heat > 0:
+        lines.append(f"  HEAT: {heat} cubes @ 1 MC each  — (corp special ability)")
+
+    # Show special resources that are available (non-zero in waitingFor model)
+    for wf_key, label, rate in [
+        ("microbes",            "MICROBES",      2),
+        ("floaters",            "FLOATERS",      3),
+        ("seeds",               "SEEDS",         5),
+        ("graphene",            "GRAPHENE",      4),
+        ("lunaArchivesScience", "LUNA_SCIENCE",  1),
+        ("kuiperAsteroids",     "KUIPER",        1),
+        ("auroraiData",         "AURORA_DATA",   3),
+        ("spireScience",        "SPIRE_SCIENCE", 2),
+    ]:
+        amt = waiting_for.get(wf_key) or 0
+        if amt > 0:
+            lines.append(f"  {label}: {amt} @ {rate} MC each")
+
+    if wf_type == "projectCard":
+        lines += [
+            "",
+            "After CHOICE, specify how you pay:",
+            "  PAYMENT: MC=<n>[, STEEL=<n>][, TITANIUM=<n>][, HEAT=<n>][, ...]",
+            "  Total value must cover the card's calculatedCost (can overpay with non-MC).",
+        ]
+    else:  # payment type
+        amount = waiting_for.get("amount", 0)
+        lines[1] = f"Payment options for {amount} MC:"
+        lines += [
+            "",
+            "Specify payment: PAYMENT: MC=<n>[, HEAT=<n>][, ...]",
+            "  Total value must equal (or exceed) the required amount.",
+        ]
+    return "\n".join(lines)
+
+
+def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict], last_error: str | None = None) -> str:
     g    = state.get("game", {})
     p    = state.get("player", {})
     prod = {k: v for k, v in p.get("production", {}).items() if v}
@@ -750,7 +903,14 @@ def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict]) ->
     aw = [f"{a.get('name','?')} ({'you' if a.get('playerId')==my_id else 'opponent'})"
           for a in aw_raw]
 
-    lines = [
+    lines: list[str] = []
+    if last_error:
+        lines += [
+            f"⚠ Your previous response was rejected: \"{last_error}\"",
+            "Please choose a different option or correct your payment/selection.",
+            "",
+        ]
+    lines += [
         f"Gen {g.get('generation',1)} | Temp {g.get('temperature',-30)}°C | "
         f"O₂ {g.get('oxygen',0)}% | Oceans {g.get('oceanCount',0)}/9",
         f"TR:{p.get('terraformRating',20)}  MC:{p.get('megacredits',0)}  "
@@ -776,14 +936,26 @@ def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict]) ->
             f"prod:{opp_prod}  tags:{opp_tags}"
         )
         if opp_cards:
-            lines.append(f"  {label} played: {', '.join(opp_cards[:16])}"
-                         f"{'…' if len(opp_cards) > 16 else ''}")
+            ctx = format_card_context(opp_cards, max_cards=14)
+            if ctx:
+                lines.append(f"  {label} played:")
+                for cl in ctx.splitlines():
+                    lines.append(f"  {cl}")
+            else:
+                lines.append(f"  {label} played: {', '.join(opp_cards[:14])}"
+                             f"{'…' if len(opp_cards) > 14 else ''}")
     if ms:
         lines.append(f"Milestones claimed: {ms}")
     if aw:
         lines.append(f"Awards funded: {aw}")
 
-    title = (waiting_for.get("title") or "").strip()
+    title_raw = waiting_for.get("title")
+    if isinstance(title_raw, str):
+        title = title_raw.strip()
+    elif isinstance(title_raw, dict):
+        title = title_raw.get("message", "")
+    else:
+        title = ""
     if title:
         lines += ["", f"Decision: {title}"]
 
@@ -794,17 +966,19 @@ def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict]) ->
         if ctx:
             lines += ["", ctx]
 
+    # Payment section for projectCard and payment types
+    wf_type = waiting_for.get("type", "")
+    if wf_type in ("projectCard", "payment"):
+        lines.append(_format_payment_section(waiting_for, p))
+
     lines.append("\nChoose from:")
     for i, opt in enumerate(options, 1):
         lines.append(f"  {i}. {opt['title']}")
 
-    lines += [
-        "",
-        "CHOICE: <number>",
-        "STRATEGY_UPDATE: <your full updated strategy — repeat everything you want to keep plus "
-        "any changes; this REPLACES your memory so omit nothing. Write 'no change' only if "
-        "truly nothing has changed.>",
-    ]
+    if wf_type in ("projectCard", "payment"):
+        lines += ["", "CHOICE: <number>", "PAYMENT: MC=<n>[, STEEL=<n>][, TITANIUM=<n>][, HEAT=<n>]..."]
+    else:
+        lines += ["", "CHOICE: <number>"]
     return "\n".join(lines)
 
 
@@ -814,17 +988,18 @@ def _parse_action_response(
     m = re.search(r"CHOICE:\s*(\d+)", text)
     chosen = int(m.group(1)) - 1 if m else 0
     chosen = max(0, min(chosen, len(options) - 1))
-
-    m2 = re.search(r"STRATEGY_UPDATE:\s*(.*)", text, re.DOTALL)
-    if m2:
-        upd = m2.group(1).strip()
-        if upd and not upd.lower().startswith("no change"):
-            _game_strategies[game_id] = upd
-            logger.info("Strategy updated for game %s", game_id)
-
     option = options[chosen]
     logger.info("Action choice game=%s: %d. %s", game_id, chosen + 1, option["title"])
-    return index_to_response(waiting_for, option["index"]), {
+    response = index_to_response(waiting_for, option["index"])
+
+    # Override payment if AI provided PAYMENT: line
+    wf_type = waiting_for.get("type", "")
+    if wf_type in ("projectCard", "payment"):
+        payment = _parse_payment_line(text)
+        if payment:
+            response = {**response, "payment": payment}
+
+    return response, {
         "llm_choice": chosen + 1,
         "llm_option": option["title"],
     }

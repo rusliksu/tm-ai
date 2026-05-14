@@ -380,7 +380,16 @@ def _node_title(node: dict, fallback: int) -> str:
     if isinstance(title, str) and title:
         return title
     if isinstance(title, dict):
-        return str(title.get("message", f"Option {fallback}"))
+        msg = title.get("message", f"Option {fallback}")
+        data = title.get("data")
+        if data and isinstance(data, list):
+            import re
+            def _sub(m: re.Match) -> str:
+                idx = int(m.group(1))
+                entry = data[idx] if idx < len(data) else None
+                return str(entry.get("value", m.group(0))) if isinstance(entry, dict) else m.group(0)
+            msg = re.sub(r'\$\{(\d+)\}', _sub, msg)
+        return msg
     return f"Option {fallback}"
 
 

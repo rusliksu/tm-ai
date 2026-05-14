@@ -74,6 +74,7 @@ class MoveRequest(BaseModel):
     state: MoveRequestState
     legal_actions: List[LegalAction]
     metadata: Metadata
+    last_error: Optional[str] = None
 
 
 class MoveDebug(BaseModel):

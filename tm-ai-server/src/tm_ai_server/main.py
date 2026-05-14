@@ -52,7 +52,8 @@ async def move(request: MoveRequest):
 
     state = request.state.model_dump()
 
-    input_response, debug_info = select_action(state, waiting_for, game_spec)
+    input_response, debug_info = select_action(state, waiting_for, game_spec,
+                                               last_error=request.last_error)
     debug = MoveDebug(**debug_info) if debug_info else None
     return MoveResponse(input_response=input_response, debug=debug)
 

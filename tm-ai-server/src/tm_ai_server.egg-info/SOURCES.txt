@@ -3,6 +3,7 @@ src/tm_ai_server/__init__.py
 src/tm_ai_server/config.py
 src/tm_ai_server/encoding.py
 src/tm_ai_server/inference.py
+src/tm_ai_server/llm_player.py
 src/tm_ai_server/main.py
 src/tm_ai_server/model.py
 src/tm_ai_server/schemas.py

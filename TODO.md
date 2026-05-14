@@ -107,3 +107,19 @@ uv run python -m tm_ai_server.training.train_ppo \
 - [ ] `Dockerfile` for GPU training (CUDA + stable-baselines3)
 - [ ] `docker-compose.yml` for local stack (TM server + AI server)
 - [ ] Cloud deployment scripts
+
+
+
+## Known Issues / Future Work
+
+- [ ] **Error feedback for specialized AI (NN) training**: The error-retry loop in `Player.ts:requestAiMove` (added for LLM player) should also be incorporated into training data collection. When a move is rejected with an error, the (state, bad_action, error, retry_action) tuple is valuable training signal. Currently the training logger only records the successful response. Add a `last_error` field to the training JSONL turn records, and teach the supervised/PPO trainer to use rejection signals as negative examples.
+
+- [ ] **Payment type handling in NN encoder**: `encoding.py:index_to_response` still uses `_mc_payment` (MC-only) for `projectCard` and `payment` types in the NN path. When the NN is trained to handle payment decisions, the encoder and response builder need to be extended to output per-resource payment amounts as part of the action.
+
+## Future ideas
+- use the llm as trainer for a human.
+  - exnted the new game ui with a switch called AI Trainer, default off.
+  - if this switch is on, the add a chat window with configurable width (30% by default) and 100% height on the main game screen
+  - use the given system prompts and game details as for AI mode to feed a lokal or cloud llm but instead of playing directly, the llm should provide its results in a human readable from like a traininer in the chat window. 
+  - in chat window, user can as questions and chat directly with ai
+  - below chat window next to the send new message, there should be a button "Play recommondation" that takes the LLM response and uses the API to play the recommendation from the AI directly. So we have to request the LLM to output a human readable result and a machine readable result, the latter is hidden from the user.

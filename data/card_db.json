@@ -6,7 +6,7 @@
     "tags": [
       "science"
     ],
-    "description": "",
+    "description": "+/- 2 Effect: Your global requirements are +2 or -2 steps, your choice in each case.",
     "victoryPoints": 1
   },
   "Adapted Lichen": {
@@ -61,7 +61,7 @@
     "tags": [
       "building"
     ],
-    "description": "",
+    "description": "Action: Spend 8 M€ to place 1 ocean tile. STEEL MAY BE USED as if you were playing a building card.",
     "victoryPoints": null
   },
   "Algae": {
@@ -388,7 +388,7 @@
     "tags": [
       "building"
     ],
-    "description": "",
+    "description": "Action: Decrease your energy production 1 step to increase your terraform rating 1 step.",
     "victoryPoints": null
   },
   "Extreme-Cold Fungus": {
@@ -721,7 +721,7 @@
     "tags": [
       "building"
     ],
-    "description": "",
+    "description": "Action: Spend 4 energy to gain 1 steel and raise oxygen 1 step.",
     "victoryPoints": null
   },
   "Kelp Farming": {
@@ -839,7 +839,7 @@
     "tags": [
       "building"
     ],
-    "description": "",
+    "description": "Action: Spend 1 energy to gain 1 M€ for each city tile ON MARS.",
     "victoryPoints": null
   },
   "Methane From Titan": {
@@ -1001,7 +1001,7 @@
     "tags": [
       "space"
     ],
-    "description": "",
+    "description": "Effect: When you play a space event, you gain 3 M€ and 3 heat.",
     "victoryPoints": null
   },
   "Ore Processor": {
@@ -1011,7 +1011,7 @@
     "tags": [
       "building"
     ],
-    "description": "",
+    "description": "Action: Spend 4 energy to gain 1 titanium and increase oxygen 1 step.",
     "victoryPoints": null
   },
   "Permafrost Extraction": {
@@ -1130,7 +1130,7 @@
       "science",
       "microbe"
     ],
-    "description": "",
+    "description": "Action: Add 1 microbe to this card. Action: Remove 2 microbes from this card to raise oxygen level 1 step.",
     "victoryPoints": null
   },
   "Release of Inert Gases": {
@@ -1160,7 +1160,7 @@
     "tags": [
       "building"
     ],
-    "description": "",
+    "description": "Effect: When any city tile is placed, gain 2 M€.",
     "victoryPoints": 1
   },
   "Search For Life": {
@@ -1247,7 +1247,7 @@
       "power",
       "space"
     ],
-    "description": "",
+    "description": "Action: Spend 7 M€ to increase your energy production 1 step.",
     "victoryPoints": null
   },
   "Special Design": {
@@ -1267,7 +1267,7 @@
     "tags": [
       "building"
     ],
-    "description": "",
+    "description": "Action: Spend 4 energy to gain 2 steel and increase oxygen 1 step.",
     "victoryPoints": null
   },
   "Strip Mine": {
@@ -1357,7 +1357,7 @@
     "tags": [
       "building"
     ],
-    "description": "",
+    "description": "Action: Spend 10M€ to increase your heat production 2 steps.",
     "victoryPoints": null
   },
   "Urbanized Area": {
@@ -1379,7 +1379,7 @@
       "jovian",
       "space"
     ],
-    "description": "",
+    "description": "Action: Pay 12 M€ to place an ocean tile. TITANIUM MAY BE USED as if playing a space card. 1 VP for each Jovian tag you have.",
     "victoryPoints": {
       "tag": "jovian"
     }
@@ -1557,7 +1557,7 @@
     "tags": [
       "science"
     ],
-    "description": "",
+    "description": "Effect: Each titanium you have is worth 1 M€ extra. Effect: Each steel you have is worth 1 M€ extra.",
     "victoryPoints": null
   },
   "AI Central": {
@@ -1618,7 +1618,7 @@
     "tags": [
       "earth"
     ],
-    "description": "",
+    "description": "Look at the top 4 cards from the deck. Take 2 of them into hand and discard the other 2.",
     "victoryPoints": null
   },
   "Business Network": {
@@ -1665,7 +1665,7 @@
     "type": "event",
     "cost": 1,
     "tags": [],
-    "description": "",
+    "description": "Add 1 resource to a card with at least 1 resource on it",
     "victoryPoints": null
   },
   "Commercial District": {
@@ -1700,7 +1700,7 @@
       "science",
       "building"
     ],
-    "description": "",
+    "description": "Action: Spend 1 energy to draw a card.",
     "victoryPoints": null
   },
   "Earth Catapult": {
@@ -1710,7 +1710,7 @@
     "tags": [
       "earth"
     ],
-    "description": "",
+    "description": "Effect: When you play a card, you pay 2 M€ less for it.",
     "victoryPoints": 2
   },
   "Earth Office": {
@@ -1720,7 +1720,7 @@
     "tags": [
       "earth"
     ],
-    "description": "",
+    "description": "Effect: When you play an Earth tag, you pay 3 M€ less for it.",
     "victoryPoints": null
   },
   "Electro Catapult": {
@@ -1823,7 +1823,7 @@
     "tags": [
       "science"
     ],
-    "description": "",
+    "description": "Look at the top 3 cards from the deck. Take 1 of them into hand and discard the other two",
     "victoryPoints": null
   },
   "Inventors' Guild": {
@@ -1833,7 +1833,7 @@
     "tags": [
       "science"
     ],
-    "description": "",
+    "description": "Action: Look at the top card and either buy it or discard it",
     "victoryPoints": null
   },
   "Investment Loan": {
@@ -1875,7 +1875,7 @@
     "type": "event",
     "cost": 1,
     "tags": [],
-    "description": "",
+    "description": "Place your marker on a non-reserved area. Only you may place a tile there.",
     "victoryPoints": null
   },
   "Lightning Harvest": {
@@ -1896,7 +1896,7 @@
       "science",
       "building"
     ],
-    "description": "",
+    "description": "Effect: When you play a science tag, including this, you may discard a card from hand to draw a card.",
     "victoryPoints": 1
   },
   "Mass Converter": {
@@ -1927,7 +1927,7 @@
     "tags": [
       "earth"
     ],
-    "description": "",
+    "description": "Effect: After you play an event card, you gain 3 M€.",
     "victoryPoints": null
   },
   "Medical Lab": {
@@ -2000,7 +2000,7 @@
       "science",
       "building"
     ],
-    "description": "",
+    "description": "Action: Spend 6 energy to add a science resource to this card. 2 VP for each science resource on this card.",
     "victoryPoints": {
       "resourcesHere": {},
       "each": 2
@@ -2014,7 +2014,7 @@
       "power",
       "building"
     ],
-    "description": "",
+    "description": "x Action: Spend any amount of energy and gain that amount of M€.",
     "victoryPoints": null
   },
   "Power Supply Consortium": {
@@ -2032,7 +2032,7 @@
     "type": "active",
     "cost": 5,
     "tags": [],
-    "description": "",
+    "description": "Opponents may not remove your",
     "victoryPoints": null
   },
   "Quantum Extractor": {
@@ -2110,7 +2110,7 @@
     "tags": [
       "space"
     ],
-    "description": "",
+    "description": "Action: Spend 1 titanium to add 1 fighter resource to this card. 1 VP for each fighter resource on this card.",
     "victoryPoints": {
       "resourcesHere": {}
     }
@@ -2133,7 +2133,7 @@
     "tags": [
       "space"
     ],
-    "description": "",
+    "description": "Effect: When you play a space card, you pay 2 M€ less for it.",
     "victoryPoints": 1
   },
   "Sponsors": {
@@ -2153,7 +2153,7 @@
     "tags": [
       "science"
     ],
-    "description": "",
+    "description": "Effect: After you pay for a standard project, except selling patents, you gain 3 M€.",
     "victoryPoints": null
   },
   "Tardigrades": {
@@ -2163,7 +2163,7 @@
     "tags": [
       "microbe"
     ],
-    "description": "",
+    "description": "Action: Add 1 microbe to this card. 1 VP per 4 Microbes on this card.",
     "victoryPoints": {
       "resourcesHere": {},
       "per": 4
@@ -2251,7 +2251,7 @@
       "science",
       "microbe"
     ],
-    "description": "",
+    "description": "Effect: When you play a plant, microbe, or an animal tag, including this, gain 1 plant or add 1 resource to THAT CARD.",
     "victoryPoints": null
   },
   "Virus": {
@@ -2351,7 +2351,7 @@
     "tags": [
       "building"
     ],
-    "description": "",
+    "description": "Effect: Your steel resources are worth 1 M€ extra.",
     "victoryPoints": 1
   },
   "Interplanetary Trade": {
@@ -2380,7 +2380,7 @@
     "type": "event",
     "cost": 0,
     "tags": [],
-    "description": "",
+    "description": "Use a card action that has been used this generation.",
     "victoryPoints": null
   },
   "Hi-Tech Lab": {
@@ -2391,7 +2391,7 @@
       "science",
       "building"
     ],
-    "description": "",
+    "description": "X Action: Spend any amount of energy to draw the same number of cards. TAKE 1 INTO HAND AND DISCARD THE REST.",
     "victoryPoints": 1
   },
   "Energy Market": {
@@ -2401,7 +2401,7 @@
     "tags": [
       "power"
     ],
-    "description": "",
+    "description": "x Action: Spend 2X M€ to gain X energy. Action: Decrease energy production 1 step to gain 8 M€.",
     "victoryPoints": null
   },
   "Law Suit": {
@@ -2432,7 +2432,7 @@
     "tags": [
       "space"
     ],
-    "description": "",
+    "description": "Action: Spend 1 titanium to add 1 asteroid resource here and increase M€ production 1 step. 1 VP for each 2 asteroids on this card.",
     "victoryPoints": {
       "resourcesHere": {},
       "per": 2
@@ -2456,7 +2456,7 @@
     "tags": [
       "space"
     ],
-    "description": "",
+    "description": "Action: Spend 1 titanium to add 1 asteroid resource to ANY CARD. Action: Remove 1 asteroid here to place an ocean.",
     "victoryPoints": null
   },
   "Cutting Edge Technology": {
@@ -2466,7 +2466,7 @@
     "tags": [
       "science"
     ],
-    "description": "",
+    "description": "Effect: When playing a card with a requirement, you pay 2 M€ less for it.",
     "victoryPoints": 1
   },
   "Crash Site Cleanup": {
@@ -2484,7 +2484,7 @@
     "tags": [
       "space"
     ],
-    "description": "",
+    "description": "Action: Spend 6 M€ to add 1 asteroid to ANY CARD (titanium may be used to pay for this). Action: Remove 1 asteroid here to raise temperature 1 step.",
     "victoryPoints": null
   },
   "Field-Capped City": {
@@ -2516,7 +2516,7 @@
     "tags": [
       "building"
     ],
-    "description": "",
+    "description": "Action: Spend 5 heat to gain 3 steel.",
     "victoryPoints": null
   },
   "Mohole Lake": {
@@ -2613,7 +2613,7 @@
     "tags": [
       "building"
     ],
-    "description": "",
+    "description": "Effect: When you gain an animal to ANY CARD, gain 2 M€.",
     "victoryPoints": null
   },
   "Advertising": {
@@ -2623,7 +2623,7 @@
     "tags": [
       "earth"
     ],
-    "description": "",
+    "description": "Effect: When you play a card with a basic cost of 20 M€ or more, increase your M€ production 1 step.",
     "victoryPoints": null
   },
   "Deimos Down:promo": {
@@ -2675,7 +2675,7 @@
     "tags": [
       "building"
     ],
-    "description": "",
+    "description": "Action: Spend 2 energy to gain 2 plants OR to add 1 animal to ANOTHER card.",
     "victoryPoints": null
   },
   "Bactoviral Research": {
@@ -2743,7 +2743,7 @@
     "tags": [
       "science"
     ],
-    "description": "",
+    "description": "Action: Gain 3 M€ per completed terraforming parameter.",
     "victoryPoints": null
   },
   "Aqueduct Systems": {
@@ -2782,7 +2782,7 @@
       "science",
       "building"
     ],
-    "description": "",
+    "description": "Effect: When you play a science tag, including this, add a graphene resource here. Effect: When playing a space or city tag, graphenes may be used as 4 M€ each.",
     "victoryPoints": 1
   },
   "Cyberia Systems": {
@@ -2819,7 +2819,7 @@
       "city",
       "plant"
     ],
-    "description": "",
+    "description": "Increase M€ production 2 steps. Draw 1 card. Remove 1 of your greenery tiles (does not affect oxygen.) Place a city tile there, regardless of placement rules. Gain placement bonuses as usual.",
     "victoryPoints": null
   },
   "Mars Nomads": {
@@ -2827,7 +2827,7 @@
     "type": "active",
     "cost": 13,
     "tags": [],
-    "description": "",
+    "description": "Action: MOVE THE NOMADS to an adjacent, non-reserved empty area and collect THE PLACEMENT BONUS as if placing a special tile there. No tiles may be placed on the Nomad area. PLACE THE NOMADS on a non-reserved, empty area on the game board.",
     "victoryPoints": null
   },
   "Neptunian Power Consultants": {
@@ -2850,7 +2850,7 @@
       "building",
       "plant"
     ],
-    "description": "",
+    "description": "Effect: When playing a building tag, plants may be used as 3 M€ each. (Requires that you have 2 greenery tiles. Increase plant production 1 step.)",
     "victoryPoints": null
   },
   "Red Ships": {
@@ -2888,7 +2888,7 @@
     "type": "active",
     "cost": 1,
     "tags": [],
-    "description": "",
+    "description": "Action: Spend 3 heat to gain either 4 M€ or 2 plants.",
     "victoryPoints": null
   },
   "Icy Impactors": {
@@ -2898,7 +2898,7 @@
     "tags": [
       "space"
     ],
-    "description": "",
+    "description": "Action: Spend 10 M€ (titanium may be used) to add 2 asteroids here. Action: Spend 1 asteroid here to place an ocean tile. FIRST PLAYER CHOOSES WHERE YOU MUST PLACE IT.",
     "victoryPoints": null
   },
   "Soil Enrichment": {
@@ -2997,7 +2997,7 @@
     "type": "event",
     "cost": 7,
     "tags": [],
-    "description": "",
+    "description": "REVEAL ANY NUMBER OF OTHER CARDS FROM YOUR HAND. (YOUR OPPONENTS MAY INSPECT THEM.) GAIN 1 M€ FOR EACH REVEALED CARD.",
     "victoryPoints": 1
   },
   "Static Harvesting": {
@@ -3057,7 +3057,7 @@
       "microbe",
       "microbe"
     ],
-    "description": "",
+    "description": "(You start with 54 M€. Draw a Science card.) Effect: When ANY microbe tag is played, add a disease here and lose 4 M€ or as much as possible. When you play a science tag, remove a disease here and gain 1 TR OR if there are no diseases here, you MAY put this card face down in your EVENTS PILE to gain 3 TR.",
     "victoryPoints": null
   },
   "Philares": {
@@ -3162,7 +3162,7 @@
     "type": "prelude",
     "cost": 0,
     "tags": [],
-    "description": "",
+    "description": "Copy your other prelude's direct effect.",
     "victoryPoints": null
   },
   "Anti-desertification Techniques": {
@@ -3181,7 +3181,7 @@
     "type": "prelude",
     "cost": 0,
     "tags": [],
-    "description": "",
+    "description": "Gain 30 M€. Then pay for and perform 2 standard projects. NOTE: If you cannot afford a second standard project, spend 10 M€ instead, or as much as possible.",
     "victoryPoints": null
   },
   "Giant Solar Collector": {
@@ -3224,7 +3224,7 @@
     "tags": [
       "venus"
     ],
-    "description": "",
+    "description": "Action: Add floater to ANY card. Action: Spend one floater here to draw 1 card.",
     "victoryPoints": 1
   },
   "Aerosport Tournament": {
@@ -3307,7 +3307,7 @@
       "venus",
       "power"
     ],
-    "description": "",
+    "description": "Action: Add 1 floater to this card. Action: Spend 1 floater here to increase your energy production 1 step.",
     "victoryPoints": null
   },
   "Dirigibles": {
@@ -3317,7 +3317,7 @@
     "tags": [
       "venus"
     ],
-    "description": "",
+    "description": "Action: Add 1 floater to ANY card Effect: When playing a Venus tag, Floaters here may be used as payment, and are worth 3M€ each.",
     "victoryPoints": null
   },
   "Extractor Balloons": {
@@ -3364,7 +3364,7 @@
     "tags": [
       "venus"
     ],
-    "description": "",
+    "description": "Action: Spend 2 M€ to add 1 floater to THIS card. Action: Spend 2 floaters here to increase Venus 1 step.",
     "victoryPoints": null
   },
   "Freyja Biodomes": {
@@ -3449,7 +3449,7 @@
     "tags": [
       "venus"
     ],
-    "description": "",
+    "description": "Action: Spend 1 titanium to add 2 floaters here Action: Spend 2 floaters here to raise Venus 1 step",
     "victoryPoints": null
   },
   "Luna Metropolis": {
@@ -3471,7 +3471,7 @@
     "tags": [
       "venus"
     ],
-    "description": "",
+    "description": "Action: Add 1 floater to this card. Action: Spend 1 floater here to raise your M€ production 1 step.",
     "victoryPoints": null
   },
   "Maxwell Base": {
@@ -3684,7 +3684,7 @@
       "venus",
       "space"
     ],
-    "description": "",
+    "description": "Effect: When you play a Venus tag, you pay 2 M€ less for it.",
     "victoryPoints": 1
   },
   "Water to Venus": {
@@ -3860,7 +3860,7 @@
     "tags": [
       "science"
     ],
-    "description": "",
+    "description": "Effect: When you trade, you pay 1 less resource for it.",
     "victoryPoints": 1
   },
   "Earth Elevator": {
@@ -3912,7 +3912,7 @@
     "tags": [
       "science"
     ],
-    "description": "",
+    "description": "Action: Add 1 floater to ANOTHER card.",
     "victoryPoints": null
   },
   "Galilean Waystation": {
@@ -4039,7 +4039,7 @@
     "tags": [
       "earth"
     ],
-    "description": "",
+    "description": "Increase one colony tile track 1 step. Decrease another colony tile track 1 step.",
     "victoryPoints": null
   },
   "Mining Colony": {
@@ -4098,7 +4098,7 @@
     "type": "automated",
     "cost": 0,
     "tags": [],
-    "description": "",
+    "description": "Gain all your colony bonuses.",
     "victoryPoints": null
   },
   "Quantum Communications": {
@@ -4138,7 +4138,7 @@
     "tags": [
       "space"
     ],
-    "description": "",
+    "description": "Effect: When you trade, you pay 1 less resource for it.",
     "victoryPoints": null
   },
   "Refugee Camps": {
@@ -4148,7 +4148,7 @@
     "tags": [
       "earth"
     ],
-    "description": "",
+    "description": "Action: Decrease your M€ production 1 step to add a camp resource to this card. 1 VP for each camp resource on this card.",
     "victoryPoints": {
       "resourcesHere": {}
     }
@@ -4242,7 +4242,7 @@
     "tags": [
       "jovian"
     ],
-    "description": "",
+    "description": "Action: Spend 1 titanium to add 2 floaters here. Action: Spend 2 floaters here to increase your TR 1 step.",
     "victoryPoints": 2
   },
   "Titan Floating Launch-pad": {
@@ -4263,7 +4263,7 @@
       "jovian",
       "space"
     ],
-    "description": "",
+    "description": "Action: Add 2 floaters to ANY JOVIAN CARD. x Action: Spend any number of floaters here to gain the same number of titanium.",
     "victoryPoints": 1
   },
   "Trading Colony": {
@@ -4281,7 +4281,7 @@
     "type": "active",
     "cost": 6,
     "tags": [],
-    "description": "",
+    "description": "+1 Effect: When you trade, you may first increase that Colony Tile track 1 step.",
     "victoryPoints": null
   },
   "Urban Decomposers": {
@@ -4781,7 +4781,7 @@
     "type": "prelude",
     "cost": 0,
     "tags": [],
-    "description": "",
+    "description": "Play a card from hand, reducing its cost by 25 M€",
     "victoryPoints": null
   },
   "Ecology Experts": {
@@ -4823,7 +4823,7 @@
       "building",
       "space"
     ],
-    "description": "",
+    "description": "(Requires that Scientists are ruling or that you have 2 delegates there. Gain 1 M€ per planet tag and colony you have. Draw 2 cards.) (FAN EXPANSION NOTE: This includes Mars but not The Moon.)",
     "victoryPoints": null
   },
   "Ceres Tech Market": {
@@ -4834,7 +4834,7 @@
       "science",
       "space"
     ],
-    "description": "",
+    "description": "-X 2x Action: Discard any number of cards from your hand to gain 2 M€ for each discarded card. (Gain 2 M€ per colony you own.)",
     "victoryPoints": 1
   },
   "Red Appeasement": {
@@ -4842,7 +4842,7 @@
     "type": "event",
     "cost": 0,
     "tags": [],
-    "description": "",
+    "description": "Requires that Reds are ruling or that you have 2 delegates there, AND THAT NO OTHER PLAYER HAS PASSED. PASS Increase M€ production 2 steps. This counts as passing. You get no other turns this generation.",
     "victoryPoints": null
   },
   "L1 Trade Terminal": {
@@ -4852,7 +4852,7 @@
     "tags": [
       "space"
     ],
-    "description": "",
+    "description": "+2 Effect: When you trade, you may first increase that colony tile track 2 steps. 3 (Add a resource to 3 different cards that already have resources.)",
     "victoryPoints": 2
   },
   "Cloud Tourism": {
@@ -5016,7 +5016,7 @@
       "venus",
       "space"
     ],
-    "description": "",
+    "description": "Action: Reveal the top 2 cards, take any venus cards to hand for free. Any other card you either buy or discard",
     "victoryPoints": null
   },
   "Venus Shuttles": {
@@ -5099,7 +5099,7 @@
       "city",
       "earth"
     ],
-    "description": "",
+    "description": "You start with 50 M€. As your first action, draw 4 cards, then discard 3 cards from your hand. Effect: When you play a card with at least 2 tags. including this, add 1 science resource here. Effect: When you pay for a standard project, science resources here may be used as 2 M€ each.",
     "victoryPoints": null
   },
   "Applied Science": {
@@ -5149,7 +5149,7 @@
     "tags": [
       "earth"
     ],
-    "description": "",
+    "description": "Effect: Each time you become party leader, draw 1 card. Raise your TR 1 step and gain 4 M€",
     "victoryPoints": null
   },
   "Early Colonization": {
@@ -5169,7 +5169,7 @@
     "tags": [
       "space"
     ],
-    "description": "",
+    "description": "Action: Add 2 floaters to ANY card. X Action: Remove any number of floaters here to gain that many of one standard resource.",
     "victoryPoints": null
   },
   "Focused Organization": {
@@ -5177,7 +5177,7 @@
     "type": "prelude",
     "cost": 0,
     "tags": [],
-    "description": "",
+    "description": "Action: Discard 1 card and spend 1 standard resource to draw 1 card and gain 1 standard resource. Draw 1 card and gain 1 standard resource.",
     "victoryPoints": null
   },
   "High Circles": {
@@ -5187,7 +5187,7 @@
     "tags": [
       "earth"
     ],
-    "description": "",
+    "description": "Raise your TR 1 step and draw 1 card with PARTY REQUIREMENT. Place 2 delegates in one party. Effect: You have +1 influence.",
     "victoryPoints": null
   },
   "Industrial Complex": {
@@ -5317,7 +5317,7 @@
     "tags": [
       "earth"
     ],
-    "description": "",
+    "description": "Effect: Each step your TR is raised, you gain 2 M€.",
     "victoryPoints": null
   },
   "Venus Contract": {
@@ -5717,7 +5717,7 @@
     "tags": [
       "wild"
     ],
-    "description": "",
+    "description": "Set the ruling party to one of your choice. Gain 1 influence. After being played, when you perform an action, the wild tag counts as any tag of your choice.",
     "victoryPoints": null
   },
   "Executive Order": {
@@ -6526,7 +6526,7 @@
     "tags": [
       "moon"
     ],
-    "description": "",
+    "description": "Action: Gain 1 M€ for each level of mining rate.",
     "victoryPoints": null
   },
   "HE3 Lobbyists": {
@@ -6713,7 +6713,7 @@
       "science",
       "moon"
     ],
-    "description": "",
+    "description": "Action: Add 1 science resource here for each Moon tag you have. Effect: When playing a Moon tag, science resources here may be used as payment, and are worth 1M€ each.",
     "victoryPoints": null
   },
   "Luna Senate": {
@@ -6748,7 +6748,7 @@
       "science",
       "moon"
     ],
-    "description": "",
+    "description": "Requires you have 2 titanium production. Action: Add 1 science resource here, or spend 1 science resource here to raise your TR 1 step. 1 VP PER MOON TAG YOU HAVE.",
     "victoryPoints": {
       "tag": "moon"
     }
@@ -6782,7 +6782,7 @@
     "tags": [
       "science"
     ],
-    "description": "",
+    "description": "Action: Add 1 science to ANY card [EXCEPT those giving 2 VP or more per science resource.] Action: Add 2 data to ANY card.",
     "victoryPoints": null
   },
   "Martian Embassy": {
@@ -6804,7 +6804,7 @@
       "moon",
       "earth"
     ],
-    "description": "",
+    "description": "Effect: When you perform an action, your PLAYED Moon tags count as Earth tags, but not vice versa.",
     "victoryPoints": null
   },
   "Rover Drivers Union": {
@@ -6854,7 +6854,7 @@
     "tags": [
       "moon"
     ],
-    "description": "",
+    "description": "0 Effect: When playing a Moon tag, you do not pay additional steel or titanium for playing it.",
     "victoryPoints": null
   },
   "Grand Luna Academy": {
@@ -6898,7 +6898,7 @@
       "moon",
       "building"
     ],
-    "description": "",
+    "description": "Action: Spend 1 steel to add 2 data resources to ANY card. 1 VP for every 3 data resources here.",
     "victoryPoints": {
       "resourcesHere": {},
       "per": 3
@@ -6911,7 +6911,7 @@
     "tags": [
       "moon"
     ],
-    "description": "",
+    "description": "Effect: Your steel resources are worth 1 M€ extra.",
     "victoryPoints": null
   },
   "Rust Eating Bacteria": {
@@ -6921,7 +6921,7 @@
     "tags": [
       "microbe"
     ],
-    "description": "",
+    "description": "Action: Spend 1 steel to add 2 microbes here. 1 VP per 3 microbes here.",
     "victoryPoints": {
       "resourcesHere": {},
       "per": 3
@@ -6936,7 +6936,7 @@
       "moon",
       "building"
     ],
-    "description": "",
+    "description": "Action: Spend 2 steel to increase your energy production 1 step.",
     "victoryPoints": null
   },
   "Moon Tether": {
@@ -6981,7 +6981,7 @@
     "tags": [
       "moon"
     ],
-    "description": "",
+    "description": "You start with 40 M€ and 2 syndicate fleets on this card. steal Action: Spend 1 titanium to add 1 syndicate fleet on this card OR remove 1 syndicate fleet from this card to steal 2 M€ from every opponent. STEAL Effect: When you place a tile on The Moon, steal 2 M€ from opponents for each of their tiles next to yours.",
     "victoryPoints": null
   },
   "Luna Hyperloop Corporation": {
@@ -7178,7 +7178,7 @@
       "plant",
       "mars"
     ],
-    "description": "",
+    "description": "(Requires 2 ocean tiles. Lose 4 plants. Place this tile on an UNRESERVED SPACE ADJACENT TO AT LEAST 2 OCEANS. Raise oxygen 1 step. Gain 1 TR.) (Effect: Wetlands counts as a greenery tile and an ocean tile, except it can't be covered and is not one of the 9 oceans required to end the game.)",
     "victoryPoints": 1
   },
   "Rare-Earth Elements": {
@@ -7305,7 +7305,7 @@
       "mars",
       "science"
     ],
-    "description": "",
+    "description": "Effect: When you place a tile ON MARS gain 1 additional resource on the space. If the space has no bonus, gain 1 steel.",
     "victoryPoints": 2
   },
   "Early Expedition": {
@@ -7362,7 +7362,7 @@
     "tags": [
       "mars"
     ],
-    "description": "",
+    "description": "Draw the top 4 cards from the discard pile. Choose 2 to keep and discard the rest.",
     "victoryPoints": null
   },
   "Designed Organisms": {
@@ -7395,7 +7395,7 @@
     "tags": [
       "earth"
     ],
-    "description": "",
+    "description": "Opponents may not remove your basic resource production",
     "victoryPoints": null
   },
   "Secret Labs": {
@@ -7540,7 +7540,7 @@
     "tags": [
       "earth"
     ],
-    "description": "",
+    "description": "Action: Spend 2 M€ to Add 1 data to ANY card. 1 VP for every 3 data here.",
     "victoryPoints": {
       "resourcesHere": {},
       "per": 3
@@ -7637,7 +7637,7 @@
     "type": "event",
     "cost": 4,
     "tags": [],
-    "description": "",
+    "description": "The next card you play this generation can be paid for with steel or titanium despite its tags.",
     "victoryPoints": null
   },
   "Crashlanding": {
@@ -7645,7 +7645,7 @@
     "type": "event",
     "cost": 20,
     "tags": [],
-    "description": "",
+    "description": "(Place AND ORIENT this tile on a non-reserved space adjacent to no more than 1 city. Crashsite grants an ADJACENCY BONUS of 1 data, and either 1 steel or 1 titanium. When placing Crashsite, for each tile you own next it, gain those bonuses. Add 1 data to any card. Add 1 resource to any card.)",
     "victoryPoints": null
   },
   "Think Tank": {
@@ -7657,7 +7657,7 @@
       "venus",
       "science"
     ],
-    "description": "",
+    "description": "Action: Spend 2 M€ to place 1 data on any card. +/-1 global parameter Effect: When playing a card, you can remove data from this card to change the card's global requirement by 1 step for every 1 data removed.",
     "victoryPoints": null
   },
   "Botanical Experience": {
@@ -7679,7 +7679,7 @@
     "tags": [
       "power"
     ],
-    "description": "",
+    "description": "Action: Spend 1 energy to add 1 data to this card. x Action: Remove all data from this card to gain 3M€ per data removed.",
     "victoryPoints": null
   },
   "Rich Deposits": {
@@ -7760,7 +7760,7 @@
     "tags": [
       "mars"
     ],
-    "description": "",
+    "description": "Reveal cards from the deck equal to the player count plus 1. In player order starting with you, each player takes one card in hand. Discard the remaining card.",
     "victoryPoints": 1
   },
   "Nobel Labs": {
@@ -7804,7 +7804,7 @@
       "mars",
       "microbe"
     ],
-    "description": "",
+    "description": "Effect: After you play a card with a microbe tag, increase your M€ production 1 step.",
     "victoryPoints": null
   },
   "Coordinated Raid": {
@@ -8271,7 +8271,7 @@
     "type": "prelude",
     "cost": 0,
     "tags": [],
-    "description": "",
+    "description": "Draw 3 CEO cards and take one to your hand, it will be played on your first turn. Discard the other 2.",
     "victoryPoints": null
   },
   "Apollo": {
@@ -8359,7 +8359,7 @@
     "type": "ceo",
     "cost": 0,
     "tags": [],
-    "description": "",
+    "description": "Effect: Ignore placement restrictions for greenery and city tiles on Mars. Effect: Gain 2 M€ when you place a greenery or city tile on Mars.",
     "victoryPoints": null
   },
   "Greta": {
@@ -8532,7 +8532,7 @@
     "type": "ceo",
     "cost": 0,
     "tags": [],
-    "description": "",
+    "description": "Effect: MILESTONES ALWAYS COST 0 M€ FOR YOU. Effect: When any milestone is claimed, gain 3 M€.",
     "victoryPoints": null
   },
   "Will": {
@@ -8548,7 +8548,7 @@
     "type": "ceo",
     "cost": 0,
     "tags": [],
-    "description": "",
+    "description": "GAIN Once per game, gain 2 wild tags for THIS GENERATION. Effect: AFTER this action has been used, when playing a card with a requirement, you pay 1 M€ less for it.",
     "victoryPoints": null
   },
   "Xu": {
@@ -8584,7 +8584,7 @@
     "tags": [
       "space"
     ],
-    "description": "",
+    "description": "Nobody may trade for the rest of this generation.",
     "victoryPoints": null
   },
   "Clone Troopers (II)": {
@@ -8617,7 +8617,7 @@
       "power",
       "plant"
     ],
-    "description": "",
+    "description": "x x-1 max 4 Action: Spend X energy and gain X-1 plants (max 4.)",
     "victoryPoints": null
   },
   "Cloud City (V)": {
@@ -8679,7 +8679,7 @@
     "tags": [
       "science"
     ],
-    "description": "",
+    "description": "Action: Identify 1 underground resource. Effect: When ANY player identifies an underground resource that depicts an ocean, YOU gain 1 TR.",
     "victoryPoints": null
   },
   "Geoscan Satellite": {
@@ -8700,7 +8700,7 @@
     "tags": [
       "building"
     ],
-    "description": "",
+    "description": "Action: Pay 3 energy to excavate 2 underground resources.",
     "victoryPoints": null
   },
   "Underground Railway": {
@@ -8834,7 +8834,7 @@
     "tags": [
       "power"
     ],
-    "description": "",
+    "description": "Increase your energy production 2 steps and your heat production 4 steps. Place this special tile on a NON-RESERVED space that has your excavation marker.",
     "victoryPoints": null
   },
   "Tunneling Subcontractor": {
@@ -9016,7 +9016,7 @@
     "tags": [
       "building"
     ],
-    "description": "",
+    "description": "Effect: The excavate standard project costs 1 M€ less for all players. Effect: When any player excavates underground resources, you gain 1 M€ per excavation.",
     "victoryPoints": null
   },
   "Landfill": {
@@ -9086,7 +9086,7 @@
       "power",
       "science"
     ],
-    "description": "",
+    "description": "CLAIM 1 Action: Spend 2 energy identify 3 underground resources. Then claim 1 of them.",
     "victoryPoints": 1
   },
   "Stem Field Subsidies": {
@@ -9096,7 +9096,7 @@
     "tags": [
       "science"
     ],
-    "description": "",
+    "description": "Effect: Whenever you play a science tag (including this), add 1 data to this card. CLAIM 1 Action: Spend 2 resources here to identify 3 underground resources. Claim 1 of them.",
     "victoryPoints": null
   },
   "Titan Manufacturing Colony": {
@@ -9108,7 +9108,7 @@
       "space",
       "building"
     ],
-    "description": "",
+    "description": "Effect: Whenever you play a Jovian tag, (including this one), add 1 tool resource on this card. Action: Spend 1 tool resource on this card to excavate an underground resource.",
     "victoryPoints": null
   },
   "Robot Moles": {
@@ -9128,7 +9128,7 @@
     "tags": [
       "earth"
     ],
-    "description": "",
+    "description": "Effect: After any player identifies 1 or more underground resources (at once), add 1 data resource to this card. Action: Spend 4 data resources on this card to draw a card.",
     "victoryPoints": null
   },
   "Server Sabotage": {
@@ -9227,7 +9227,7 @@
     "tags": [
       "science"
     ],
-    "description": "",
+    "description": "Action: Spend 1 energy to excavate an underground resource. Requires 2 science tags. Decrease any plant production 1 step",
     "victoryPoints": null
   },
   "Micro-Geodesics": {
@@ -9259,7 +9259,7 @@
       "venus",
       "space"
     ],
-    "description": "",
+    "description": "Excavate an underground resource. Add 3 floaters to any card",
     "victoryPoints": -1
   },
   "Artesian Aquifer": {
@@ -9319,7 +9319,7 @@
     "tags": [
       "earth"
     ],
-    "description": "",
+    "description": "-2 Requires that you have no more than 0 corruption. ALL players lose 2 corruption each.",
     "victoryPoints": 2
   },
   "Monopoly": {
@@ -9428,7 +9428,7 @@
       "power",
       "building"
     ],
-    "description": "",
+    "description": "Action: Spend 1 energy to gain 1 M€ for each power tag you have.",
     "victoryPoints": null
   },
   "Voltaic Metallurgy": {
@@ -9474,7 +9474,7 @@
     "tags": [
       "science"
     ],
-    "description": "",
+    "description": "Effect: After you place a tile (on Mars or in space) that has no adjacent tiles, draw a card.",
     "victoryPoints": 1
   },
   "Cut-throat Budgeting": {
@@ -9606,7 +9606,7 @@
     "tags": [
       "earth"
     ],
-    "description": "",
+    "description": "Effect: Whenever ANY player plays a crime tag, you gain 2 MC.",
     "victoryPoints": null
   },
   "Racketeering": {
@@ -9636,7 +9636,7 @@
     "tags": [
       "earth"
     ],
-    "description": "",
+    "description": "Target a player that has at least 4 corruption. Draw 2 cards. Place this card face-down in that player's project card file.",
     "victoryPoints": "special"
   },
   "Family Connections": {
@@ -9689,7 +9689,7 @@
       "venus",
       "crime"
     ],
-    "description": "",
+    "description": "Effect: Whenever ANY player terraforms Venus 1 step, THEY also gain 2 MC. Action: Pay 1 corruption to terraform Venus 1 step.",
     "victoryPoints": null
   },
   "Deep Foundations": {
@@ -9700,7 +9700,7 @@
       "city",
       "building"
     ],
-    "description": "",
+    "description": "Action: Pay 20 M€ (STEEL MAY BE USED). Pick a valid space for a city on Mars. Excavate the underground resource in that space, if possible. Then place a city there.",
     "victoryPoints": null
   },
   "Standard Technology:u": {
@@ -9710,7 +9710,7 @@
     "tags": [
       "science"
     ],
-    "description": "",
+    "description": "REPEAT (Action: Use a standard project that you've already used this generation, with its cost reduced by 8 M€.)",
     "victoryPoints": null
   },
   "Hackers:u": {
@@ -9981,7 +9981,7 @@
     "tags": [
       "crime"
     ],
-    "description": "",
+    "description": "Gain 1 corruption. Place 2 delegates in any party. Effect: You have +1 influence.",
     "victoryPoints": null
   },
   "Cloud Vortex Outpost": {
@@ -9991,7 +9991,7 @@
     "tags": [
       "venus"
     ],
-    "description": "",
+    "description": "Raise Venus 2 steps. Place 3 floaters on this card. Action: Remove 1 floater from THIS card to add 1 floater to ANOTHER card",
     "victoryPoints": null
   }
 }
