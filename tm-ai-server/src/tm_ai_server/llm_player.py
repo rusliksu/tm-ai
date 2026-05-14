@@ -1,11 +1,22 @@
 """
 LLM-based action selection — supports Ollama (local) and Gemini (cloud).
 
-Two-phase approach:
-- Setup (initialCards / prelude): rich prompt with full rules → corporation/card
-  selection + strategy document for the rest of the game.
-- Action phase: compact prompt with strategy doc in context → choice +
-  optional strategy update.
+Session-per-game architecture:
+- Setup (initialCards): full system prompt (TM rules + board context) sent ONCE to
+  initialise the session. The model writes an opening strategy document.
+- All subsequent decisions (prelude / action): continue the same session. Only the
+  current game state and numbered options are sent — rules/board context are in
+  session memory, so they are NOT repeated each turn.
+- Strategy: requested at setup, updated on demand via STRATEGY_UPDATE in action prompts.
+  Stored in _game_strategies for logging and context-trim recovery.
+- Context trimming: if an Ollama session grows beyond MAX_SESSION_MESSAGES, it is
+  rebuilt as: original system + strategy reminder + last 40 messages.
+
+Providers:
+  Ollama  — messages[] array; Ollama server reuses KV cache for unchanged prefix.
+  Gemini  — Chat API (client.chats.create + chat.send_message); history cached server-side.
+            Setup uses generate_content with think=True, then chat is initialised with
+            that exchange as history.
 
 Env vars:
   USE_LLM=true              Enable this module (checked in inference.py)
@@ -50,8 +61,16 @@ _gemini_client = None  # lazy-initialised
 
 SETUP_TYPES = {"initialCards", "prelude"}
 
-# Per-game strategy documents: game_id → strategy text
+# Per-game strategy documents: game_id → strategy text (for logging and trim recovery)
 _game_strategies: dict[str, str] = {}
+
+# Per-game session history: game_id → messages list (Ollama) or Chat object (Gemini)
+_game_sessions: dict[str, list[dict]] = {}
+_game_chat_sessions: dict[str, object] = {}
+_session_base_system: dict[str, str] = {}  # game_id → original system (for trim)
+
+# Trim Ollama sessions when they grow beyond this many messages (system + user/assistant pairs)
+_MAX_SESSION_MESSAGES = 62  # ~30 game turns before trim
 
 # ---------------------------------------------------------------------------
 # Terraforming Mars rules reference — injected into every system prompt
@@ -216,10 +235,7 @@ def select_action_llm(state: dict, waiting_for: dict) -> tuple[dict, dict]:
         if wf_type in SETUP_TYPES:
             return _select_setup(state, waiting_for, game_id)
         else:
-            strategy = _game_strategies.get(
-                game_id, "Play a balanced game — maximise TR and card synergies."
-            )
-            return _select_action(state, waiting_for, strategy, game_id)
+            return _select_action(state, waiting_for, game_id)
     except Exception as exc:
         logger.error("LLM selection failed (game=%s type=%s): %s — using default",
                      game_id, wf_type, exc, exc_info=True)
@@ -227,47 +243,10 @@ def select_action_llm(state: dict, waiting_for: dict) -> tuple[dict, dict]:
 
 
 # ---------------------------------------------------------------------------
-# LLM provider helpers
+# LLM provider helpers — session-per-game
 # ---------------------------------------------------------------------------
 
-def _call_llm(system: str, user: str, think: bool = False) -> str:
-    """Route to the configured LLM provider. Logs prompts/response if LLM_DEBUG."""
-    if _LLM_DEBUG:
-        logger.info("=== LLM PROMPT (system, provider=%s) ===\n%s", _LLM_PROVIDER, system)
-        logger.info("=== LLM PROMPT (user) ===\n%s", user)
-
-    if _LLM_PROVIDER == "gemini":
-        text = _call_gemini(system, user, think)
-    else:
-        text = _call_ollama(system, user, think)
-
-    if _LLM_DEBUG:
-        logger.info("=== LLM RESPONSE ===\n%s", text)
-    return text
-
-
-def _call_ollama(system: str, user: str, think: bool = False) -> str:
-    """Call Ollama /api/chat. think=True enables chain-of-thought for models that support it."""
-    payload: dict = {
-        "model":  _OLLAMA_MODEL,
-        "stream": False,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user",   "content": user},
-        ],
-    }
-    # "think" is only supported by qwen3 family; other models return 400
-    if _OLLAMA_MODEL.startswith("qwen3"):
-        payload["think"] = think
-    r = requests.post(f"{_OLLAMA_URL}/api/chat", json=payload, timeout=_OLLAMA_TIMEOUT)
-    r.raise_for_status()
-    return r.json()["message"]["content"]
-
-
-def _call_gemini(system: str, user: str, think: bool = False) -> str:
-    """Call Google Gemini via the google-genai SDK.
-    think=True uses a 1024-token thinking budget; think=False disables it.
-    """
+def _ensure_gemini_client() -> None:
     global _gemini_client
     if not _GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not set")
@@ -275,9 +254,159 @@ def _call_gemini(system: str, user: str, think: bool = False) -> str:
         from google import genai
         _gemini_client = genai.Client(api_key=_GEMINI_API_KEY)
 
+
+def _call_llm_init(game_id: str, system: str, user: str, think: bool = False) -> str:
+    """Start a new session for game_id and return the first response.
+
+    Sends the full system prompt (TM rules + board context) once. All subsequent
+    calls via _call_llm_continue omit the system and rely on session memory.
+    """
+    _session_base_system[game_id] = system
+    if _LLM_DEBUG:
+        logger.info("=== LLM INIT (provider=%s game=%s) system ===\n%s",
+                    _LLM_PROVIDER, game_id, system)
+        logger.info("=== LLM INIT user ===\n%s", user)
+
+    if _LLM_PROVIDER == "gemini":
+        text = _init_gemini_session(game_id, system, user, think)
+    else:
+        text = _init_ollama_session(game_id, system, user, think)
+
+    if _LLM_DEBUG:
+        logger.info("=== LLM INIT response ===\n%s", text)
+    return text
+
+
+def _call_llm_continue(game_id: str, user: str) -> str:
+    """Continue the existing session for game_id (no system re-sent).
+
+    Falls back to a stateless call with rules + strategy if the session was lost
+    (e.g. server restart mid-game).
+    """
+    if _LLM_DEBUG:
+        logger.info("=== LLM CONTINUE (provider=%s game=%s) user ===\n%s",
+                    _LLM_PROVIDER, game_id, user)
+
+    if _LLM_PROVIDER == "gemini":
+        chat = _game_chat_sessions.get(game_id)
+        if chat is None:
+            logger.warning("No Gemini session for game %s — falling back to stateless", game_id)
+            text = _stateless_fallback(game_id, user)
+        else:
+            text = _continue_gemini_session(game_id, user, chat)
+    else:
+        session = _game_sessions.get(game_id)
+        if session is None:
+            logger.warning("No Ollama session for game %s — falling back to stateless", game_id)
+            text = _stateless_fallback(game_id, user)
+        else:
+            text = _continue_ollama_session(game_id, user, session)
+
+    if _LLM_DEBUG:
+        logger.info("=== LLM CONTINUE response ===\n%s", text)
+    return text
+
+
+def _stateless_fallback(game_id: str, user: str) -> str:
+    """Single stateless call when no session exists (server restart recovery)."""
+    strategy = _game_strategies.get(game_id, "Play a balanced game — maximise TR and card synergies.")
+    system = (
+        TM_RULES + "\n\n"
+        "You are a Terraforming Mars player. Your current strategy:\n"
+        f"{strategy}\n\n"
+        "Pick the single best action. Respond ONLY:\n"
+        "CHOICE: <number>\n"
+        "STRATEGY_UPDATE: <full updated strategy or 'no change'>"
+    )
+    if _LLM_PROVIDER == "gemini":
+        _ensure_gemini_client()
+        from google.genai import types
+        response = _gemini_client.models.generate_content(  # type: ignore[union-attr]
+            model=_GEMINI_MODEL,
+            contents=user,
+            config=types.GenerateContentConfig(
+                system_instruction=system,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+        return response.text
+    else:
+        payload: dict = {
+            "model": _OLLAMA_MODEL, "stream": False,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user",   "content": user},
+            ],
+        }
+        r = requests.post(f"{_OLLAMA_URL}/api/chat", json=payload, timeout=_OLLAMA_TIMEOUT)
+        r.raise_for_status()
+        return r.json()["message"]["content"]
+
+
+# ---------------------------------------------------------------------------
+# Ollama session management
+# ---------------------------------------------------------------------------
+
+def _init_ollama_session(game_id: str, system: str, user: str, think: bool) -> str:
+    session: list[dict] = [
+        {"role": "system", "content": system},
+        {"role": "user",   "content": user},
+    ]
+    payload: dict = {"model": _OLLAMA_MODEL, "stream": False, "messages": session}
+    if _OLLAMA_MODEL.startswith("qwen3"):
+        payload["think"] = think
+    r = requests.post(f"{_OLLAMA_URL}/api/chat", json=payload, timeout=_OLLAMA_TIMEOUT)
+    r.raise_for_status()
+    text: str = r.json()["message"]["content"]
+    session.append({"role": "assistant", "content": text})
+    _game_sessions[game_id] = session
+    return text
+
+
+def _continue_ollama_session(game_id: str, user: str, session: list[dict]) -> str:
+    session.append({"role": "user", "content": user})
+    _trim_ollama_session_if_needed(game_id, session)
+    payload: dict = {"model": _OLLAMA_MODEL, "stream": False, "messages": session}
+    # think=False for action phase
+    if _OLLAMA_MODEL.startswith("qwen3"):
+        payload["think"] = False
+    r = requests.post(f"{_OLLAMA_URL}/api/chat", json=payload, timeout=_OLLAMA_TIMEOUT)
+    r.raise_for_status()
+    text: str = r.json()["message"]["content"]
+    session.append({"role": "assistant", "content": text})
+    return text
+
+
+def _trim_ollama_session_if_needed(game_id: str, session: list[dict]) -> None:
+    """If the session is too long, rebuild it: base system+strategy + last 40 messages."""
+    if len(session) <= _MAX_SESSION_MESSAGES:
+        return
+    strategy = _game_strategies.get(game_id, "")
+    base = _session_base_system.get(game_id, session[0]["content"])
+    system_with_reminder = base
+    if strategy:
+        system_with_reminder = (
+            base + f"\n\n[CONTEXT TRIM — current strategy to continue with:\n{strategy}]"
+        )
+    tail = session[-40:]  # keep last 20 exchanges
+    session.clear()
+    session.append({"role": "system", "content": system_with_reminder})
+    session.extend(tail)
+    logger.info("Ollama session trimmed for game %s — kept last 40 messages + strategy reminder",
+                game_id)
+
+
+# ---------------------------------------------------------------------------
+# Gemini session management
+# ---------------------------------------------------------------------------
+
+def _init_gemini_session(game_id: str, system: str, user: str, think: bool) -> str:
+    """Setup via generate_content (supports think=True), then create Chat with history."""
+    _ensure_gemini_client()
     from google.genai import types
+
     thinking_budget = 1024 if think else 0
-    response = _gemini_client.models.generate_content(
+    response = _gemini_client.models.generate_content(  # type: ignore[union-attr]
         model=_GEMINI_MODEL,
         contents=user,
         config=types.GenerateContentConfig(
@@ -285,6 +414,28 @@ def _call_gemini(system: str, user: str, think: bool = False) -> str:
             thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget),
         ),
     )
+    text: str = response.text
+
+    # Create chat with the setup exchange as initial history.
+    # Action calls use thinking_budget=0 (fast responses).
+    history = [
+        types.Content(role="user",  parts=[types.Part.from_text(text=user)]),
+        types.Content(role="model", parts=[types.Part.from_text(text=text)]),
+    ]
+    chat = _gemini_client.chats.create(  # type: ignore[union-attr]
+        model=_GEMINI_MODEL,
+        config=types.GenerateContentConfig(
+            system_instruction=system,
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+        ),
+        history=history,
+    )
+    _game_chat_sessions[game_id] = chat
+    return text
+
+
+def _continue_gemini_session(game_id: str, user: str, chat: object) -> str:
+    response = chat.send_message(user)  # type: ignore[attr-defined]
     return response.text
 
 
@@ -294,22 +445,35 @@ def _call_gemini(system: str, user: str, think: bool = False) -> str:
 
 def _select_setup(state: dict, waiting_for: dict, game_id: str) -> tuple[dict, dict]:
     g = state.get("game", {})
-    game_ctx = format_game_context(
-        g.get("boardName", "tharsis"),
-        g.get("expansions") or [],
+    wf_type = waiting_for.get("type", "")
+    has_session = game_id in (
+        _game_chat_sessions if _LLM_PROVIDER == "gemini" else _game_sessions
     )
-    system = (
-        TM_RULES + "\n\n" + game_ctx + "\n\n"
-        "You are an expert Terraforming Mars strategist making the opening decisions. "
-        "Think step by step about card synergies, engine building, milestones, and awards "
-        "available on this specific board. "
-        "Follow the EXACT output format requested — no extra text before or after."
-    )
+
+    logger.info("LLM setup call (game=%s type=%s board=%s exps=%s session=%s)",
+                game_id, wf_type, g.get("boardName", "?"), g.get("expansions", []), has_session)
+
     user = _build_setup_prompt(state, waiting_for, game_id)
-    logger.info("LLM setup call (game=%s type=%s board=%s exps=%s)",
-                game_id, waiting_for.get("type"),
-                g.get("boardName", "?"), g.get("expansions", []))
-    text = _call_llm(system, user, think=True)
+
+    if wf_type == "initialCards" or not has_session:
+        # First call of the game: send full system prompt and start a new session.
+        game_ctx = format_game_context(
+            g.get("boardName", "tharsis"),
+            g.get("expansions") or [],
+        )
+        system = (
+            TM_RULES + "\n\n" + game_ctx + "\n\n"
+            "You are an expert Terraforming Mars strategist making the opening decisions. "
+            "Think step by step about card synergies, engine building, milestones, and awards "
+            "available on this specific board. Remember everything in this session — you will "
+            "continue playing this game in subsequent messages. "
+            "Follow the EXACT output format requested — no extra text before or after."
+        )
+        text = _call_llm_init(game_id, system, user, think=True)
+    else:
+        # Prelude comes after initialCards in the same game — continue the session.
+        text = _call_llm_continue(game_id, user)
+
     logger.info("Setup LLM response (game=%s):\n%s", game_id, text[:1000])
 
     input_response, strategy = _parse_setup_response(text, waiting_for, game_id)
@@ -382,7 +546,9 @@ def _build_setup_prompt(state: dict, waiting_for: dict, game_id: str) -> str:
             "",
             "Analyse the corporations and project cards. Choose the corporation that best",
             "synergises with the available project cards and write a clear strategic plan.",
-            "This strategy is your persistent memory for the whole game — be specific.",
+            "This strategy is your memory for the whole game — you will update it each turn.",
+            "After this, each game turn you will receive game state + numbered options and",
+            "must reply CHOICE: <number> and STRATEGY_UPDATE: <full strategy or 'no change'>.",
             "",
             "Respond in EXACTLY this format (copy card/corporation names exactly as listed):",
             "CORPORATION: <exact name from list above>",
@@ -399,13 +565,11 @@ def _build_setup_prompt(state: dict, waiting_for: dict, game_id: str) -> str:
         ]
 
     elif wf_type == "prelude":
-        existing = _game_strategies.get(game_id, "Play balanced.")
         p    = state.get("player", {})
         prod = {k: v for k, v in p.get("production", {}).items() if v}
         lines += [
             "# Terraforming Mars — Prelude Selection",
             f"State: MC={p.get('megacredits',0)} Production={prod}",
-            f"Strategy so far: {existing}",
             "",
             "## Prelude Options",
         ]
@@ -558,35 +722,15 @@ def _parse_setup_response(
 # Action phase
 # ---------------------------------------------------------------------------
 
-def _select_action(
-    state: dict, waiting_for: dict, strategy: str, game_id: str
-) -> tuple[dict, dict]:
+def _select_action(state: dict, waiting_for: dict, game_id: str) -> tuple[dict, dict]:
     options = flatten_options(waiting_for)
     if not options:
         return _default_response(waiting_for), {}
 
-    g = state.get("game", {})
-    game_ctx = format_game_context(
-        g.get("boardName", "tharsis"),
-        g.get("expansions") or [],
-    )
-    system = (
-        TM_RULES + "\n\n" + game_ctx + "\n\n"
-        "You are a Terraforming Mars player executing a strategic plan.\n\n"
-        f"YOUR CURRENT STRATEGY (this is your memory — it persists across turns):\n{strategy}\n\n"
-        "Before choosing, briefly analyse: what engine are opponents building from their "
-        "played cards, funded awards, and claimed milestones? Does that change your priority?\n\n"
-        "Pick the single best action from the numbered list.\n"
-        "Respond in EXACTLY this format (nothing else):\n"
-        "CHOICE: <number>\n"
-        "STRATEGY_UPDATE: <your full updated strategy — repeat every element you want to keep "
-        "plus any changes; this REPLACES your memory entirely, so omitting something means "
-        "forgetting it. Write 'no change' only if truly nothing has changed.>"
-    )
     user = _build_action_prompt(state, waiting_for, options)
-    logger.debug("Ollama action call (game=%s type=%s options=%d)",
+    logger.debug("LLM action (game=%s type=%s options=%d)",
                  game_id, waiting_for.get("type"), len(options))
-    text = _call_llm(system, user, think=False)
+    text = _call_llm_continue(game_id, user)
     logger.debug("Action response (game=%s): %s", game_id, text[:300])
 
     return _parse_action_response(text, options, waiting_for, game_id)
@@ -654,6 +798,13 @@ def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict]) ->
     for i, opt in enumerate(options, 1):
         lines.append(f"  {i}. {opt['title']}")
 
+    lines += [
+        "",
+        "CHOICE: <number>",
+        "STRATEGY_UPDATE: <your full updated strategy — repeat everything you want to keep plus "
+        "any changes; this REPLACES your memory so omit nothing. Write 'no change' only if "
+        "truly nothing has changed.>",
+    ]
     return "\n".join(lines)
 
 
