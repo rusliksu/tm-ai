@@ -21,7 +21,7 @@ The existing game loop must remain intact; AI behavior is a clean extension poin
 | `aiFallbackResponse()` (OrOptions → last SelectOption) | ✅ Done | `src/server/Player.ts` |
 | `requestAiMove()` with fallback on failure | ✅ Done | `src/server/Player.ts` |
 | `AiClient.ts` HTTP client | ✅ Done | `src/server/ai/AiClient.ts` |
-| `stateMapping.ts` — extended state (opponents, board, milestones, awards) | ✅ Done | `src/server/ai/stateMapping.ts` |
+| `stateMapping.ts` — extended state (opponents, board, milestones, awards, cardsInHand, recentLog, boardName, expansions, gameVariants) | ✅ Done | `src/server/ai/stateMapping.ts` |
 | `TrainingLogger.ts` — per-game JSONL with meta/turn/result records | ✅ Done | `src/server/ai/TrainingLogger.ts` |
 | Plan B: `setWaitingFor()` captures `pendingTrainingState` for all players | ✅ Done | `src/server/Player.ts` |
 | Plan B: `process()` calls `logTrainingTurn()` for all players | ✅ Done | `src/server/Player.ts` |
@@ -34,6 +34,8 @@ The existing game loop must remain intact; AI behavior is a clean extension poin
 | Plan A: `export_training_data.ts` (re-run engine on DB saves) | ✅ Done | `src/server/tools/export_training_data.ts` |
 | Self-play `POST /api/ai/new-game` + `/api/ai/step` | ✅ Done | `src/server/routes/ApiAiSelfPlay.ts` |
 | `game.isSelfPlay` flag (suppresses auto AI trigger) | ✅ Done | `src/server/Game.ts`, `IGame.ts`, `Player.ts` |
+| `requestAiMove` retry on `process()` failure (up to 2×, sends `last_error`) | ✅ Done | `src/server/Player.ts` |
+| `extract_card_db.ts` — renderData traversal for prelude/CEO descriptions | ✅ Done | `src/server/tools/extract_card_db.ts` |
 
 ---
 
@@ -108,6 +110,7 @@ The TM server uses a **`provide_input` paradigm**: it sends the full `PlayerInpu
 
 - Timeout or non-OK HTTP status: fallback to `aiFallbackResponse()` (last `SelectOption` in `OrOptions`, or first option as best-effort)
 - Timeout is controlled by `AI_TIMEOUT_MS` env var (default 600000ms / 10 min). A custom `undici.Agent` is used with matching `headersTimeout`/`bodyTimeout` to prevent Node.js undici's internal 300s headers timeout from firing before `AbortController`.
+- `player.process()` failure (e.g. "you do not have enough resources"): `requestAiMove` retries up to 2× with `last_error` set in the request payload so the AI can correct its choice or payment. After 2 retries, falls back to `aiFallbackResponse()`.
 - If no fallback found: error logged, no action applied (AI player stalls)
 
 ---
@@ -116,13 +119,15 @@ The TM server uses a **`provide_input` paradigm**: it sends the full `PlayerInpu
 
 `buildAiRequestState()` extracts a full-game view via `buildPlayerSnapshot()` and `buildBoardState()`:
 
-- **`game`**: id, phase, generation, oxygen, temperature, oceanCount
-- **`player`** (active player): all resources, production, tags, handSize, isAI, playedCards (card names), corporations
-- **`opponents`** (all other players): same snapshot fields as player
+- **`game`**: id, phase, generation, oxygen, temperature, oceanCount, boardName, expansions (string[]), availableMilestones (name+description), availableAwards (name+description), gameVariants (active rule variants), `recentLog` (string[] — serialized game log entries since the start of the current generation, capped at 60; includes player names, card names, tile types, placement bonuses resolved from enums)
+- **`player`** (active player): all resources, production, tags, handSize, isAI, playedCards (card names), corporations, `cardsInHand` (card names — only sent for the active AI player, not opponents)
+- **`opponents`** (all other players): resources, production, tags, handSize (count only — hand is secret), playedCards, corporations
 - **`board`**: placed tiles — spaceId, x, y, tileType, playerColor
 - **`milestones`**: claimed milestones — name, playerId
 - **`awards`**: funded awards — name, playerId
 - **`waitingFor`**: the full `PlayerInputModel` for the current decision
+
+`recentLog` serialization: `serializeLogMessage` substitutes `${N}` template placeholders using per-type handlers — `PLAYER` → player name (looked up by color), `TILE_TYPE` → human-readable tile name (greenery/ocean/city/…), `SPACE_BONUS` → resource name (titanium/steel/plant/…), `CARDS` → comma-joined list, others → string value.
 
 ---
 
@@ -235,8 +240,8 @@ Full union of types: `OrOptions | AndOptions | SelectInitialCards | SelectOption
 |---|---|---|
 | `src/server/Player.ts` | isAI flag, setWaitingFor, process, requestAiMove, fallback, Plan B logging | ✅ Done |
 | `src/server/Game.ts` | writeResult at game end | ✅ Done |
-| `src/server/ai/AiClient.ts` | HTTP client to AI server | ✅ Done |
-| `src/server/ai/stateMapping.ts` | Full state build (player + opponents + board + milestones + awards) | ✅ Done |
+| `src/server/ai/AiClient.ts` | HTTP client to AI server; `MoveRequestPayload` includes optional `last_error?: string` | ✅ Done |
+| `src/server/ai/stateMapping.ts` | Full state: player (+ cardsInHand) + opponents + board + milestones + awards + recentLog + boardName/expansions/milestones/awards/gameVariants | ✅ Done |
 | `src/server/ai/TrainingLogger.ts` | writeMeta / appendTurn / writeResult; per-game JSONL | ✅ Done |
 | `src/server/ai/index.ts` | Re-exports | ✅ Done |
 | `src/server/routes/ApiCreateGame.ts` | isAI on player create, writeMeta at game start | ✅ Done |

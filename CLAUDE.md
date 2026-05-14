@@ -92,13 +92,14 @@ specs/
 ## API Contract
 
 The TM game server calls `POST /move` with:
-- `state.game` — global state (camelCase: `generation`, `oxygen`, `temperature`, `oceanCount`)
-- `state.player` — active player resources/production/tags/playedCards/cardResources (per-card)
-- `state.opponents` — all other players (same fields including handSize)
+- `state.game` — global state: `generation`, `oxygen`, `temperature`, `oceanCount`, `boardName`, `expansions`, `availableMilestones`, `availableAwards`, `gameVariants`, `recentLog` (serialized game log entries since start of current generation)
+- `state.player` — active player: resources, production, tags, `cardsInHand` (list of card names), `playedCards`, `cardResources` (per-card), `corporations`
+- `state.opponents` — all other players: same fields plus `handSize` (count only — hand is secret)
 - `state.board` — placed tiles (id, x, y, tileType, playerColor)
 - `state.milestones` / `state.awards` — claimed/funded
 - `state.waitingFor` — full `PlayerInputModel` decision tree
 - `legal_actions[0]` — always `{action_id:"provide_input", payload:{input:<PlayerInputModel>}}`
+- `last_error` — optional; set when the previous AI response was rejected by `player.process()`, so the AI can correct its choice
 
 Response: `{input_response:{...}, debug:{...}}` — `input_response` goes directly to `player.process()`.
 
@@ -150,15 +151,17 @@ Key files in `/home/pmunk/workspace/terraforming-mars/src/server/`:
 - `Player.ts` — isAI, setWaitingFor (Plan B capture + AI trigger), process (logs turn), requestAiMove with fallback
   - `_aiMoveInProgress` flag prevents infinite retry loop
   - `!game.isSelfPlay` guard prevents auto-trigger during self-play
+  - `requestAiMove(lastError?, retryCount)` — retries up to 2× on `process()` failure, sending error message as `last_error` in next request; falls back to `aiFallbackResponse()` after max retries
   - After successful `process()`, re-triggers `requestAiMove()` if new `waitingFor` was set
 - `Game.ts` — `isSelfPlay: boolean` field; set via `newInstance(..., isSelfPlay=true)` before `gotoInitialPhase()`; writeResult in gotoEndGame
 - `IGame.ts` — `isSelfPlay: boolean` in interface
-- `ai/AiClient.ts` — HTTP client to AI server (5s timeout, reads `AI_SERVER_URL` from env)
-- `ai/stateMapping.ts` — full state; `cardResources` is per-card `{name: count}`
+- `ai/AiClient.ts` — HTTP client to AI server; `MoveRequestPayload` includes optional `last_error?: string`
+- `ai/stateMapping.ts` — full state; includes `cardsInHand` (self player only), `recentLog` (serialized game log since generation start), `boardName`, `expansions`, `availableMilestones`, `availableAwards`, `gameVariants`; `cardResources` is per-card `{name: count}`
 - `ai/TrainingLogger.ts` — accepts optional `logDir` in constructor; writeMeta/appendTurn/writeResult
 - `routes/ApiAiSelfPlay.ts` — `POST /api/ai/new-game` and `POST /api/ai/step`
 - `routes/ApiCreateGame.ts` — isAI flag, writeMeta at game creation
 - `common/app/paths.ts` — `API_AI_NEW_GAME` and `API_AI_STEP` path constants
+- `tools/extract_card_db.ts` — extracts card DB including prelude/CEO descriptions via renderData traversal
 
 ## Running the Stack
 
@@ -199,17 +202,31 @@ Supports Ollama (local, free) and Gemini (cloud, fast). Select via `LLM_PROVIDER
 |-----|---------|-------------|
 | `USE_LLM` | `false` | Enable LLM player |
 | `LLM_PROVIDER` | `ollama` | `ollama` or `gemini` |
-| `LLM_DEBUG` | `false` | Log full prompts/responses |
+| `LLM_DEBUG` | `false` | Log prompts (`>` prefix) and responses (`<` prefix) |
 | `OLLAMA_MODEL` | `qwen3:4b` | Ollama model tag |
 | `OLLAMA_TIMEOUT` | `600` | Ollama timeout (s) |
 | `GEMINI_API_KEY` | — | Google AI Studio key (required for Gemini) |
 | `GEMINI_MODEL` | `gemini-2.5-flash` | Gemini model name |
 
-**Setup phase** (`initialCards`/`prelude`): `think=True` → chain-of-thought corp + card selection, writes a 100–200 word strategy document stored per `game_id`.
+**Session-per-game architecture**: TM rules + board/expansion context sent once at game start (`_call_llm_init`); all subsequent turns continue the same session (`_call_llm_continue`) — no rules repetition.
 
-**Action phase**: `think=False` → fast direct answer, picks from numbered options, optionally updates strategy.
+**Setup phase** (`initialCards`/`prelude`): `think=True` → chain-of-thought corp + card selection, writes a 100–200 word strategy document including a TABLEAU section (played cards + effects). Strategy stored per `game_id` in `_game_strategies`.
 
-Strategy document persists in `llm_player._game_strategies` for the server lifetime.
+**Action phase**: `think=False` → fast direct answer. Strategy NOT re-requested each turn (saves tokens). Prompt shows:
+- Current resources/production/tags
+- `Your hand (N cards):` with cost, tags, description for each card
+- Opponent resources/production/tags
+- `Recent events:` from serialized game log (current generation)
+- Numbered options with blue-card-action options annotated: `Use Soletta action — <desc>`
+- Payment section for `projectCard`/`payment` decisions: AI specifies `PAYMENT: MC=N[, STEEL=N][, TITANIUM=N]...`
+
+**Error feedback**: when `last_error` is set in the request, it is prepended as `⚠ Your previous response was rejected: "..."` so the AI can correct its choice or payment.
+
+**Session recovery**: if a Gemini session is lost (503 exhausted, server restart), `_session_recovery` re-initialises a chat session using the stored strategy as context. Future turns continue it normally.
+
+**Ollama context trim**: when Ollama session exceeds `MAX_SESSION_MESSAGES` (~30 turns), strategy (including TABLEAU) is captured via an extra API call, then the session is rebuilt as: original system + strategy reminder + last 40 messages.
+
+**Gemini transient errors**: `_gemini_with_retry` retries on 503/429 with exponential backoff (5s, 10s, 3 attempts).
 
 ## Remaining Work
 

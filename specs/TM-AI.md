@@ -78,7 +78,13 @@ The TM server calls this when an AI player must make a decision. The full `Playe
       "generation": 7,
       "oxygen": 8,
       "temperature": -12,
-      "oceanCount": 5
+      "oceanCount": 5,
+      "boardName": "tharsis",
+      "expansions": ["venus", "prelude"],
+      "availableMilestones": [{"name": "Terraformer", "description": "TR ≥ 35"}],
+      "availableAwards": [{"name": "Landlord", "description": "Most tiles on board"}],
+      "gameVariants": {"draftVariant": true},
+      "recentLog": ["Alice played Nuclear Power", "Bob placed a greenery on hex-15 and received 2 plant"]
     },
     "player": {
       "id": "p456...",
@@ -92,17 +98,17 @@ The TM server calls this when an AI player must make a decision. The full `Playe
       "energy": 2,
       "heat": 6,
       "handSize": 4,
-      "production": {
-        "megacredits": 4,
-        "steel": 1,
-        "titanium": 0,
-        "plants": 2,
-        "heat": 0,
-        "energy": 1
-      },
+      "cardsInHand": ["Nuclear Power", "Asteroid"],
+      "production": {"megacredits": 4, "steel": 1, "titanium": 0, "plants": 2, "heat": 0, "energy": 1},
       "tags": {"science": 2, "building": 3, "space": 1},
-      "isAI": true
+      "isAI": true,
+      "playedCards": ["Power Grid", "Soletta"],
+      "corporations": ["Thorgate"]
     },
+    "opponents": [{"id": "p2", "name": "Bob", "terraformRating": 38, "handSize": 3, ...}],
+    "board": [{"id": "H05", "x": 3, "y": 2, "tileType": 0, "playerColor": "blue"}],
+    "milestones": [{"name": "Terraformer", "playerId": "p456..."}],
+    "awards": [{"name": "Landlord", "playerId": "p456..."}],
     "waitingFor": {"type": "or", "title": "Take action", "options": ["..."]}
   },
   "legal_actions": [
@@ -110,14 +116,15 @@ The TM server calls this when an AI player must make a decision. The full `Playe
       "action_id": "provide_input",
       "type": "or",
       "title": "Take action",
-      "payload": {
-        "input": {"type": "or", "title": "Take action", "options": ["..."]}
-      }
+      "payload": {"input": {"type": "or", "title": "Take action", "options": ["..."]}}
     }
   ],
-  "metadata": {"schema_version": 1}
+  "metadata": {"schema_version": 1},
+  "last_error": "You do not have enough steel to pay for this card"
 }
 ```
+
+`last_error` is optional; set when the previous AI `input_response` was rejected by `player.process()`, enabling the AI to correct its choice or payment on retry.
 
 `legal_actions` always has exactly one entry with `action_id: "provide_input"`. The `PlayerInputModel` decision tree is in `state.waitingFor` and also in `legal_actions[0].payload.input`.
 
@@ -445,20 +452,32 @@ An alternative to the trained neural net that uses an LLM for strategic decision
 - **`ollama`** (default) — local inference, no API cost, requires Ollama daemon running
 - **`gemini`** — Google Gemini cloud API, fast (~1s/move), free tier available
 
-### Architecture
+### Architecture — Session-per-game
 
 ```
-Game start (initialCards / prelude)
-    → configured LLM, think=True (chain-of-thought for opening decisions)
-    → outputs: corporation/card selection + strategy document (100-200 words)
+Game start (initialCards)
+    → _call_llm_init: TM rules + board/expansion/milestone/award context sent ONCE
+      think=True (chain-of-thought), outputs corp/card selection + strategy document
+      (100-200 words) including TABLEAU section (played cards + key effects)
 
-All subsequent decisions
-    → configured LLM, think=False (fast direct answer)
-    → strategy document passed as system context
-    → outputs: action choice + optional strategy revision
+All subsequent decisions (prelude, action phase)
+    → _call_llm_continue: continues same session — no rules re-sent
+      think=False (fast direct answer)
+      Prompt shows: resources, hand cards with descriptions, opponent state,
+      recent game log (current generation), numbered options with blue-card
+      action descriptions inline, payment section where applicable
+      → outputs: CHOICE: N  [PAYMENT: MC=N, STEEL=N, ...]
 ```
 
-Strategy documents are stored per `game_id` in `_game_strategies` dict for the server lifetime.
+**Strategy documents** are stored per `game_id` in `_game_strategies` for trim recovery / fallback. Strategy is written at setup and prelude — NOT requested on every action turn.
+
+**Session recovery** (`_session_recovery`): when no session is found (503 exhausted on setup, or server restart), a new session is initialised with the stored strategy as context. Future turns continue it normally.
+
+**Ollama context trim**: when session exceeds `MAX_SESSION_MESSAGES` (~30 turns), `_capture_strategy_then_trim` makes an extra API call to capture current strategy (including TABLEAU), then rebuilds the session as: original system + strategy reminder + last 40 messages.
+
+**Error feedback**: when `last_error` is set in the request, the action prompt prepends `⚠ Your previous response was rejected: "..."` so the AI can correct its choice or payment.
+
+**Payment selection**: for `projectCard` and `payment` decisions, the prompt shows available payment resources (MC, steel, titanium, heat, special resources) and asks the AI to specify `PAYMENT: MC=N[, STEEL=N][, TITANIUM=N]...`. Parsed and merged into the `input_response`.
 
 ### Env vars
 
@@ -466,7 +485,7 @@ Strategy documents are stored per `game_id` in `_game_strategies` dict for the s
 |-----|---------|-------------|
 | `USE_LLM` | `false` | Enable LLM player |
 | `LLM_PROVIDER` | `ollama` | `ollama` or `gemini` |
-| `LLM_DEBUG` | `false` | Log full prompts and raw responses |
+| `LLM_DEBUG` | `false` | Log prompts (lines prefixed `>`) and responses (lines prefixed `<`) |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama server base URL |
 | `OLLAMA_MODEL` | `qwen3:4b` | Ollama model tag |
 | `OLLAMA_TIMEOUT` | `600` | Ollama request timeout (seconds) |
@@ -475,65 +494,50 @@ Strategy documents are stored per `game_id` in `_game_strategies` dict for the s
 
 ### Think mode
 
-Setup phase uses `think=True` (chain-of-thought for opening decisions); action phase uses `think=False` (direct fast answer).
+Setup phase uses `think=True`; action phase uses `think=False`.
 
 - **Ollama**: passed as `"think": true/false` in `/api/chat` payload — effective on qwen3 family.
 - **Gemini**: maps to `ThinkingConfig(thinking_budget=1024)` (on) or `thinking_budget=0` (off).
+  Setup uses `generate_content` (supports thinking), then creates a `Chat` with that exchange as history for all subsequent turns.
+
+### Gemini resilience
+
+`_gemini_with_retry` retries transient errors (503/429/overloaded) with exponential backoff (5s, 10s, 3 attempts total). If setup exhausts retries, the first action call triggers session recovery via `_session_recovery`.
 
 ### Key functions in `llm_player.py`
 
-- `select_action_llm(state, waiting_for)` — public entry point, routes to setup or action
-- `_call_llm(system, user, think)` — provider router; logs prompts/response if `LLM_DEBUG`
-- `_call_ollama(system, user, think)` — Ollama `/api/chat` backend
-- `_call_gemini(system, user, think)` — Google Gemini backend (lazy-init client)
-- `_select_setup(state, waiting_for, game_id)` — rich prompt for `initialCards`/`prelude`; injects board/expansion context
-- `_select_action(state, waiting_for, strategy, game_id)` — compact action prompt with strategy; injects board context + card descriptions for card-selection decisions
-- `_parse_setup_response(text, waiting_for, game_id)` — extracts CORPORATION/BUY_CARDS/STRATEGY
-- `_parse_action_response(text, options, waiting_for, game_id)` — extracts CHOICE/STRATEGY_UPDATE
-- `_extract_card_names(waiting_for)` — recursively collects card names from a `card`-type decision node
+- `select_action_llm(state, waiting_for, last_error)` — public entry point; routes to `_select_setup` or `_select_action`
+- `_call_llm_init(game_id, system, user, think)` — starts new session; stores base system for trim
+- `_call_llm_continue(game_id, user)` — continues session; falls back to `_session_recovery` if none
+- `_session_recovery(game_id, user)` — re-initialises a proper session from stored strategy
+- `_select_setup(state, waiting_for, game_id)` — rich prompt for `initialCards`/`prelude`; injects board/expansion/milestone/award context
+- `_select_action(state, waiting_for, game_id, last_error)` — compact action prompt
+- `_build_action_prompt(state, waiting_for, options, last_error)` — assembles the action prompt
+- `_build_setup_prompt(state, waiting_for, game_id)` — setup prompt with corp/card/prelude/CEO options
+- `_parse_setup_response(text, waiting_for, game_id)` — extracts CORPORATION/BUY_CARDS/PRELUDE_CARDS/CEO_CARD/STRATEGY
+- `_parse_action_response(text, options, waiting_for, game_id)` — extracts CHOICE + optional PAYMENT
+- `_format_payment_section(waiting_for, player)` — builds payment options block for projectCard/payment decisions
+- `_parse_payment_line(text)` — parses `PAYMENT: MC=N, STEEL=N, ...` into a Payment dict
+- `_get_card_desc_for_option(opt)` — returns description for `Use <CardName> action` options
+- `_extract_card_names(waiting_for)` — collects card names from `card`-type decision nodes (for research/discard descriptions)
+- `_capture_strategy_then_trim(game_id, session)` — Ollama: capture strategy then rebuild trimmed session
 
 ### Game Knowledge Database (`game_knowledge.py`)
 
-A companion module that provides structured game context injected into LLM prompts.
+- `CARD_DB` — 970 cards loaded from `data/card_db.json`. Regenerate: `cd terraforming-mars && npx tsx src/server/tools/extract_card_db.ts > ../tm-ai/data/card_db.json`. `extract_card_db.ts` traverses the CardRenderer `renderData` tree to extract descriptions for prelude, CEO, and event cards that lack a plain `description` string.
+- `BOARD_INFO`, `EXPANSION_INFO`, `GAME_VARIANT_DESCRIPTIONS` — hand-written strategic descriptions.
+- `format_card_context(names, header, max_cards)` — compact card description block for prompt injection.
+- `format_config_context(game)` — full `=== GAME CONFIGURATION ===` block using the live game state: board, expansions, game variants, and the ACTUAL milestones/awards for the game (supports randomised MA).
 
-**Sources:**
-- `CARD_DB` — loaded at startup from `data/card_db.json` (970 cards). Generated by
-  `npx tsx src/server/tools/extract_card_db.ts > tm-ai/data/card_db.json` in the TM server repo.
-  Contains `{name, type, cost, tags, description, victoryPoints}` for every card.
-- `BOARD_INFO` — hand-written descriptions of all 12 boards (special tiles, milestones, awards, strategic notes).
-- `EXPANSION_INFO` — one-paragraph summaries of all 9 expansions.
-
-**Key functions:**
-- `format_card_context(card_names, header, max_cards=20)` — returns a compact block of card descriptions for injection into prompts when cards are being selected.
-- `format_game_context(board_name, expansions)` — returns a `=== GAME CONFIGURATION ===` block with board special tiles, milestones, awards, notes, and active expansion summaries.
-
-**Injection points in `llm_player.py`:**
-- **Setup phase system prompt**: `format_game_context(board, expansions)` prepended so the AI knows which milestones/awards are in play.
-- **Setup prompt user message**: each card (corporation, project, prelude, CEO) shown with its description and tags inline.
-- **Action phase system prompt**: `format_game_context` repeated so board context is always present.
-- **Action prompt user message**: when the decision involves selecting from cards (waitingFor.type == `"card"`), `format_card_context` injects descriptions of those specific cards.
-
-**Board/expansion data source:** `stateMapping.ts` now includes `boardName` and `expansions[]` in the game context sent with every `/move` request. `schemas.py` exposes them as `GameContext.boardName` and `GameContext.expansions`.
+**Injection:** setup system prompt calls `format_config_context(game_state)`. Action prompt shows hand cards via `format_card_context(cardsInHand)` and annotates card-action options inline. Card descriptions for `card`-type selection decisions (research/discard) still use `_extract_card_names` + `format_card_context`.
 
 ### Ollama local models
-
-Install: https://ollama.com — then `ollama pull <model>`.
 
 | Model | RAM | Action time | Notes |
 |-------|-----|-------------|-------|
 | `qwen3:4b` | 2.5 GB | ~30–60s | **Recommended** — built-in think mode, free |
 | `phi4-mini` | 4 GB | ~20–40s | Fast, strong reasoning |
 | `gemma4:e4b` | 9.9 GB | ~90–120s | Larger, slower; needs 14 GB RAM total |
-
-```bash
-ollama pull qwen3:4b   # one-time download
-```
-
-### Gemini free tier setup
-
-1. Go to **https://aistudio.google.com/apikey** → "Create API key" (no credit card needed)
-2. Free limits for `gemini-2.5-flash`: **1,500 req/day**, 15 RPM
-3. Set `GEMINI_API_KEY=<key>` when starting the server
 
 ### Running
 
@@ -543,7 +547,8 @@ cd tm-ai-server && USE_LLM=true LLM_PROVIDER=ollama OLLAMA_MODEL=qwen3:4b LLM_DE
   uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000 >> /tmp/ai-server.log 2>&1 &
 
 # Gemini (cloud, ~1s/move, free tier — get key at aistudio.google.com/apikey)
-cd tm-ai-server && USE_LLM=true LLM_PROVIDER=gemini GEMINI_API_KEY=<key> LLM_DEBUG=true \
+source /home/pmunk/workspace/tm-ai/.env
+cd tm-ai-server && USE_LLM=true LLM_PROVIDER=gemini GEMINI_API_KEY=$GEMINI_API_KEY LLM_DEBUG=true \
   uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000 >> /tmp/ai-server.log 2>&1 &
 ```
 
