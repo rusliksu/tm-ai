@@ -256,6 +256,16 @@ def _ensure_gemini_client() -> None:
         _gemini_client = genai.Client(api_key=_GEMINI_API_KEY)
 
 
+def _log_prompt(header: str, text: str) -> None:
+    prefixed = '\n'.join(f'> {line}' for line in text.splitlines())
+    logger.info("%s\n%s", header, prefixed)
+
+
+def _log_response(header: str, text: str) -> None:
+    prefixed = '\n'.join(f'< {line}' for line in text.splitlines())
+    logger.info("%s\n%s", header, prefixed)
+
+
 def _call_llm_init(game_id: str, system: str, user: str, think: bool = False) -> str:
     """Start a new session for game_id and return the first response.
 
@@ -264,9 +274,8 @@ def _call_llm_init(game_id: str, system: str, user: str, think: bool = False) ->
     """
     _session_base_system[game_id] = system
     if _LLM_DEBUG:
-        logger.info("=== LLM INIT (provider=%s game=%s) system ===\n%s",
-                    _LLM_PROVIDER, game_id, system)
-        logger.info("=== LLM INIT user ===\n%s", user)
+        _log_prompt(f"=== INIT system (provider={_LLM_PROVIDER} game={game_id}) ===", system)
+        _log_prompt(f"=== INIT user (game={game_id}) ===", user)
 
     if _LLM_PROVIDER == "gemini":
         text = _init_gemini_session(game_id, system, user, think)
@@ -274,42 +283,44 @@ def _call_llm_init(game_id: str, system: str, user: str, think: bool = False) ->
         text = _init_ollama_session(game_id, system, user, think)
 
     if _LLM_DEBUG:
-        logger.info("=== LLM INIT response ===\n%s", text)
+        _log_response(f"=== INIT response (game={game_id}) ===", text)
     return text
 
 
 def _call_llm_continue(game_id: str, user: str) -> str:
     """Continue the existing session for game_id (no system re-sent).
 
-    Falls back to a stateless call with rules + strategy if the session was lost
-    (e.g. server restart mid-game).
+    Falls back to a session-recovery call with rules + strategy if the session
+    was lost (e.g. server restart mid-game or 503 exhausted on setup).
     """
     if _LLM_DEBUG:
-        logger.info("=== LLM CONTINUE (provider=%s game=%s) user ===\n%s",
-                    _LLM_PROVIDER, game_id, user)
+        _log_prompt(f"=== CONTINUE user (provider={_LLM_PROVIDER} game={game_id}) ===", user)
 
     if _LLM_PROVIDER == "gemini":
         chat = _game_chat_sessions.get(game_id)
         if chat is None:
-            logger.warning("No Gemini session for game %s — falling back to stateless", game_id)
-            text = _stateless_fallback(game_id, user)
+            logger.warning("No Gemini session for game %s — recovering session", game_id)
+            text = _session_recovery(game_id, user)
         else:
             text = _continue_gemini_session(game_id, user, chat)
     else:
         session = _game_sessions.get(game_id)
         if session is None:
-            logger.warning("No Ollama session for game %s — falling back to stateless", game_id)
-            text = _stateless_fallback(game_id, user)
+            logger.warning("No Ollama session for game %s — recovering session", game_id)
+            text = _session_recovery(game_id, user)
         else:
             text = _continue_ollama_session(game_id, user, session)
 
     if _LLM_DEBUG:
-        logger.info("=== LLM CONTINUE response ===\n%s", text)
+        _log_response(f"=== CONTINUE response (game={game_id}) ===", text)
     return text
 
 
-def _stateless_fallback(game_id: str, user: str) -> str:
-    """Single stateless call when no session exists (server restart recovery)."""
+def _session_recovery(game_id: str, user: str) -> str:
+    """Re-initialise a session when none exists (setup 503 exhausted or server restart).
+
+    Creates a proper chat session as a side-effect so all subsequent turns continue it.
+    """
     strategy = _game_strategies.get(game_id, "Play a balanced game — maximise TR and card synergies.")
     system = (
         TM_RULES + "\n\n"
@@ -318,29 +329,12 @@ def _stateless_fallback(game_id: str, user: str) -> str:
         "Pick the single best action. Respond ONLY:\n"
         "CHOICE: <number>"
     )
+    logger.info("Session recovery for game %s (strategy: %.80s…)", game_id, strategy)
+    # Initialise a proper session — future turns will use _continue_*
     if _LLM_PROVIDER == "gemini":
-        _ensure_gemini_client()
-        from google.genai import types
-        response = _gemini_with_retry(lambda: _gemini_client.models.generate_content(  # type: ignore[union-attr]
-            model=_GEMINI_MODEL,
-            contents=user,
-            config=types.GenerateContentConfig(
-                system_instruction=system,
-                thinking_config=types.ThinkingConfig(thinking_budget=0),
-            ),
-        ))
-        return response.text
+        return _init_gemini_session(game_id, system, user, think=False)
     else:
-        payload: dict = {
-            "model": _OLLAMA_MODEL, "stream": False,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user",   "content": user},
-            ],
-        }
-        r = requests.post(f"{_OLLAMA_URL}/api/chat", json=payload, timeout=_OLLAMA_TIMEOUT)
-        r.raise_for_status()
-        return r.json()["message"]["content"]
+        return _init_ollama_session(game_id, system, user, think=False)
 
 
 # ---------------------------------------------------------------------------
