@@ -117,9 +117,21 @@ uv run python -m tm_ai_server.training.train_ppo \
 - [ ] **Payment type handling in NN encoder**: `encoding.py:index_to_response` still uses `_mc_payment` (MC-only) for `projectCard` and `payment` types in the NN path. When the NN is trained to handle payment decisions, the encoder and response builder need to be extended to output per-resource payment amounts as part of the action.
 
 
-- [ ] **self-training biased**: in ApiAiSelfPlay the game setup is quite deterministic. I want the ai to train with 2-4 player but 80% of games with 2 players only. I want it to use random official boards. I want it to use random awards and milestones. I want the prelude, prelude 2, and venus packs enabled always, and in 20% of cases the promo packs. I want the terraforming world government disabled and express mode enabled always. 
+- [x] **self-training biased**: ApiAiSelfPlay now randomises player count (80%×2, 10%×3, 10%×4), board (tharsis/hellas/elysium), randomMA, prelude+prelude2+venus always, 20% promo, fastModeOption=true, solarPhaseOption=false.
 
-- [ ] **board information missing**: the AI has no information of the board. add a generic description of the board (what do the tile placement IDs mean, which IDs have which neighbours etc.) and for each board the placement bonus per placement tile, the placement tile type (normal, ocean, volcano, special - with description) and add this information to the initial prompt with the selected board.
+- [x] **board information missing**: `buildAllBoardSpaces()` adds all board spaces (id, x, y, type, bonuses, volcanic) to state. `format_board_layout()` injects board layout into initial LLM system prompt. Space selection options annotated with position + bonuses (fixes AI confusing space IDs with option numbers).
+
+- [x] **cardsInHand silently dropped** (CRITICAL bug found in game g786ed2285373): Pydantic `PlayerContext` was missing `cardsInHand` field — AI could never see its own hand. Fixed by adding `cardsInHand: List[str] = []` to schema.
+
+- [x] **recentLog silently dropped** (CRITICAL bug): `GameContext` was missing `recentLog` field — AI never saw recent game events. Fixed by adding `recentLog: List[str] = []` to schema.
+
+- [x] **victoryPoints added**: `buildPlayerSnapshot()` now emits `victoryPoints` (current VP total). Shown in action prompt for both self and opponents so AI can assess score standing.
+
+- [ ] **Context accumulation / tableau memory**: Over a 15-generation game the Gemini session accumulates ~150+ messages. The AI was asked to memorise its tableau but later turns may attend less to early session content. Consider re-injecting a tableau summary each turn OR compressing at each generation boundary.
+
+- [ ] **Terraforming urgency signal**: AI needs to know if the game is ending soon. Add `estGenerationsLeft` (estimated remaining generations based on current global parameter pace) to the game state or action prompt.
+
+- [ ] **Opponent engine summary**: AI has opponent resources/tags but no engine-type summary. Consider adding a brief "opponent strategy" tag to help the AI decide what to deny or race.
 
 ## Future ideas
 - use the llm as trainer for a human.
