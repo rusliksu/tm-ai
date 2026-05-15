@@ -11,8 +11,11 @@ if not _app_logger.handlers:
     _app_logger.propagate = False
 
 from .config import STATE_DIM, HIDDEN_SIZES, ACTION_SPACE_SIZE, PORT
-from .inference import select_action
-from .schemas import HealthResponse, MoveDebug, MoveRequest, MoveResponse, VersionResponse
+from .inference import select_action, select_advice
+from .schemas import (
+    AdviceRequest, AdviceResponse, HealthResponse, MoveDebug,
+    MoveRequest, MoveResponse, VersionResponse,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +59,19 @@ async def move(request: MoveRequest):
                                                last_error=request.last_error)
     debug = MoveDebug(**debug_info) if debug_info else None
     return MoveResponse(input_response=input_response, debug=debug)
+
+
+@app.post("/advise", response_model=AdviceResponse)
+async def advise(request: AdviceRequest):
+    waiting_for = request.state.waitingFor
+    if waiting_for is None:
+        raise HTTPException(status_code=400, detail="state.waitingFor is required")
+
+    state = request.state.model_dump()
+    advice_text, recommendation = select_advice(
+        state, waiting_for, request.game_id, user_question=request.user_question
+    )
+    return AdviceResponse(advice_text=advice_text, recommendation=recommendation)
 
 
 if __name__ == "__main__":

@@ -159,9 +159,12 @@ Key files in `/home/pmunk/workspace/terraforming-mars/src/server/`:
 - `ai/stateMapping.ts` — full state; includes `cardsInHand` (self player only), `recentLog` (serialized game log since generation start), `boardName`, `expansions`, `availableMilestones`, `availableAwards`, `gameVariants`; `cardResources` is per-card `{name: count}`
 - `ai/TrainingLogger.ts` — accepts optional `logDir` in constructor; writeMeta/appendTurn/writeResult
 - `routes/ApiAiSelfPlay.ts` — `POST /api/ai/new-game` and `POST /api/ai/step`
+- `routes/ApiAiAdvice.ts` — `POST /api/ai/advice` and `POST /api/ai/play-recommendation` (AI Trainer; requires `game.aiTrainerEnabled`)
 - `routes/ApiCreateGame.ts` — isAI flag, writeMeta at game creation
-- `common/app/paths.ts` — `API_AI_NEW_GAME` and `API_AI_STEP` path constants
+- `common/app/paths.ts` — `API_AI_NEW_GAME`, `API_AI_STEP`, `API_AI_ADVICE`, `API_AI_PLAY_RECOMMENDATION` path constants
 - `tools/extract_card_db.ts` — extracts card DB including prelude/CEO descriptions via renderData traversal
+- `client/components/ai/AiTrainerChat.vue` — coaching chat sidebar; auto-fetches advice on each new decision, shows Play Recommendation button
+- `client/components/create/CreateGameForm.vue` — `aiTrainerEnabled` checkbox (under Show timers)
 
 ## Running the Stack
 
@@ -206,7 +209,8 @@ Supports Ollama (local, free) and Gemini (cloud, fast). Select via `LLM_PROVIDER
 | `OLLAMA_MODEL` | `qwen3:4b` | Ollama model tag |
 | `OLLAMA_TIMEOUT` | `600` | Ollama timeout (s) |
 | `GEMINI_API_KEY` | — | Google AI Studio key (required for Gemini) |
-| `GEMINI_MODEL` | `gemini-2.5-flash` | Gemini model name |
+| `GEMINI_MODEL` | `gemini-2.5-flash-lite` | Gemini model — supported: `gemini-3-pro`, `gemini-3-flash`, `gemini-3-flash-lite`, `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite` (any Google AI Studio name accepted) |
+| `GEMINI_THINKING_BUDGET` | `1024` | Thinking tokens per turn (setup + every action) |
 
 **Session-per-game architecture**: TM rules + board/expansion context sent once at game start (`_call_llm_init`); all subsequent turns continue the same session (`_call_llm_continue`) — no rules repetition.
 
@@ -226,7 +230,15 @@ Supports Ollama (local, free) and Gemini (cloud, fast). Select via `LLM_PROVIDER
 
 **Ollama context trim**: when Ollama session exceeds `MAX_SESSION_MESSAGES` (~30 turns), strategy (including TABLEAU) is captured via an extra API call, then the session is rebuilt as: original system + strategy reminder + last 40 messages.
 
+**Gemini context caching**: system prompt is cached once per game via `client.caches.create` (TTL 3600s). All turns use `cached_content=name` — billed once, not per turn. TTL refreshed every 50 min; on refresh failure the chat is rebuilt with inline `system_instruction`.
+
+**Gemini per-generation trim**: at each generation bump, strategy is summarised in 100 words and the chat history is rebuilt with only the last 4 turns + summary. Keeps context small regardless of game length.
+
+**Description elision**: for discard/keep/draft decisions (`wf_type == "card"`) where all cards are already in the hand block, descriptions are replaced with `"(see hand above)"` — saves ~50–200 tokens per such turn.
+
 **Gemini transient errors**: `_gemini_with_retry` retries on 503/429 with exponential backoff (5s, 10s, 3 attempts).
+
+**AI Trainer** (`select_action_advise`): activated via `POST /advise` when `aiTrainerEnabled=true`. Uses `trainer:<game_id>` session namespace (separate from AI-player session). Instructs the LLM to produce coaching text + `<recommendation>CHOICE: N [PAYMENT: ...]</recommendation>` in one response; the server splits these before returning `{advice_text, recommendation}`. Requires `USE_LLM=true`.
 
 ## Remaining Work
 

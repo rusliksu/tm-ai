@@ -7,10 +7,15 @@ Session-per-game architecture:
 - All subsequent decisions (prelude / action): continue the same session. Only the
   current game state and numbered options are sent — rules/board context are in
   session memory, so they are NOT repeated each turn.
-- Strategy: written at setup (and at prelude). NOT requested on every action turn to save tokens.
-  Captured before Ollama context trim; stored in _game_strategies for trim recovery / fallback.
-- Context trimming: if an Ollama session grows beyond MAX_SESSION_MESSAGES, it is
-  rebuilt as: original system + strategy reminder + last 40 messages.
+- Thinking is enabled on EVERY turn (setup, prelude, actions, per-gen reflection).
+  Default budget controllable via GEMINI_THINKING_BUDGET (default 1024 tokens).
+- Per-generation strategy update: at the first action of each new generation, the LLM
+  is asked to restate its strategy (standing, engine, milestone/award targets, next-gen
+  priority). The response becomes natural chat history (no destructive rebuild) and is
+  stored in _game_strategies for debugging + session recovery.
+- Context trimming: Ollama-only — if a session grows beyond MAX_SESSION_MESSAGES, it
+  is rebuilt as: original system + strategy reminder + last 40 messages. Gemini's 1M
+  context window makes trimming unnecessary for normal games.
 
 Providers:
   Ollama  — messages[] array; Ollama server reuses KV cache for unchanged prefix.
@@ -30,10 +35,15 @@ Env vars:
 
   Gemini (LLM_PROVIDER=gemini):
     GEMINI_API_KEY          Google AI Studio API key (required)
-    GEMINI_MODEL            Model name (default: gemini-2.5-flash)
+    GEMINI_MODEL            Model name (default: gemini-2.5-flash-lite)
+                            Supported: gemini-3-pro, gemini-3-flash, gemini-3-flash-lite,
+                            gemini-2.5-pro, gemini-2.5-flash, gemini-2.5-flash-lite
+                            (any Google AI Studio model name is accepted verbatim)
+    GEMINI_THINKING_BUDGET  Thinking tokens per turn (default: 1024)
 """
 
 from __future__ import annotations
+import hashlib
 import logging
 import os
 import re
@@ -55,8 +65,9 @@ _OLLAMA_MODEL   = os.getenv("OLLAMA_MODEL", "qwen3:4b")
 _OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "600"))
 
 # Gemini settings
-_GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-_GEMINI_MODEL   = os.getenv("GEMINI_MODEL",  "gemini-2.5-flash")
+_GEMINI_API_KEY        = os.getenv("GEMINI_API_KEY", "")
+_GEMINI_MODEL          = os.getenv("GEMINI_MODEL",  "gemini-2.5-flash-lite")
+_GEMINI_THINKING_BUDGET = int(os.getenv("GEMINI_THINKING_BUDGET", "1024"))
 
 _gemini_client = None  # lazy-initialised
 
@@ -68,7 +79,14 @@ _game_strategies: dict[str, str] = {}
 # Per-game session history: game_id → messages list (Ollama) or Chat object (Gemini)
 _game_sessions: dict[str, list[dict]] = {}
 _game_chat_sessions: dict[str, object] = {}
+
+# Gemini context caching: game_id → {name, created_at, system}
+_game_cache_info: dict[str, dict] = {}
+_CACHE_REFRESH_AFTER = 50 * 60  # seconds — refresh TTL before cache expires at 3600s
 _session_base_system: dict[str, str] = {}  # game_id → original system (for trim)
+
+# Per-generation Gemini strategy update: game_id → last seen generation number
+_gemini_last_generation: dict[str, int] = {}
 
 # Trim Ollama sessions when they grow beyond this many messages (system + user/assistant pairs)
 _MAX_SESSION_MESSAGES = 62  # ~30 game turns before trim
@@ -90,10 +108,21 @@ VP sources:
   • Cards: VPs printed on individual cards
 
 GLOBAL PARAMETERS (game ends when ALL three are maxed):
-  • Temperature: -30°C → +8°C  (38 steps). Raise: 8 heat, Asteroid SP, or cards.
-  • Oxygen:       0%   → 14%   (14 steps). Raise: place greenery tile or cards.
-  • Oceans:       0   → 9 tiles.           Place: Aquifer SP or cards.
+  • Temperature: -30°C → +8°C  (each step = +2°C, 20 steps). Raise: 8 heat, Asteroid SP, or cards.
+  • Oxygen:       0%   → 14%   (14 steps).                    Raise: place greenery tile or cards.
+  • Oceans:       0   → 9 tiles.                              Place: Aquifer SP or cards.
+  • Venus:        0%   → 30%   (each step = +2%, 15 steps).   Raise: Venus expansion cards/SPs.
   Each step raised = +1 TR (=+1 income and +1 VP).
+
+GLOBAL-PARAMETER MILESTONE BONUSES (one-time, awarded to the player who triggers the threshold):
+  • Temperature reaches -24°C : +1 HEAT PRODUCTION to the raising player.
+  • Temperature reaches -20°C : +1 HEAT PRODUCTION to the raising player.
+  • Temperature reaches   0°C : the raising player places 1 OCEAN tile.
+  • Oxygen reaches 8%         : temperature automatically rises +1 step (free TR + further bonuses).
+  • Venus reaches 8%          : the raising player DRAWS 1 CARD.
+  • Venus reaches 16%         : the raising player gains +1 TR.
+  These are big — timing your terraforming step to hit a threshold yourself is worth ~10 MC of value.
+  If an opponent is about to hit a threshold, consider racing them to it.
 
 RESOURCES (produced every generation):
   • MegaCredits (MC): currency. INCOME = TR + MC-production each generation.
@@ -364,7 +393,7 @@ def _continue_ollama_session(game_id: str, user: str, session: list[dict]) -> st
         _capture_strategy_then_trim(game_id, session)
     payload: dict = {"model": _OLLAMA_MODEL, "stream": False, "messages": session}
     if _OLLAMA_MODEL.startswith("qwen3"):
-        payload["think"] = False
+        payload["think"] = True  # think on every turn (was False — caused shallow choices)
     r = requests.post(f"{_OLLAMA_URL}/api/chat", json=payload, timeout=_OLLAMA_TIMEOUT)
     r.raise_for_status()
     text: str = r.json()["message"]["content"]
@@ -445,6 +474,60 @@ def _gemini_with_retry(fn):
     raise last_exc  # type: ignore[misc]
 
 
+def _create_gemini_cache(system: str) -> str | None:
+    """Create a Gemini context cache for `system`. Returns cache name or None on failure."""
+    from google.genai import types
+    try:
+        cache = _gemini_client.caches.create(  # type: ignore[union-attr]
+            model=_GEMINI_MODEL,
+            config=types.CreateCachedContentConfig(
+                system_instruction=system,
+                ttl="3600s",
+            ),
+        )
+        logger.info("Created Gemini context cache: %s", cache.name)
+        return cache.name
+    except Exception as exc:
+        logger.warning("Gemini cache creation failed (falling back to inline system): %s", exc)
+        return None
+
+
+def _maybe_refresh_gemini_cache(game_id: str) -> None:
+    """Refresh the cache TTL after 50 min; rebuild chat without cache if refresh fails."""
+    info = _game_cache_info.get(game_id)
+    if not info or time.time() - info["created_at"] < _CACHE_REFRESH_AFTER:
+        return
+    from google.genai import types
+    try:
+        _gemini_client.caches.update(  # type: ignore[union-attr]
+            name=info["name"],
+            config=types.UpdateCachedContentConfig(ttl="3600s"),
+        )
+        info["created_at"] = time.time()
+        logger.info("Refreshed Gemini cache TTL for game %s", game_id)
+    except Exception as exc:
+        logger.warning("Gemini cache TTL refresh failed (game=%s): %s — rebuilding chat without cache", game_id, exc)
+        _rebuild_gemini_chat_without_cache(game_id, info["system"])
+        del _game_cache_info[game_id]
+
+
+def _rebuild_gemini_chat_without_cache(game_id: str, system: str) -> None:
+    """Reconstruct the chat session using inline system_instruction after cache expiry."""
+    from google.genai import types
+    old_chat = _game_chat_sessions.get(game_id)
+    history = old_chat.get_history() if old_chat else []  # type: ignore[attr-defined]
+    chat = _gemini_client.chats.create(  # type: ignore[union-attr]
+        model=_GEMINI_MODEL,
+        config=types.GenerateContentConfig(
+            system_instruction=system,
+            thinking_config=types.ThinkingConfig(thinking_budget=_GEMINI_THINKING_BUDGET),
+        ),
+        history=history,
+    )
+    _game_chat_sessions[game_id] = chat
+    logger.info("Rebuilt Gemini chat without cache for game %s (cache expired)", game_id)
+
+
 def _init_gemini_session(game_id: str, system: str, user: str, think: bool) -> str:
     """Setup via generate_content (supports think=True), then create Chat with history."""
     _ensure_gemini_client()
@@ -452,38 +535,113 @@ def _init_gemini_session(game_id: str, system: str, user: str, think: bool) -> s
 
     thinking_budget = 1024 if think else 0
 
+    # Attempt to create a context cache for the system prompt (saves per-turn token cost).
+    # Include a hash of the system in the display name so stale caches are detectable.
+    sys_hash = hashlib.sha256(system.encode()).hexdigest()[:12]
+    cache_name = _create_gemini_cache(system)
+    if cache_name:
+        _game_cache_info[game_id] = {"name": cache_name, "created_at": time.time(), "system": system}
+        logger.debug("Using cached content %s for game %s (hash=%s)", cache_name, game_id, sys_hash)
+        init_config = types.GenerateContentConfig(
+            cached_content=cache_name,
+            thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget),
+        )
+        chat_config = types.GenerateContentConfig(
+            cached_content=cache_name,
+            thinking_config=types.ThinkingConfig(thinking_budget=_GEMINI_THINKING_BUDGET),
+        )
+    else:
+        init_config = types.GenerateContentConfig(
+            system_instruction=system,
+            thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget),
+        )
+        chat_config = types.GenerateContentConfig(
+            system_instruction=system,
+            thinking_config=types.ThinkingConfig(thinking_budget=_GEMINI_THINKING_BUDGET),
+        )
+
     def _call_init():
         return _gemini_client.models.generate_content(  # type: ignore[union-attr]
             model=_GEMINI_MODEL,
             contents=user,
-            config=types.GenerateContentConfig(
-                system_instruction=system,
-                thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget),
-            ),
+            config=init_config,
         )
 
     response = _gemini_with_retry(_call_init)
     text: str = response.text
 
     # Create chat with the setup exchange as initial history.
-    # Action calls use thinking_budget=0 (fast responses).
+    # Action calls use _GEMINI_THINKING_BUDGET (default 1024) — think on every turn.
     history = [
         types.Content(role="user",  parts=[types.Part.from_text(text=user)]),
         types.Content(role="model", parts=[types.Part.from_text(text=text)]),
     ]
     chat = _gemini_client.chats.create(  # type: ignore[union-attr]
         model=_GEMINI_MODEL,
-        config=types.GenerateContentConfig(
-            system_instruction=system,
-            thinking_config=types.ThinkingConfig(thinking_budget=0),
-        ),
+        config=chat_config,
         history=history,
     )
     _game_chat_sessions[game_id] = chat
     return text
 
 
+_PER_GEN_STRATEGY_PROMPT = (
+    "=== End of Generation {prev_gen}, start of Generation {gen} ===\n"
+    "Before your next action, restate your strategy. This is saved as your strategy memory and "
+    "logged for debugging — be concrete and concise.\n"
+    "Cover in ~120-180 words:\n"
+    "1. STANDING: your VP/TR vs each opponent. Ahead, level, or behind?\n"
+    "2. ENGINE: primary path to victory — engine type, key cards in play, how you score each gen.\n"
+    "3. MILESTONE TARGET: which of the 5 milestones will you claim (5 VP, max 3 in whole game, 8 MC)?\n"
+    "   List the requirement and your current progress. IF YOU ALREADY MEET ONE, "
+    "claim it next action — don't let opponents block you!\n"
+    "4. AWARD TARGET: which award will you fund and place 1st in (5 VP for 1st, 2 VP for 2nd, "
+    "max 3 funded at 8/14/20 MC)? Don't fund awards you can't win.\n"
+    "5. NEXT-GEN PRIORITY: concrete plan for this generation's actions (which card, milestone, "
+    "or terraforming step is highest value right now)."
+)
+
+
+def _per_generation_strategy_update(game_id: str, chat: object, generation: int) -> None:
+    """Ask the LLM to restate its strategy at each generation boundary.
+
+    The response becomes natural chat history (no destructive rebuild) and is stored in
+    _game_strategies for debugging + session recovery. Replaces the old _trim_gemini_session,
+    which re-injected stale strategy via a fake user/model pair at chat[0] and caused the
+    model to paraphrase that stale anchor every subsequent generation.
+    """
+    prompt = _PER_GEN_STRATEGY_PROMPT.format(prev_gen=generation - 1, gen=generation)
+    if _LLM_DEBUG:
+        _log_prompt(f"=== PER-GEN STRATEGY UPDATE (game={game_id} gen={generation}) ===", prompt)
+    try:
+        response = _gemini_with_retry(lambda: chat.send_message(prompt))  # type: ignore[attr-defined]
+        strategy = response.text.strip()
+        _game_strategies[game_id] = strategy
+        logger.info("Per-gen strategy update (game=%s gen=%d):\n%s", game_id, generation, strategy)
+        if _LLM_DEBUG:
+            _log_response(f"=== PER-GEN STRATEGY UPDATE response (game={game_id} gen={generation}) ===", strategy)
+    except Exception as exc:
+        logger.warning("Per-gen strategy update failed (game=%s gen=%d): %s", game_id, generation, exc)
+
+
+def _maybe_per_generation_update(game_id: str, generation: int) -> None:
+    """When generation number increases, run a per-generation strategy update.
+
+    Fires at the first action call of generation N+1. The Gemini chat retains full history
+    (1M-token context window — no trim needed for a typical 15-gen game).
+    """
+    last_gen = _gemini_last_generation.get(game_id)
+    if last_gen is not None and generation > last_gen:
+        chat = _game_chat_sessions.get(game_id)
+        if chat is not None:
+            logger.info("Generation bump %d→%d for game %s — running strategy update",
+                        last_gen, generation, game_id)
+            _per_generation_strategy_update(game_id, chat, generation)
+    _gemini_last_generation[game_id] = generation
+
+
 def _continue_gemini_session(game_id: str, user: str, chat: object) -> str:
+    _maybe_refresh_gemini_cache(game_id)
     response = _gemini_with_retry(lambda: chat.send_message(user))  # type: ignore[attr-defined]
     return response.text
 
@@ -782,6 +940,11 @@ def _select_action(state: dict, waiting_for: dict, game_id: str, last_error: str
     if not options:
         return _default_response(waiting_for), {}
 
+    # At each generation boundary, ask the Gemini session to restate its strategy.
+    if _LLM_PROVIDER == "gemini":
+        generation = state.get("game", {}).get("generation", 1)
+        _maybe_per_generation_update(game_id, generation)
+
     user = _build_action_prompt(state, waiting_for, options, last_error=last_error)
     logger.debug("LLM action (game=%s type=%s options=%d)",
                  game_id, waiting_for.get("type"), len(options))
@@ -789,6 +952,96 @@ def _select_action(state: dict, waiting_for: dict, game_id: str, last_error: str
     logger.debug("Action response (game=%s): %s", game_id, text[:300])
 
     return _parse_action_response(text, options, waiting_for, game_id)
+
+
+# ---------------------------------------------------------------------------
+# AI Trainer advice endpoint
+# ---------------------------------------------------------------------------
+
+_TRAINER_SYSTEM_SUFFIX = (
+    "\n\nYou are a strategy coach helping a human player. Your job is to advise, not to play. "
+    "Always produce TWO outputs in the same response:\n"
+    "1. A human-readable coaching section with strategic advice.\n"
+    "2. A hidden machine-readable section wrapped in <recommendation>...</recommendation> tags "
+    "using the same CHOICE: N [PAYMENT: ...] format as normal action responses."
+)
+
+
+def select_action_advise(
+    state: dict,
+    waiting_for: dict,
+    game_id: str,
+    user_question: str | None = None,
+) -> tuple[str, dict]:
+    """Return (advice_text, recommendation_input_response) for the AI Trainer feature.
+
+    Uses a distinct session namespace ('trainer:<game_id>') to avoid colliding with any
+    concurrent AI-player session in the same game.
+    """
+    options = flatten_options(waiting_for)
+    if not options:
+        return ("No actions available.", _default_response(waiting_for))
+
+    trainer_game_id = f"trainer:{game_id}"
+
+    if _LLM_PROVIDER == "gemini":
+        generation = state.get("game", {}).get("generation", 1)
+        _maybe_per_generation_update(trainer_game_id, generation)
+
+    prompt_lines: list[str] = []
+    prompt_lines.append(_build_action_prompt(state, waiting_for, options))
+    if user_question:
+        prompt_lines.append(f"\nUser's question: \"{user_question}\"")
+    prompt_lines += [
+        "",
+        "Provide strategic coaching advice for the human player, then give your recommendation.",
+        "Format your response as:",
+        "  [Coaching advice paragraph(s)]",
+        "  <recommendation>",
+        "  CHOICE: <number>",
+        "  [PAYMENT: MC=<n>[, STEEL=<n>] ...  # only if payment is required]",
+        "  </recommendation>",
+    ]
+    user = "\n".join(prompt_lines)
+
+    # Use or initialise a trainer session (separate namespace from the AI-player session)
+    if trainer_game_id not in (_game_chat_sessions if _LLM_PROVIDER == "gemini" else _game_sessions):
+        # Build trainer system prompt: same rules + coaching persona
+        system = _session_base_system.get(game_id, "") or _session_base_system.get(trainer_game_id, "")
+        if not system:
+            from .game_knowledge import format_config_context
+            g = state.get("game", {})
+            game_ctx = format_config_context(g)
+            system = TM_RULES + "\n\n" + game_ctx
+        system = system + _TRAINER_SYSTEM_SUFFIX
+        text = _call_llm_init(trainer_game_id, system, user, think=False)
+    else:
+        text = _call_llm_continue(trainer_game_id, user)
+
+    # Extract <recommendation>...</recommendation> block
+    rec_match = re.search(r"<recommendation>(.*?)</recommendation>", text, re.DOTALL | re.IGNORECASE)
+    if rec_match:
+        rec_text = rec_match.group(1).strip()
+        advice_text = text[:rec_match.start()].strip()
+        if not advice_text:
+            advice_text = text[rec_match.end():].strip()
+    else:
+        rec_text = text
+        advice_text = text
+
+    # Parse the recommendation using the same logic as action responses
+    m = re.search(r"CHOICE:\s*(\d+)", rec_text)
+    chosen = int(m.group(1)) - 1 if m else 0
+    chosen = max(0, min(chosen, len(options) - 1))
+    recommendation = index_to_response(waiting_for, options[chosen]["index"])
+
+    wf_type = waiting_for.get("type", "")
+    if wf_type in ("projectCard", "payment"):
+        payment = _parse_payment_line(rec_text)
+        if payment:
+            recommendation = {**recommendation, "payment": payment}
+
+    return advice_text, recommendation
 
 
 # Payment resource values (MC equivalent per unit)
@@ -1003,9 +1256,12 @@ def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict], la
     if wf_type == "card":
         card_names_in_decision = _extract_card_names(waiting_for)
         if card_names_in_decision:
-            ctx = format_card_context(card_names_in_decision, header="Cards to choose from:", max_cards=20)
-            if ctx:
-                lines += ["", ctx]
+            if _is_card_decision_about_hand(card_names_in_decision, hand_cards):
+                lines += ["", "Cards to choose from: (see hand above)"]
+            else:
+                ctx = format_card_context(card_names_in_decision, header="Cards to choose from:", max_cards=20)
+                if ctx:
+                    lines += ["", ctx]
 
     # Payment section
     if wf_type in ("projectCard", "payment"):
@@ -1071,6 +1327,14 @@ def _node_title(node: dict, fallback: int) -> str:
     if isinstance(title, dict):
         return str(title.get("message", f"Option {fallback}"))
     return f"Option {fallback}"
+
+
+def _is_card_decision_about_hand(card_names: list[str], cards_in_hand: list) -> bool:
+    """Return True when all cards in the decision are already described in the hand block."""
+    if not card_names or not cards_in_hand:
+        return False
+    hand_set = {c if isinstance(c, str) else c.get("name", "") for c in cards_in_hand}
+    return all(name in hand_set for name in card_names)
 
 
 def _extract_card_names(waiting_for: dict, max_depth: int = 3) -> list[str]:

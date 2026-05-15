@@ -42,12 +42,10 @@ class TerraformingMarsEnv(gym.Env):
 
     metadata = {"render_modes": []}
 
-    def __init__(self, server_url: str = TM_SERVER_URL, game_config: dict | None = None,
-                 log_dir: str | None = None):
+    def __init__(self, server_url: str = TM_SERVER_URL, game_config: dict | None = None):
         super().__init__()
         self.server_url = server_url.rstrip("/")
         self.game_config = {**DEFAULT_GAME_CONFIG, **(game_config or {})}
-        self.log_dir = log_dir
         self.observation_space = gym.spaces.Box(
             low=-np.inf, high=np.inf, shape=(STATE_DIM,), dtype=np.float32
         )
@@ -62,8 +60,6 @@ class TerraformingMarsEnv(gym.Env):
     def reset(self, *, seed: int | None = None, options: dict | None = None) -> tuple[np.ndarray, dict]:
         super().reset(seed=seed)
         payload = dict(self.game_config)
-        if self.log_dir:
-            payload["logDir"] = self.log_dir
         for attempt in range(5):
             try:
                 resp = requests.post(

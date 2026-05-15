@@ -200,7 +200,7 @@ def train(
         json.dump(manifest, f, indent=2)
 
     def make_env():
-        env = TerraformingMarsEnv(server_url=TM_SERVER_URL, log_dir=str(run_dir))
+        env = TerraformingMarsEnv(server_url=TM_SERVER_URL)
         return ActionMasker(env, lambda e: e.action_masks())
 
     env = make_env()

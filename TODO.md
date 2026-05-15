@@ -134,9 +134,40 @@ uv run python -m tm_ai_server.training.train_ppo \
 - [ ] **Opponent engine summary**: AI has opponent resources/tags but no engine-type summary. Consider adding a brief "opponent strategy" tag to help the AI decide what to deny or race.
 
 ## Future ideas
-- use the llm as trainer for a human.
-  - exnted the new game ui with a switch called AI Trainer, default off.
-  - if this switch is on, the add a chat window with configurable width (30% by default) and 100% height on the main game screen
-  - use the given system prompts and game details as for AI mode to feed a lokal or cloud llm but instead of playing directly, the llm should provide its results in a human readable from like a traininer in the chat window. 
-  - in chat window, user can as questions and chat directly with ai
-  - below chat window next to the send new message, there should be a button "Play recommondation" that takes the LLM response and uses the API to play the recommendation from the AI directly. So we have to request the LLM to output a human readable result and a machine readable result, the latter is hidden from the user.
+- ✅ **AI Trainer** (human coaching sidebar) — implemented.
+  - ✅ `aiTrainerEnabled` game option (default off), checkbox in CreateGameForm.
+  - ✅ `AiTrainerChat.vue` sidebar (fixed-position, resizable, width persisted to localStorage).
+  - ✅ Auto-fetches coaching advice on each new decision point; human can ask follow-up questions.
+  - ✅ LLM responds with human-readable coaching + hidden `<recommendation>` block.
+  - ✅ "Play Recommendation" button submits the recommendation via `/api/ai/play-recommendation`.
+  - ✅ Session namespace `trainer:<game_id>` — isolated from AI-player session in same game.
+  - ✅ Requires `USE_LLM=true` on the AI server.
+
+
+  # after llm test run
+  - clear all ppo training runs from the db - keep all human played games, even if played against ai. identify all games to keep by checking if player names ["Sandra", "Peter"] (ignore case) are part of the game
+  - remove the feature to log the ppo training runs - that is not required, we can always use the export feature to get the same information from the database - correct? If not correct, argue why and keep feature
+  - src/server/tools/export_training_data.ts shoudl skip all games where the jsonl log files already exist in the folder  
+  - export all human game logs again
+    - analyse my latest play in ga097581101aa - copy the exported game log to logs/llm-test/ga097581101aa - ai and tm server logs are already there. 
+    - why does the ai not fund the milestone when it is available? system prompt indicates milestones are important! 
+    - it seesm the ai playes well until generation 8, then it blunders and does not perform. what happend? context window full? why does the automatic context reset not work - check the logs if that was even triggered.
+    - make the llm model selection choosable - gemini-3-pro gemini-3-flash gemini-3-flash-light along with the 2.5 versions shall be selectable via env vars
+    - game log still contains last 20-30 moves. crop to the last moves of the opponents
+    - I think it might be good to ask the llm to re-iterate over its strategy at the end of each generation and force an output (also for debugging) - makes sense? if yes, implement!
+    - add to system prompt the benefits you get for specific level of temperature, oxygen and venus scale increasing - check the terraforming-mars implementation for details
+- update the specification then implement the changes
+
+
+# ai trainer fix
+- ai trainer side is a player-specific toogle button, not a game wide one.
+- from the chat it seems the llm has a hard time to separate both players. make sure that each player get's a separat ai trainer
+- update prompt of ai trainer to make output shorter
+- add to prompt not to use markdown, just plain text for formatting
+- play recommendation should trigger a refresh of the page in a similar way as if the the "play" button is pressed by the user
+- ai trainer did not recommend to take any of the initial cards
+- it seems some keys like s or d make the page jump to a specific location - this prevents chatting. disable this feature when ai chat is on
+- update the specification then implement the changes
+
+
+

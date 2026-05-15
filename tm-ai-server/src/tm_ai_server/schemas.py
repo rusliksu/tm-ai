@@ -91,6 +91,16 @@ class MoveResponse(BaseModel):
     debug: Optional[MoveDebug] = None
 
 
+class AdviceRequest(MoveRequest):
+    user_question: Optional[str] = None
+
+
+class AdviceResponse(BaseModel):
+    advice_text: str
+    recommendation: Dict[str, Any]
+    debug: Optional[MoveDebug] = None
+
+
 class HealthResponse(BaseModel):
     status: str = "ok"
 

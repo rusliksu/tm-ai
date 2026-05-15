@@ -157,6 +157,28 @@ The TM server calls this when an AI player must make a decision. The full `Playe
 | `SelectDelegate` | `{type:"delegate", player:<Color>}` |
 | `SelectParty` | `{type:"party", partyName:<PartyName>}` |
 
+### `POST /advise`
+
+Called by the TM server's `ApiAiAdvice` route when the human player in an AI-trainer-enabled game wants coaching. Shares the same request structure as `/move`, plus an optional `user_question`.
+
+**Request body:** same as `/move`, plus:
+```json
+{
+  "user_question": "Should I focus on science tags this turn?"
+}
+```
+
+**Response:**
+```json
+{
+  "advice_text": "Given your limited budget, passing this turn would let you accumulate 8 MC before the next phase. However, playing Nuclear Power now would lock in 2 heat production...",
+  "recommendation": {"type": "or", "index": 0, "response": {"type": "option"}},
+  "debug": null
+}
+```
+
+`advice_text` is the human-readable coaching paragraph(s). `recommendation` is a valid `input_response` dict the client can submit directly via `/api/ai/play-recommendation`.
+
 ### `GET /health`
 ```json
 {"status": "ok"}
@@ -475,6 +497,12 @@ All subsequent decisions (prelude, action phase)
 
 **Ollama context trim**: when session exceeds `MAX_SESSION_MESSAGES` (~30 turns), `_capture_strategy_then_trim` makes an extra API call to capture current strategy (including TABLEAU), then rebuilds the session as: original system + strategy reminder + last 40 messages.
 
+**Gemini context caching**: at game start, `_init_gemini_session` creates a Gemini context cache (`client.caches.create`) containing the full system prompt (TM rules + game config), with TTL 3600s. All subsequent `generate_content` and `chats.create` calls reference the cache via `cached_content=name` — the system prompt is billed once instead of repeating every turn. Cache name stored in `_game_cache_info[game_id]`. TTL is refreshed every 50 min via `_maybe_refresh_gemini_cache`; if refresh fails (cache expired), the chat is reconstructed with inline `system_instruction` using `get_history()`.
+
+**Gemini per-generation trim**: at the start of each action turn, `_maybe_trim_gemini_session` detects when `game.generation` increases. It asks the model to summarise its current strategy in 100 words, stores the result, then rebuilds the chat with a compact history (last 4 turns + strategy summary). This caps conversation history regardless of how long the game runs.
+
+**Description elision**: for `wf_type == "card"` decisions (discard, keep, draft) where all candidate cards are already in the hand block of the prompt, `_is_card_decision_about_hand` returns True and `format_card_context` is replaced with a lightweight `"(see hand above)"` note, saving ~50–200 tokens per such turn.
+
 **Error feedback**: when `last_error` is set in the request, the action prompt prepends `⚠ Your previous response was rejected: "..."` so the AI can correct its choice or payment.
 
 **Payment selection**: for `projectCard` and `payment` decisions, the prompt shows available payment resources (MC, steel, titanium, heat, special resources) and asks the AI to specify `PAYMENT: MC=N[, STEEL=N][, TITANIUM=N]...`. Parsed and merged into the `input_response`.
@@ -490,7 +518,7 @@ All subsequent decisions (prelude, action phase)
 | `OLLAMA_MODEL` | `qwen3:4b` | Ollama model tag |
 | `OLLAMA_TIMEOUT` | `600` | Ollama request timeout (seconds) |
 | `GEMINI_API_KEY` | _(required for Gemini)_ | Google AI Studio API key |
-| `GEMINI_MODEL` | `gemini-2.5-flash` | Gemini model name |
+| `GEMINI_MODEL` | `gemini-2.5-flash-lite` | Gemini model name |
 
 ### Think mode
 
@@ -503,6 +531,24 @@ Setup phase uses `think=True`; action phase uses `think=False`.
 ### Gemini resilience
 
 `_gemini_with_retry` retries transient errors (503/429/overloaded) with exponential backoff (5s, 10s, 3 attempts total). If setup exhausts retries, the first action call triggers session recovery via `_session_recovery`.
+
+### AI Trainer (`select_action_advise`)
+
+The AI Trainer is a coaching sidebar that advises a **human** player (rather than playing for them). Enabled per-game via `aiTrainerEnabled: true` in `GameOptions`.
+
+**Flow:**
+1. Human sees a "🤖 AI Trainer" panel in the game UI (`AiTrainerChat.vue`).
+2. When the game waits for the player's decision, the panel automatically POSTs to `/api/ai/advice` (TM server proxy).
+3. TM server calls `POST /advise` on the AI server, which calls `select_action_advise`.
+4. Response contains both human-readable advice and a `<recommendation>` block parsed into a valid `input_response`.
+5. Human can click **Play Recommendation** to submit it, or play manually.
+6. Human can also type a follow-up question and click **Ask** — the conversation continues in the same session.
+
+**Session isolation**: trainer sessions use the namespace `trainer:<game_id>` in `_game_sessions` / `_game_chat_sessions`, so they never collide with a concurrent AI-player session in the same game.
+
+**Dual-format response**: the LLM is instructed to always produce two sections in one reply — a coaching paragraph, then `<recommendation>CHOICE: N [PAYMENT: ...]</recommendation>`. `select_action_advise` splits these: `advice_text` is shown to the human; the recommendation block is parsed by `index_to_response` to produce the ready-to-submit `recommendation` dict.
+
+**Requires `USE_LLM=true`** — returns an error if the neural-net mode is active instead.
 
 ### Key functions in `llm_player.py`
 
@@ -521,6 +567,7 @@ Setup phase uses `think=True`; action phase uses `think=False`.
 - `_get_card_desc_for_option(opt)` — returns description for `Use <CardName> action` options
 - `_extract_card_names(waiting_for)` — collects card names from `card`-type decision nodes (for research/discard descriptions)
 - `_capture_strategy_then_trim(game_id, session)` — Ollama: capture strategy then rebuild trimmed session
+- `select_action_advise(state, waiting_for, game_id, user_question)` — AI Trainer entry point; returns `(advice_text, recommendation)`
 
 ### Game Knowledge Database (`game_knowledge.py`)
 
@@ -557,6 +604,7 @@ cd tm-ai-server && USE_LLM=true LLM_PROVIDER=gemini GEMINI_API_KEY=$GEMINI_API_K
 ## Cloud LLM Provider Comparison
 
 Cost basis: 200 moves/game × 1,000 input + 100 output tokens = 200K input / 20K output per game.
+With context caching + per-generation trim + description elision (Phase 1 optimisations), Gemini effective cost is ~3–5× lower — the system prompt is billed once per game (not per turn), and history is trimmed per generation.
 
 | Provider / Model | Input $/1M | Output $/1M | TTFT | Speed | $/game | $/1K games | Free tier |
 |---|---|---|---|---|---|---|---|
@@ -582,7 +630,7 @@ Cost basis: 200 moves/game × 1,000 input + 100 output tokens = 200K input / 20K
 ### Gemini Free Tier Setup
 
 1. Go to **https://aistudio.google.com/apikey** → create API key (no credit card required)
-2. Free limits for `gemini-2.5-flash`: **1,500 req/day**, 15 RPM, 1M TPM
+2. Free limits for `gemini-2.5-flash-lite`: **1,500 req/day**, 15 RPM, 1M TPM
 3. Start the AI server:
    ```bash
    cd tm-ai-server && USE_LLM=true LLM_PROVIDER=gemini \

@@ -205,6 +205,58 @@ The Python env (`env_tm.py`) calls these endpoints sequentially; the model plays
 
 ---
 
+## AI Trainer API
+
+Two TM-server routes for the human-facing coaching sidebar, implemented in `src/server/routes/ApiAiAdvice.ts`. Only available when `game.aiTrainerEnabled === true`.
+
+### `POST /api/ai/advice`
+
+Called by `AiTrainerChat.vue` when the game reaches a new decision point (or when the human asks a follow-up question). Proxies to `POST /advise` on the AI server.
+
+Request:
+```json
+{
+  "game_id": "g...",
+  "player_id": "p...",
+  "user_question": "Should I play Nuclear Power now?"
+}
+```
+
+Response:
+```json
+{
+  "advice_text": "Holding off on Nuclear Power this turn lets you...",
+  "recommendation": {"type": "or", "index": 2, "response": {"type": "option"}}
+}
+```
+
+### `POST /api/ai/play-recommendation`
+
+Submits the AI's recommended `input_response` on behalf of the human player (via `player.process()`), exactly as if the human had chosen that action manually.
+
+Request:
+```json
+{
+  "game_id": "g...",
+  "player_id": "p...",
+  "input_response": {"type": "or", "index": 2, "response": {"type": "option"}}
+}
+```
+
+Response: `{"success": true}`
+
+### Game option: `aiTrainerEnabled`
+
+Added to `GameOptions` (default `false`). Propagated through:
+- `NewGameConfig.aiTrainerEnabled?: boolean` (client → server)
+- `ApiCreateGame` → `gameOptions.aiTrainerEnabled`
+- `Game.aiTrainerEnabled: boolean` instance field
+- `ServerModel` → `GameOptionsModel.aiTrainerEnabled`
+- `AiTrainerChat.vue` renders in `PlayerHome.vue` when `game.gameOptions.aiTrainerEnabled`
+- Checkbox in `CreateGameForm.vue` under the timers option
+
+---
+
 ## Plan A: Re-run Engine on DB Saves
 
 **Goal:** Extract training tuples from the 82 existing historical games in the SQLite DB.
