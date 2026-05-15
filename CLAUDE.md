@@ -210,7 +210,7 @@ Supports Ollama (local, free) and Gemini (cloud, fast). Select via `LLM_PROVIDER
 | `OLLAMA_TIMEOUT` | `600` | Ollama timeout (s) |
 | `GEMINI_API_KEY` | — | Google AI Studio key (required for Gemini) |
 | `GEMINI_MODEL` | `gemini-2.5-flash-lite` | Gemini model — supported: `gemini-3-pro`, `gemini-3-flash`, `gemini-3-flash-lite`, `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite` (any Google AI Studio name accepted) |
-| `GEMINI_THINKING_BUDGET` | `1024` | Thinking tokens per turn (setup + every action) |
+| `GEMINI_THINKING_BUDGET` | `512` | Thinking tokens per turn (setup/prelude always use 1024) |
 
 **Session-per-game architecture**: TM rules + board/expansion context sent once at game start (`_call_llm_init`); all subsequent turns continue the same session (`_call_llm_continue`) — no rules repetition.
 
@@ -234,7 +234,7 @@ Supports Ollama (local, free) and Gemini (cloud, fast). Select via `LLM_PROVIDER
 
 **Gemini per-generation strategy update**: at each generation bump, `_per_generation_strategy_update` sends a structured restate prompt to the existing chat (standing, engine, milestone target with "claim it if you already qualify" reminder, award target, next-gen priority). The response becomes natural chat history and is stored in `_game_strategies`. Chat is **not** rebuilt — Gemini's 1M-token context handles full sessions. Replaces an earlier `_trim_gemini_session` that re-injected a fake user/model summary pair at chat[0] and caused the model to re-paraphrase that stale anchor every generation (observed in game `ga097581101aa`: identical opening-strategy stub re-emitted from gen 2 through gen 13).
 
-**Think on every turn**: `GEMINI_THINKING_BUDGET` (default 1024) applies to setup, prelude, every action, and the per-gen reflection. Ollama `_continue_ollama_session` also uses `think=True`. Earlier `think=False` on action turns caused the AI to emit one-line `CHOICE: N` responses without considering milestones it already qualified for.
+**Think on every turn**: `GEMINI_THINKING_BUDGET` (default 512; setup/prelude always use 1024) applies to every action and the per-gen reflection. Ollama `_continue_ollama_session` also uses `think=True`. Earlier `think=False` on action turns caused the AI to emit one-line `CHOICE: N` responses without considering milestones it already qualified for.
 
 **Description elision**: for discard/keep/draft decisions (`wf_type == "card"`) where all cards are already in the hand block, descriptions are replaced with `"(see hand above)"` — saves ~50–200 tokens per such turn.
 

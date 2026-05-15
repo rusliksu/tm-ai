@@ -67,7 +67,7 @@ _OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "600"))
 # Gemini settings
 _GEMINI_API_KEY        = os.getenv("GEMINI_API_KEY", "")
 _GEMINI_MODEL          = os.getenv("GEMINI_MODEL",  "gemini-2.5-flash-lite")
-_GEMINI_THINKING_BUDGET = int(os.getenv("GEMINI_THINKING_BUDGET", "1024"))
+_GEMINI_THINKING_BUDGET = int(os.getenv("GEMINI_THINKING_BUDGET", "512"))   # setup/prelude always use 1024
 
 _gemini_client = None  # lazy-initialised
 
@@ -291,7 +291,10 @@ def _log_prompt(header: str, text: str) -> None:
     logger.info("%s\n%s", header, prefixed)
 
 
-def _log_response(header: str, text: str) -> None:
+def _log_response(header: str, text: str | None) -> None:
+    if text is None:
+        logger.info("%s\n< (empty/None response)", header)
+        return
     prefixed = '\n'.join(f'< {line}' for line in text.splitlines())
     logger.info("%s\n%s", header, prefixed)
 
@@ -587,9 +590,9 @@ def _init_gemini_session(game_id: str, system: str, user: str, think: bool) -> s
 
 _PER_GEN_STRATEGY_PROMPT = (
     "=== End of Generation {prev_gen}, start of Generation {gen} ===\n"
-    "Before your next action, restate your strategy. This is saved as your strategy memory and "
-    "logged for debugging — be concrete and concise.\n"
-    "Cover in ~120-180 words:\n"
+    "{global_status}"
+    "{income_note}"
+    "Before your next action, restate your strategy in ~120-180 words:\n"
     "1. STANDING: your VP/TR vs each opponent. Ahead, level, or behind?\n"
     "2. ENGINE: primary path to victory — engine type, key cards in play, how you score each gen.\n"
     "3. MILESTONE TARGET: which of the 5 milestones will you claim (5 VP, max 3 in whole game, 8 MC)?\n"
@@ -597,12 +600,13 @@ _PER_GEN_STRATEGY_PROMPT = (
     "claim it next action — don't let opponents block you!\n"
     "4. AWARD TARGET: which award will you fund and place 1st in (5 VP for 1st, 2 VP for 2nd, "
     "max 3 funded at 8/14/20 MC)? Don't fund awards you can't win.\n"
-    "5. NEXT-GEN PRIORITY: concrete plan for this generation's actions (which card, milestone, "
-    "or terraforming step is highest value right now)."
+    "5. NEXT-GEN PRIORITY: concrete plan for this generation's actions. "
+    "Reminder: DO NOT use Convert Heat if temperature is already 8°C, and DO NOT place "
+    "greenery tiles if O₂ is already 14% (both are wasted actions at max)."
 )
 
 
-def _per_generation_strategy_update(game_id: str, chat: object, generation: int) -> None:
+def _per_generation_strategy_update(game_id: str, chat: object, generation: int, state: dict) -> None:
     """Ask the LLM to restate its strategy at each generation boundary.
 
     The response becomes natural chat history (no destructive rebuild) and is stored in
@@ -610,7 +614,41 @@ def _per_generation_strategy_update(game_id: str, chat: object, generation: int)
     which re-injected stale strategy via a fake user/model pair at chat[0] and caused the
     model to paraphrase that stale anchor every subsequent generation.
     """
-    prompt = _PER_GEN_STRATEGY_PROMPT.format(prev_gen=generation - 1, gen=generation)
+    g = state.get("game", {})
+    p = state.get("player", {})
+
+    # Warn about any already-maxed global parameters so the AI doesn't waste actions.
+    temp = g.get("temperature", -30)
+    oxygen = g.get("oxygen", 0)
+    oceans = g.get("oceanCount", 0)
+    maxed_warnings: list[str] = []
+    if temp >= 8:
+        maxed_warnings.append("temperature is at maximum (8°C) — DO NOT use Convert Heat")
+    if oxygen >= 14:
+        maxed_warnings.append("O₂ is at maximum (14%) — DO NOT place greenery tiles")
+    if oceans >= 9:
+        maxed_warnings.append("all 9 oceans are placed")
+    global_status = ("⚠ Global parameters: " + "; ".join(maxed_warnings) + "\n") if maxed_warnings else ""
+
+    # Inform the AI of its production income for this generation so it can plan accurately.
+    prod = p.get("production", {})
+    mc_prod = prod.get("megacredits", 0)
+    tr = p.get("terraformRating", 20)
+    mc_income = tr + mc_prod
+    income_parts = [f"MC:{mc_income} (TR:{tr} + prod:{mc_prod:+d})"]
+    for res_label, key in [("steel", "steel"), ("titanium", "titanium"),
+                           ("plants", "plants"), ("energy", "energy"), ("heat", "heat")]:
+        v = prod.get(key, 0)
+        if v:
+            income_parts.append(f"{res_label}:{v}")
+    income_note = "Your production income this generation: " + ", ".join(income_parts) + "\n"
+
+    prompt = _PER_GEN_STRATEGY_PROMPT.format(
+        prev_gen=generation - 1,
+        gen=generation,
+        global_status=global_status,
+        income_note=income_note,
+    )
     if _LLM_DEBUG:
         _log_prompt(f"=== PER-GEN STRATEGY UPDATE (game={game_id} gen={generation}) ===", prompt)
     try:
@@ -624,7 +662,7 @@ def _per_generation_strategy_update(game_id: str, chat: object, generation: int)
         logger.warning("Per-gen strategy update failed (game=%s gen=%d): %s", game_id, generation, exc)
 
 
-def _maybe_per_generation_update(game_id: str, generation: int) -> None:
+def _maybe_per_generation_update(game_id: str, generation: int, state: dict) -> None:
     """When generation number increases, run a per-generation strategy update.
 
     Fires at the first action call of generation N+1. The Gemini chat retains full history
@@ -636,14 +674,22 @@ def _maybe_per_generation_update(game_id: str, generation: int) -> None:
         if chat is not None:
             logger.info("Generation bump %d→%d for game %s — running strategy update",
                         last_gen, generation, game_id)
-            _per_generation_strategy_update(game_id, chat, generation)
+            _per_generation_strategy_update(game_id, chat, generation, state)
     _gemini_last_generation[game_id] = generation
 
 
 def _continue_gemini_session(game_id: str, user: str, chat: object) -> str:
     _maybe_refresh_gemini_cache(game_id)
+    # Re-fetch chat: _maybe_refresh_gemini_cache may have rebuilt it into _game_chat_sessions.
+    # Using the stale reference causes a 403 because the old chat object still references
+    # the expired cache.
+    chat = _game_chat_sessions.get(game_id) or chat
     response = _gemini_with_retry(lambda: chat.send_message(user))  # type: ignore[attr-defined]
-    return response.text
+    text: str | None = response.text
+    if not text:
+        logger.warning("Gemini returned empty/None text for game %s", game_id)
+        return ""
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -943,7 +989,7 @@ def _select_action(state: dict, waiting_for: dict, game_id: str, last_error: str
     # At each generation boundary, ask the Gemini session to restate its strategy.
     if _LLM_PROVIDER == "gemini":
         generation = state.get("game", {}).get("generation", 1)
-        _maybe_per_generation_update(game_id, generation)
+        _maybe_per_generation_update(game_id, generation, state)
 
     user = _build_action_prompt(state, waiting_for, options, last_error=last_error)
     logger.debug("LLM action (game=%s type=%s options=%d)",
@@ -962,14 +1008,21 @@ _TRAINER_SYSTEM_SUFFIX = (
     "\n\nYou are a strategy coach helping a human player. Your job is to advise, not to play.\n"
     "Output rules (STRICT — failure to follow breaks the UI):\n"
     "  • Plain text ONLY. No markdown. No bullet points. No asterisks, no headers, no backticks.\n"
-    "  • Keep coaching to 1-3 short sentences. Be direct and concrete.\n"
+    "  • Structure EVERY coaching response in exactly two parts:\n"
+    "      1. Strategy (2-3 sentences): describe the overall strategic direction this player "
+    "should pursue given their engine, score, and the game situation.\n"
+    "      2. Action (1-2 sentences): state clearly and concretely what to do RIGHT NOW with "
+    "this specific decision, and why it fits the strategy.\n"
     "  • End EVERY response with a machine-readable block:\n"
     "      <recommendation>\n"
     "      CHOICE: <number>\n"
     "      [PAYMENT: MC=<n>[, STEEL=<n>] ...   # only if payment is required]\n"
     "      </recommendation>\n"
     "  • For setup decisions, follow the requested CORPORATION / BUY_CARDS / PRELUDE_CARDS / "
-    "CEO_CARD / STRATEGY format inside the recommendation block instead."
+    "CEO_CARD / STRATEGY format inside the recommendation block instead.\n"
+    "  • Production floor: Steel/Titanium/Plants/Energy/Heat production CANNOT go below 0. "
+    "Only MC production can be negative (down to -5). Never recommend playing a card that "
+    "would reduce any non-MC production below its current level if that level is already 0."
 )
 
 
@@ -1232,13 +1285,14 @@ _BONUS_ABBREV = {
 
 
 def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict], last_error: str | None = None) -> str:
-    g    = state.get("game", {})
-    p    = state.get("player", {})
-    prod = {k: v for k, v in p.get("production", {}).items() if v}
-    tags = {k: v for k, v in p.get("tags", {}).items() if v}
-    my_id = p.get("id", "")
+    g      = state.get("game", {})
+    p      = state.get("player", {})
+    prod   = {k: v for k, v in p.get("production", {}).items() if v}
+    tags   = {k: v for k, v in p.get("tags", {}).items() if v}
+    my_id  = p.get("id", "")
     ms_raw = state.get("milestones", [])
     aw_raw = state.get("awards", [])
+    wf_type = waiting_for.get("type", "")
 
     # Build a spaceId → space_info lookup for annotating tile placement options
     _space_index: dict[str, dict] = {}
@@ -1259,24 +1313,41 @@ def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict], la
             "",
         ]
 
+    temp = g.get("temperature", -30)
+    oxygen = g.get("oxygen", 0)
+    oceans = g.get("oceanCount", 0)
+
     my_vp = p.get("victoryPoints")
     vp_str = f"  VP:{my_vp}" if my_vp is not None else ""
     lines += [
-        f"Gen {g.get('generation',1)} | Temp {g.get('temperature',-30)}°C | "
-        f"O₂ {g.get('oxygen',0)}% | Oceans {g.get('oceanCount',0)}/9",
+        f"Gen {g.get('generation',1)} | Temp {temp}°C | O₂ {oxygen}% | Oceans {oceans}/9",
         f"TR:{p.get('terraformRating',20)}{vp_str}  MC:{p.get('megacredits',0)}  "
         f"St:{p.get('steel',0)}  Ti:{p.get('titanium',0)}  "
         f"Pl:{p.get('plants',0)}  En:{p.get('energy',0)}  He:{p.get('heat',0)}",
     ]
+
+    # Warn when global params are maxed so the AI doesn't waste actions.
+    if temp >= 8:
+        lines.append("⚠ Temperature is at maximum (8°C). DO NOT use Convert Heat — it is a wasted action.")
+    if oxygen >= 14:
+        lines.append("⚠ O₂ is at maximum (14%). DO NOT place greenery tiles — they give no benefit.")
+    if oceans >= 9:
+        lines.append("⚠ All 9 oceans are placed. No more ocean tiles can be placed.")
     if prod:
         lines.append(f"Production: {prod}")
     if tags:
         lines.append(f"Tags: {tags}")
     # Played cards are in session memory — not repeated each turn.
+    # Production floor rule: Steel/Titanium/Plants/Energy/Heat production cannot go below 0.
+    # Only MC production can be negative (minimum -5). Don't play cards that would reduce
+    # non-MC production below 0 — the game will reject those actions.
+    lines.append("Note: Only MC production can go negative (min -5). Steel/Ti/Plants/Energy/Heat production CANNOT go below 0.")
 
-    # Cards in hand with descriptions
+    # Cards in hand with descriptions — skip for tile/payment/numeric decisions
+    # where the hand plays no role (saves ~100–300 tokens per such turn).
     hand_cards = p.get("cardsInHand") or []
-    if hand_cards:
+    _hand_irrelevant = wf_type in ("space", "payment", "amount")
+    if hand_cards and not _hand_irrelevant:
         ctx = format_card_context(hand_cards, header=f"Your hand ({len(hand_cards)} cards):", max_cards=30)
         lines += ["", ctx]
 
@@ -1297,10 +1368,11 @@ def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict], la
     if aw:
         lines.append(f"Awards funded: {aw}")
 
-    # Recent game events (current generation log)
+    # Recent game events (current generation log — OPPONENT moves and system messages only;
+    # your own moves are already in your session memory above).
     recent_log = g.get("recentLog") or []
     if recent_log:
-        lines += ["", f"Recent events ({len(recent_log)}):"]
+        lines += ["", f"Recent opponent actions / events ({len(recent_log)}):"]
         for entry in recent_log:
             lines.append(f"  {entry}")
 
@@ -1315,8 +1387,32 @@ def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict], la
     if title:
         lines += ["", f"Decision: {title}"]
 
+    # Tile placement tips: greenery adjacency to cities; city separation rule.
+    if wf_type == "space":
+        title_lower = title.lower()
+        if "greenery" in title_lower:
+            own_cities = sum(
+                1 for s in (state.get("boardSpaces") or [])
+                if s.get("tileType") == "city" and s.get("playerColor") == p.get("color")
+            )
+            if own_cities:
+                lines.append(
+                    f"Placement tip: place this greenery ADJACENT to one of your {own_cities} "
+                    f"city tile(s) — each adjacent greenery scores +1 VP for the city at game end."
+                )
+            else:
+                lines.append(
+                    "Placement tip: you have no cities yet. Consider placing this greenery where "
+                    "a future city can sit next to it, or near the center for flexibility."
+                )
+        elif "city" in title_lower:
+            lines.append(
+                "Placement tip: place this city where greenery tiles can later surround it — "
+                "each adjacent greenery scores +1 VP for this city at game end. "
+                "Cities cannot be adjacent to other cities."
+            )
+
     # Card descriptions for explicit card-selection decisions (research, discard, etc.)
-    wf_type = waiting_for.get("type", "")
     if wf_type == "card":
         card_names_in_decision = _extract_card_names(waiting_for)
         if card_names_in_decision:
