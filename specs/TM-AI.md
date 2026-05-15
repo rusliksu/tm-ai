@@ -491,7 +491,7 @@ All subsequent decisions (prelude, action phase)
       → outputs: CHOICE: N  [PAYMENT: MC=N, STEEL=N, ...]
 ```
 
-**Strategy documents** are stored per `game_id` in `_game_strategies` for trim recovery / fallback. Strategy is written at setup and prelude — NOT requested on every action turn.
+**Strategy documents** are stored per `game_id` in `_game_strategies`. Initial strategy is written at setup (and updated at prelude); subsequently re-written at every generation boundary via `_per_generation_strategy_update` (see below).
 
 **Session recovery** (`_session_recovery`): when no session is found (503 exhausted on setup, or server restart), a new session is initialised with the stored strategy as context. Future turns continue it normally.
 
@@ -499,7 +499,9 @@ All subsequent decisions (prelude, action phase)
 
 **Gemini context caching**: at game start, `_init_gemini_session` creates a Gemini context cache (`client.caches.create`) containing the full system prompt (TM rules + game config), with TTL 3600s. All subsequent `generate_content` and `chats.create` calls reference the cache via `cached_content=name` — the system prompt is billed once instead of repeating every turn. Cache name stored in `_game_cache_info[game_id]`. TTL is refreshed every 50 min via `_maybe_refresh_gemini_cache`; if refresh fails (cache expired), the chat is reconstructed with inline `system_instruction` using `get_history()`.
 
-**Gemini per-generation trim**: at the start of each action turn, `_maybe_trim_gemini_session` detects when `game.generation` increases. It asks the model to summarise its current strategy in 100 words, stores the result, then rebuilds the chat with a compact history (last 4 turns + strategy summary). This caps conversation history regardless of how long the game runs.
+**Gemini per-generation strategy update** (`_per_generation_strategy_update`): at the first action turn of each new generation, `_maybe_per_generation_update` detects when `game.generation` increases and sends a structured restate prompt to the existing chat. The prompt asks the model to cover: standing vs opponents, current engine + scoring path, milestone target (with explicit "if you already meet a requirement, claim it next action"), award target (only if winnable), and concrete next-gen priority. The response becomes natural chat history and is stored in `_game_strategies` for debugging + recovery. The chat is **not** rebuilt — Gemini's 1M-token context handles a full 15-gen session organically.
+
+This replaces an earlier `_trim_gemini_session` that re-injected a fake `"Summarize strategy" → "[CONTEXT TRIM …]"` user/model pair at chat position 0 each generation; the model would then anchor on that stale text and paraphrase it for every subsequent trim. Empirically (game `ga097581101aa`, 16 generations) the same opening-strategy stub was re-emitted at every trim from gen 2 through gen 13, depriving the AI of any tactical evolution.
 
 **Description elision**: for `wf_type == "card"` decisions (discard, keep, draft) where all candidate cards are already in the hand block of the prompt, `_is_card_decision_about_hand` returns True and `format_card_context` is replaced with a lightweight `"(see hand above)"` note, saving ~50–200 tokens per such turn.
 
@@ -518,15 +520,15 @@ All subsequent decisions (prelude, action phase)
 | `OLLAMA_MODEL` | `qwen3:4b` | Ollama model tag |
 | `OLLAMA_TIMEOUT` | `600` | Ollama request timeout (seconds) |
 | `GEMINI_API_KEY` | _(required for Gemini)_ | Google AI Studio API key |
-| `GEMINI_MODEL` | `gemini-2.5-flash-lite` | Gemini model name |
+| `GEMINI_MODEL` | `gemini-2.5-flash-lite` | Gemini model name; supported: `gemini-3-pro`, `gemini-3-flash`, `gemini-3-flash-lite`, `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite` (any Google AI Studio model name is accepted verbatim) |
+| `GEMINI_THINKING_BUDGET` | `1024` | Thinking tokens per turn (setup + every action + per-gen reflection) |
 
 ### Think mode
 
-Setup phase uses `think=True`; action phase uses `think=False`.
+Think is enabled on **every** turn (setup, prelude, action, per-generation reflection) — not just setup. Action-turn deliberation was previously disabled to save tokens, but the game-log analysis (`ga097581101aa`) showed the AI consistently emitted one-line `CHOICE: N` responses without considering milestones it already qualified for. Enabling think gives the model a deliberation budget on every decision.
 
-- **Ollama**: passed as `"think": true/false` in `/api/chat` payload — effective on qwen3 family.
-- **Gemini**: maps to `ThinkingConfig(thinking_budget=1024)` (on) or `thinking_budget=0` (off).
-  Setup uses `generate_content` (supports thinking), then creates a `Chat` with that exchange as history for all subsequent turns.
+- **Ollama**: `"think": true` in `/api/chat` payload — effective on qwen3 family.
+- **Gemini**: every `Chat` is constructed with `ThinkingConfig(thinking_budget=_GEMINI_THINKING_BUDGET)`, default 1024 tokens. Setup uses `generate_content` (supports thinking), then creates a `Chat` with that exchange as history; all subsequent action turns inherit the same thinking budget.
 
 ### Gemini resilience
 
@@ -567,6 +569,8 @@ The AI Trainer is a coaching sidebar that advises a **human** player (rather tha
 - `_get_card_desc_for_option(opt)` — returns description for `Use <CardName> action` options
 - `_extract_card_names(waiting_for)` — collects card names from `card`-type decision nodes (for research/discard descriptions)
 - `_capture_strategy_then_trim(game_id, session)` — Ollama: capture strategy then rebuild trimmed session
+- `_per_generation_strategy_update(game_id, chat, generation)` — Gemini: at each generation boundary, send a structured restate prompt and capture the response as the updated strategy
+- `_maybe_per_generation_update(game_id, generation)` — fires `_per_generation_strategy_update` on generation bump; no-op when generation unchanged
 - `select_action_advise(state, waiting_for, game_id, user_question)` — AI Trainer entry point; returns `(advice_text, recommendation)`
 
 ### Game Knowledge Database (`game_knowledge.py`)
@@ -604,7 +608,7 @@ cd tm-ai-server && USE_LLM=true LLM_PROVIDER=gemini GEMINI_API_KEY=$GEMINI_API_K
 ## Cloud LLM Provider Comparison
 
 Cost basis: 200 moves/game × 1,000 input + 100 output tokens = 200K input / 20K output per game.
-With context caching + per-generation trim + description elision (Phase 1 optimisations), Gemini effective cost is ~3–5× lower — the system prompt is billed once per game (not per turn), and history is trimmed per generation.
+With context caching + per-generation strategy update + description elision (Phase 1 optimisations), Gemini effective cost is significantly lower — the system prompt is billed once per game (not per turn) via context caching; the per-generation update grows chat history organically rather than rebuilding it, relying on Gemini's 1M-token window to absorb full 15-gen sessions.
 
 | Provider / Model | Input $/1M | Output $/1M | TTFT | Speed | $/game | $/1K games | Free tier |
 |---|---|---|---|---|---|---|---|

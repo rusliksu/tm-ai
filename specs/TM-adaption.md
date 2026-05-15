@@ -129,16 +129,20 @@ The TM server uses a **`provide_input` paradigm**: it sends the full `PlayerInpu
 
 `recentLog` serialization: `serializeLogMessage` substitutes `${N}` template placeholders using per-type handlers — `PLAYER` → player name (looked up by color), `TILE_TYPE` → human-readable tile name (greenery/ocean/city/…), `SPACE_BONUS` → resource name (titanium/steel/plant/…), `CARDS` → comma-joined list, others → string value.
 
+`getRecentLog` filters entries to **opponents' moves + system messages** (the AI's own moves are dropped — they're already in the model's session memory, so showing them again wastes tokens and confuses tableau attention).
+
 ---
 
 ## Plan B: Real-time Decision Logging
 
-Logging is wired in `Player.ts` for all players (human and AI):
+Logging is wired in `Player.ts` for all players (human and AI) **except self-play games**:
 
 1. **`setWaitingFor()`** — captures `{step, state, waitingFor}` into `this.pendingTrainingState` for every player before each decision
-2. **`process()`** — calls `logTrainingTurn(input)` which pairs the captured state with the chosen `InputResponse` and appends it to the game's JSONL file
+2. **`process()`** — calls `logTrainingTurn(input)` which pairs the captured state with the chosen `InputResponse` and appends it to the game's JSONL file. **Bails out when `game.isSelfPlay === true`** — self-play games persist to the DB only.
 3. **`ApiCreateGame.ts`** — calls `TrainingLogger.writeMeta()` at game creation to write the game_spec and player list
-4. **`Game.gotoEndGame()`** — calls `TrainingLogger.writeResult()` to write final VP and rankings
+4. **`Game.gotoEndGame()`** — calls `TrainingLogger.writeResult()` to write final VP and rankings. **Bails out when `game.isSelfPlay === true`**.
+
+For self-play games, the canonical training-data source is the DB. Use `export_training_data.ts` to extract JSONLs when needed (e.g. for a supervised re-training pass).
 
 ### JSONL File Format
 
@@ -162,11 +166,11 @@ Two endpoints for PPO self-play training, implemented in `src/server/routes/ApiA
 
 ### `POST /api/ai/new-game`
 Creates a 2-player self-play game (both players have `isAI=true`, `game.isSelfPlay=true`).
-`isSelfPlay` suppresses the auto `requestAiMove()` trigger in `setWaitingFor()`.
+`isSelfPlay` suppresses the auto `requestAiMove()` trigger in `setWaitingFor()` **and** suppresses per-turn / result JSONL logging in `Player.process()` and `Game.gotoEndGame()`. The game state persists to the DB; use `export_training_data.ts` to extract training data later if needed.
 
 Request body (all optional):
 ```json
-{"boardName": "tharsis", "logDir": "logs/selfplay/<run_id>"}
+{"boardName": "tharsis", "playerCount": 2}
 ```
 
 Response:
@@ -267,12 +271,13 @@ Added to `GameOptions` (default `false`). Propagated through:
 
 **Steps for `export_training_data.ts`:**
 1. Iterate all games from the DB
-2. For each game, iterate consecutive save pairs (saveId N → N+1)
-3. Deserialize save N → `activePlayer.waitingFor` is set automatically
-4. Capture `waitingFor.toModel(player)` and state via `buildAiRequestState()`
-5. Diff game log messages between save N and N+1 to infer the chosen action
-6. Write the training turn record
-7. At the last save, compute final VP and write the result record
+2. **Skip games whose `${gameId}.jsonl` already exists in the output dir** (idempotent re-runs are now cheap)
+3. For each game, iterate consecutive save pairs (saveId N → N+1)
+4. Deserialize save N → `activePlayer.waitingFor` is set automatically
+5. Capture `waitingFor.toModel(player)` and state via `buildAiRequestState()`
+6. Diff game log messages between save N and N+1 to infer the chosen action
+7. Write the training turn record
+8. At the last save, compute final VP and write the result record
 
 **Remaining risks:** Inferring the chosen action from log message diffs is imprecise — some saves may be mid-deferred-action rather than clean decision points. Filter by checking if `activePlayer` or `phase` changed.
 

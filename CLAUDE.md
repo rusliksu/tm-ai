@@ -92,7 +92,7 @@ specs/
 ## API Contract
 
 The TM game server calls `POST /move` with:
-- `state.game` — global state: `generation`, `oxygen`, `temperature`, `oceanCount`, `boardName`, `expansions`, `availableMilestones`, `availableAwards`, `gameVariants`, `recentLog` (serialized game log entries since start of current generation)
+- `state.game` — global state: `generation`, `oxygen`, `temperature`, `oceanCount`, `boardName`, `expansions`, `availableMilestones`, `availableAwards`, `gameVariants`, `recentLog` (serialized game log entries since start of current generation — **opponents' moves and system messages only**; AI's own moves omitted, since they're in session memory)
 - `state.player` — active player: resources, production, tags, `cardsInHand` (list of card names), `playedCards`, `cardResources` (per-card), `corporations`
 - `state.opponents` — all other players: same fields plus `handSize` (count only — hand is secret)
 - `state.board` — placed tiles (id, x, y, tileType, playerColor)
@@ -109,9 +109,9 @@ Response: `{input_response:{...}, debug:{...}}` — `input_response` goes direct
 
 Two new TM server endpoints for PPO training:
 
-**`POST /api/ai/new-game`** — creates a 2-player self-play game (both AI, `isSelfPlay=true` suppresses auto `requestAiMove()`):
+**`POST /api/ai/new-game`** — creates a self-play game (both AI, `isSelfPlay=true` suppresses auto `requestAiMove()` AND skips JSONL logging — game persists to DB only):
 ```json
-{"boardName":"tharsis", "logDir":"logs/selfplay/<run_id>"}
+{"boardName":"tharsis", "playerCount":2}
 → {"game_id":"g...", "player_id":"p...", "state":{...}, "waitingFor":{...}, "game_spec":{...}}
 ```
 
@@ -143,7 +143,7 @@ Config dims are always zeroed (game_spec=None) for train/inference consistency.
 - Middle: `{type:"turn", state:{...}, waitingFor:{...}, input_response:{...}, is_human:bool}`
 - Last: `{type:"result", endGeneration:N, playerResults:[...]}`
 
-**`logs/selfplay/<run_id>/`** — self-play game JSONLs (same format, written by TrainingLogger with per-run `logDir`).
+**`logs/selfplay/<run_id>/`** — PPO run artifacts (`manifest.json`, `metrics.jsonl`, model checkpoints). Per-game JSONLs are **not** written here anymore — self-play games persist to the TM server DB only; use `export_training_data.ts` to extract training data if/when needed.
 
 ## TM Server Integration Points
 
@@ -156,8 +156,8 @@ Key files in `/home/pmunk/workspace/terraforming-mars/src/server/`:
 - `Game.ts` — `isSelfPlay: boolean` field; set via `newInstance(..., isSelfPlay=true)` before `gotoInitialPhase()`; writeResult in gotoEndGame
 - `IGame.ts` — `isSelfPlay: boolean` in interface
 - `ai/AiClient.ts` — HTTP client to AI server; `MoveRequestPayload` includes optional `last_error?: string`
-- `ai/stateMapping.ts` — full state; includes `cardsInHand` (self player only), `recentLog` (serialized game log since generation start), `boardName`, `expansions`, `availableMilestones`, `availableAwards`, `gameVariants`; `cardResources` is per-card `{name: count}`
-- `ai/TrainingLogger.ts` — accepts optional `logDir` in constructor; writeMeta/appendTurn/writeResult
+- `ai/stateMapping.ts` — full state; includes `cardsInHand` (self player only), `recentLog` (opponents' moves + system messages since generation start; own moves filtered out), `boardName`, `expansions`, `availableMilestones`, `availableAwards`, `gameVariants`; `cardResources` is per-card `{name: count}`
+- `ai/TrainingLogger.ts` — writeMeta/appendTurn/writeResult; **skipped entirely for `game.isSelfPlay` games** in Player.process() and Game.gotoEndGame()
 - `routes/ApiAiSelfPlay.ts` — `POST /api/ai/new-game` and `POST /api/ai/step`
 - `routes/ApiAiAdvice.ts` — `POST /api/ai/advice` and `POST /api/ai/play-recommendation` (AI Trainer; requires `game.aiTrainerEnabled`)
 - `routes/ApiCreateGame.ts` — isAI flag, writeMeta at game creation
@@ -232,7 +232,9 @@ Supports Ollama (local, free) and Gemini (cloud, fast). Select via `LLM_PROVIDER
 
 **Gemini context caching**: system prompt is cached once per game via `client.caches.create` (TTL 3600s). All turns use `cached_content=name` — billed once, not per turn. TTL refreshed every 50 min; on refresh failure the chat is rebuilt with inline `system_instruction`.
 
-**Gemini per-generation trim**: at each generation bump, strategy is summarised in 100 words and the chat history is rebuilt with only the last 4 turns + summary. Keeps context small regardless of game length.
+**Gemini per-generation strategy update**: at each generation bump, `_per_generation_strategy_update` sends a structured restate prompt to the existing chat (standing, engine, milestone target with "claim it if you already qualify" reminder, award target, next-gen priority). The response becomes natural chat history and is stored in `_game_strategies`. Chat is **not** rebuilt — Gemini's 1M-token context handles full sessions. Replaces an earlier `_trim_gemini_session` that re-injected a fake user/model summary pair at chat[0] and caused the model to re-paraphrase that stale anchor every generation (observed in game `ga097581101aa`: identical opening-strategy stub re-emitted from gen 2 through gen 13).
+
+**Think on every turn**: `GEMINI_THINKING_BUDGET` (default 1024) applies to setup, prelude, every action, and the per-gen reflection. Ollama `_continue_ollama_session` also uses `think=True`. Earlier `think=False` on action turns caused the AI to emit one-line `CHOICE: N` responses without considering milestones it already qualified for.
 
 **Description elision**: for discard/keep/draft decisions (`wf_type == "card"`) where all cards are already in the hand block, descriptions are replaced with `"(see hand above)"` — saves ~50–200 tokens per such turn.
 

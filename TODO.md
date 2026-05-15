@@ -145,18 +145,19 @@ uv run python -m tm_ai_server.training.train_ppo \
 
 
   # after llm test run
-  - clear all ppo training runs from the db - keep all human played games, even if played against ai. identify all games to keep by checking if player names ["Sandra", "Peter"] (ignore case) are part of the game
-  - remove the feature to log the ppo training runs - that is not required, we can always use the export feature to get the same information from the database - correct? If not correct, argue why and keep feature
-  - src/server/tools/export_training_data.ts shoudl skip all games where the jsonl log files already exist in the folder  
-  - export all human game logs again
-    - analyse my latest play in ga097581101aa - copy the exported game log to logs/llm-test/ga097581101aa - ai and tm server logs are already there. 
-    - why does the ai not fund the milestone when it is available? system prompt indicates milestones are important! 
-    - it seesm the ai playes well until generation 8, then it blunders and does not perform. what happend? context window full? why does the automatic context reset not work - check the logs if that was even triggered.
-    - make the llm model selection choosable - gemini-3-pro gemini-3-flash gemini-3-flash-light along with the 2.5 versions shall be selectable via env vars
-    - game log still contains last 20-30 moves. crop to the last moves of the opponents
-    - I think it might be good to ask the llm to re-iterate over its strategy at the end of each generation and force an output (also for debugging) - makes sense? if yes, implement!
-    - add to system prompt the benefits you get for specific level of temperature, oxygen and venus scale increasing - check the terraforming-mars implementation for details
-- update the specification then implement the changes
+  - [x] clear all ppo training runs from the db - keep all human played games involving Sandra/Peter (94 kept / 1472 deleted; 117GB → 754MB via copy-keep-then-swap; old DB preserved at `db/game.db.old` until verified)
+  - [x] remove the feature to log the ppo training runs — Player.process() + Game.gotoEndGame() skip TrainingLogger when `game.isSelfPlay`; logDir param dropped from /api/ai/new-game. Self-play data lives in DB only; re-export via `export_training_data.ts` when needed.
+  - [x] `export_training_data.ts` skips games whose JSONL already exists (idempotent re-runs)
+  - [x] re-exported human game logs (62 games / 8235 turns / 111 MB after wipe)
+  - [x] copied `ga097581101aa.jsonl` to `logs/llm-test/ga097581101aa/`; identified the gen-8 blunder root cause (stale-strategy bug in per-gen trim) AND the milestone-skip root cause (`think=False` on action turns)
+  - [x] milestones: per-gen restate prompt now explicitly tells AI "if you already meet a milestone requirement, claim it next action — don't let opponents block you"
+  - [x] gen-8 blunders: replaced buggy `_trim_gemini_session` with `_per_generation_strategy_update` — no more stale anchor; chat history kept intact (Gemini 1M context)
+  - [x] LLM model selectable via `GEMINI_MODEL` env (gemini-3-pro / 3-flash / 3-flash-lite + 2.5 family)
+  - [x] `recentLog` cropped to opponents' moves + system messages (own moves dropped — already in session memory)
+  - [x] per-generation strategy restate forces a structured output (logged for debugging via `_log_response`)
+  - [x] temperature/oxygen/venus bonus thresholds added to `TM_RULES` GLOBAL-PARAMETER MILESTONE BONUSES section (-24/-20°C heat-prod, 0°C ocean, 8% O2 → +temp, 8% Venus → card, 16% Venus → TR)
+  - [x] think enabled on every turn (`GEMINI_THINKING_BUDGET=1024` default; Ollama continue uses `think=True`)
+- [x] update the specification (TM-AI.md, TM-adaption.md, CLAUDE.md)
 
 
 # ai trainer fix
