@@ -290,33 +290,45 @@ class VersionResponse(BaseModel):
 
 Converts the JSON state from the TM server into a fixed-size float32 feature vector.
 
-### Essential features (~150–200 dims, implement first)
+### Current architecture — flat 492-dim state, fixed 128-slot policy
 
-- **Global** (5): generation, temperature, oxygen, oceans, phase (one-hot over 5 phases)
-- **Current player** (28): TR, megacredits, steel, titanium, plants, energy, heat (7 resources), production for all 6 resources, tags for all 13 tag types, handSize
-- **Game config** (20+): player count, board one-hot (tharsis/hellas/elysium/...), enabled expansion flags (corpEra, venus, colonies, prelude, prelude2, turmoil, moon, pathfinders, ...)
+`STATE_DIM = 492` (see `config.py`):
 
-### Extended features (add after baseline converges)
+| Block | Dims | Contents |
+|---|---|---|
+| Global | 9 | generation, temperature, oxygen, oceans, phase (one-hot × 5) |
+| Self | 230 | 7 resources + 6 production + 13 tags + 1 handSize + 199 per-card resources + 1 played_count + 3 board_tiles |
+| Opponent | 230 | same shape as self (handSize is public) |
+| Milestones/Awards | 4 | ms_self, ms_total, aw_self, aw_total |
+| Config | 19 | player_count + 5 board one-hot + 13 expansion flags (zeroed when game_spec=None to keep train/inference consistent) |
 
-- Per opponent (×N players): TR, resources, production, tags, played card count
-- Board state: ocean/city/greenery tile counts
-- Milestones: which are claimed, by whom
-- Awards: which are funded, by whom
+`flatten_options()` walks the `waitingFor` decision tree depth-first into a list of leaf choices. Padded to `MAX_ACTIONS = 128`; the policy emits 128 logits, mask is applied before softmax.
 
-### Action encoding
+### Planned architecture — Option C (card embeddings + spatial board + per-option scoring)
 
-The `waitingFor` `PlayerInputModel` is a recursive tree. Flatten it to a canonical list of leaf options:
-- Walk the tree depth-first, collect all leaf choices (e.g. each `OrOptions` option, each selectable card)
-- Pad to a fixed maximum (128 options) with -∞ masking for invalid slots
-- The AI outputs 128 logits; apply mask before softmax
+The flat MLP has two design flaws that motivate a planned refactor (Part B / Phase 4 of the active plan; see also [`ai-model-design.md`](../ai-model-design.md) for the full rationale and tensor layout):
 
-This avoids a fixed global action space and handles the variable 2–100+ actions per decision.
+1. **Per-card resources are 199 sparse slots** — *Tardigrades* and *Ants* live in totally separate dimensions. The 970-card vocabulary collapses to a learnable `nn.Embedding(971, 32)` (index 0 reserved for unknown/pad). Played, hand, and resource-bearing cards are gathered into the same table and pooled into three 32-dim summaries.
+2. **The board is not encoded at all** — `state.board` is in the request but `encode_state()` ignores tile positions. Add `board_grid: tensor[6, 9, 9]` with channels {greenery, city, ocean, special, mine, opponent}.
+3. **Rotating slot meanings.** Today a fixed `Linear(D, 128)` policy head emits one logit per slot, but slot 7 is "Greenery" one turn and "Search for Life" the next. Replace with **per-option scoring**: each leaf option carries a 64-dim feature vector (type one-hot, parsed cost, x/y, tile-type, card embedding), and a shared `Linear(state+option, 256) → 1` MLP scores each slot. Slot index becomes meaningless; reordering options leaves predictions unchanged.
+
+**Planned constants** (`config.py`):
+```
+CARD_VOCAB_SIZE     = 971       # 970 cards + pad index 0
+CARD_EMBEDDING_DIM  = 32
+MAX_PLAYED_CARDS    = 80
+MAX_HAND_CARDS      = 40
+MAX_ACTIONS         = 128       # bumpable to 256 if histogram demands
+OPTION_FEATURE_DIM  = 64
+```
+
+`encode_state` becomes a dict (state_other, played/hand IDs, resource card IDs + counts, board grid). `flatten_options` emits `{title, index, node, features: tensor[64]}` per leaf. See [`ai-model-design.md`](../ai-model-design.md) for the tensor pipeline.
 
 ---
 
 ## Model Architecture (`model.py`)
 
-**`PolicyValueNet` (MLP):**
+### Current — flat MLP `PolicyValueNet`
 
 ```python
 import torch
@@ -344,7 +356,36 @@ class PolicyValueNet(nn.Module):
         return logits, value
 ```
 
-Default config: `hidden_sizes=[512, 512, 512]`, `action_space_size=128`.
+Config: `state_dim=492`, `hidden_sizes=[512, 512, 512]`, `action_space_size=128`.
+
+### Planned — Option C
+
+```python
+class PolicyValueNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.card_embedding = nn.Embedding(971, 32, padding_idx=0)
+        self.board_conv = nn.Sequential(
+            nn.Conv2d(6, 32, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(32, 32, 3, padding=1), nn.ReLU(),
+            nn.AdaptiveAvgPool2d(2), nn.Flatten(),
+        )                                              # → 128-dim board feature
+        # state_other (~120) + 4×card_emb (4×32) + board (128) ≈ 376
+        self.backbone = nn.Sequential(
+            *[block for _ in range(4) for block in (
+                nn.Linear(768 if _ else 376, 768), nn.LayerNorm(768),
+                nn.ReLU(), nn.Dropout(0.1),
+            )],
+        )
+        self.scoring_head = nn.Sequential(             # Option C: shared per-option scorer
+            nn.Linear(768 + 64, 256), nn.ReLU(), nn.Linear(256, 1),
+        )
+        self.value_head = nn.Linear(768, 1)
+```
+
+Backbone is unchanged in spirit but wider (768) and deeper (4 layers). The 128-output `policy_head` is **removed**; logits come from running `scoring_head` once per option slot with shared weights — going from 128 → 256 slots adds zero parameters, just FLOPs.
+
+**Migration constraint:** the refactor refuses to load any 492-dim checkpoint. Current `models/checkpoint_best.pt` is backed up as `models/checkpoint_supervised_492dim.pt.bak` before the swap; PPO has to restart from a fresh supervised pretrain.
 
 ---
 
@@ -361,11 +402,12 @@ Default config: `hidden_sizes=[512, 512, 512]`, `action_space_size=128`.
 ### Phase 2 — PPO self-play (cloud GPU)
 
 The `env_tm.py` Gymnasium environment wraps the TM server over HTTP:
-- `reset()`: POST to TM server to start a new game, return initial state
-- `step(action)`: send `input_response`, receive next state + reward
+- `reset()`: POST `/api/ai/new-game`, return initial state
+- `step(action)`: POST `/api/ai/step` with `input_response`, receive next state + reward
 - **Reward**: relative scoring = `(player_vp - mean_opponent_vp) / reference_vp`
   - Gives learning signal to all players, not just the winner
   - Switch to rank-based reward once agent stabilises
+- Self-play games persist to the TM-server DB only — no per-game JSONL is written (see `TM-adaption.md`)
 
 Stable-Baselines3 PPO hyperparameters (starting values):
 
@@ -379,21 +421,68 @@ Stable-Baselines3 PPO hyperparameters (starting values):
 
 Initialise PPO from the supervised model checkpoint.
 
+#### Compute profile
+
+PPO training for TM has an unusual bottleneck: **CPU + TM-server throughput**, not GPU compute, because:
+- Each PPO "step" is one decision in a live TM game; the TM Node.js server processes decisions serially over HTTP.
+- The neural net is tiny (~3M params even after the Option C upgrade); inference and gradient updates take microseconds.
+- A single TM game ≈ 800–1500 decisions × ~50–100 ms/decision = 1–3 min/game serial.
+- 5M PPO steps ≈ 5000–7000 games.
+
+Implication: **a single modest GPU is plenty.** The leverage is parallelizing TM-server instances via sb3's `SubprocVecEnv`. Target: 4–8 parallel envs on an 8–16 vCPU host with one T4 / L4 / 3090-class GPU.
+
+#### Cloud GPU platform comparison
+
+| Platform | Cheapest GPU class | On-demand | Spot / Interruptible | Notes |
+|---|---|---|---|---|
+| **Vast.ai** | RTX 3090 (24 GB) | ~$0.18–0.30/h | n/a | Cheapest. Community GPUs; reliability varies; pay by minute. |
+| **RunPod (community)** | RTX 4090 (24 GB) | ~$0.34/h | ~$0.20/h | Reliable. Pay by second. Friendly web UI. |
+| **Google Cloud (GCE)** | NVIDIA T4 | $0.35/h | **$0.07–0.10/h** | Managed, deep-learning VM, logging/monitoring; Spot 30 s preempt. |
+| **Google Cloud (GCE)** | NVIDIA L4 (24 GB) | $0.65/h | ~$0.20/h | Newer Ada-gen, faster than T4. |
+| **Google Vertex AI Training** | A100 40 GB | ~$3.67/h | — | Managed; overkill for this workload. |
+| **AWS g4dn.xlarge** | NVIDIA T4 | $0.52/h | ~$0.16/h | Mature; frequent spot preemption. |
+| **Lambda Labs** | A10 (24 GB) | $0.75/h | — | Premium hobby cloud, no spot. |
+| **Modal** | A10G serverless | $0.59/h | — | Pay-per-second, zero-config. |
+
+Recommended paths: **Vast.ai 3090 spot** for cheapest (~$0.20/h), **GCE Spot T4 + n1-standard-8** for most managed (~$0.50/h total). See [Phase 7 of the active plan](../ai-model-design.md) for end-to-end gcloud setup commands and the Spot-preemption recovery flow.
+
+#### Estimated experiment budget
+
+Single 5M-step run, 4 parallel envs, ~4–6 h wall:
+
+| Setup | Per-hour total | 5 h run | 5-run experiment |
+|---|---|---|---|
+| Vast.ai 3090 (24 GB) | ~$0.25 | ~$1.25 | ~$6–10 |
+| GCE Spot T4 + n1-standard-8 | ~$0.50 | ~$2.50 | ~$12–25 |
+| GCE Spot L4 + n1-standard-8 | ~$0.60 | ~$3.00 | ~$15–30 |
+| RunPod 4090 community | ~$0.34 | ~$1.70 | ~$8–15 |
+
+Realistic budget incl. hyperparam search + verdict iteration: **€10–30 on Vast.ai, €25–50 on GCE.** Even at 50M steps (10× longer), GCE Spot stays under €100. Compute is not the limiting factor here.
+
+### Phase 2.5 — LLM bootstrap training data (planned, ~500 games / €25–50)
+
+Goal: dense supervised pretraining without relying on the limited human-game pool (62 games / 8235 turns).
+
+**Pipeline:**
+- `tools/run_llm_self_play.py` calls `/api/ai/new-game` + `/api/ai/step` with `USE_LLM=true` set on the AI server, concurrency = 4, randomized configs per `ApiAiSelfPlay.ts` defaults
+- Output: per-game JSONLs under `logs/training/llm/<run_id>/<game_id>.jsonl`
+- Run target: 500 successful games or €100 spent
+- Expected with Phase 1 token optimisations (caching + per-gen restate + description elision): **~€50 total, ~24 h wall clock**
+
+**Cost basis:** see "Cloud LLM Provider Comparison" below; ~$0.003/game on Gemini 2.5 Flash-Lite (frontier quality at flash-lite tier). Even without caching the upper bound stays under €100; with caching it lands closer to €25.
+
 ---
 
 ## Training Data
 
-### Existing data
+### Sources
 
-The 80 exported JSON files in `logs/json/` **contain only display log messages** (the game event log), not game states or actions. They are not usable for training.
-
-The SQLite database (`db/game.db` in the TM server repo) contains the full `SerializedGame` JSON at every save point: 82 games, 11,192 saves. This is the source for training data.
-
-**Export strategy — two parallel tracks:**
-
-1. **Plan A (historical)**: Re-run the game engine on each DB save to recover the `waitingFor` decision tree. See `TM-adaption.md` for full analysis, risks, and the `export_training_data.ts` implementation plan.
-
-2. **Plan B (ongoing)**: Hook `Player.setWaitingFor()` + `Player.process()` in the TM server to log all decisions (human and AI) in real time. Produces clean training tuples without any inference or diffing.
+| Source | Where | What |
+|---|---|---|
+| **Plan B — live per-turn capture** | `logs/training/*.jsonl` (`AI_TRAINING_LOG_DIR`) | Real-time `(state, waitingFor, input_response)` triples for **human and AI vs human** games. `Player.process()` writes this for every turn. Skipped entirely when `game.isSelfPlay === true`. |
+| **Plan A — engine replay** | `export_training_data.ts` re-runs the engine on each DB save and infers actions from save-diffs + log-diffs. | Recovers historical games. Tool now skips any `gameId` whose JSONL already exists, so re-runs are cheap. After the May-2026 DB purge: 62 games / 8235 turns. |
+| **Self-play (PPO)** | TM server DB only (`db/game.db`) | Games created via `/api/ai/new-game` (`isSelfPlay=true`) persist to the DB. No JSONL is written. Run `export_training_data.ts` against the DB if/when supervised retraining wants these games. |
+| **LLM bootstrap (planned)** | `logs/training/llm/<run_id>/` | Phase 5: ~500 LLM-played self-play games via `tools/run_llm_self_play.py`. ~€25–50 on Gemini 2.5 Flash-Lite with caching. |
 
 ### Training log format consumed by `dataset.py`
 
@@ -447,12 +536,41 @@ One JSON file per game (written by Plan B or produced by the Plan A export tool)
 uv run uvicorn tm_ai_server.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-### Cloud (RunPod / Vast / Synpix)
+### Cloud (training)
 
-- CPU inference image: `pytorch/pytorch` + FastAPI server only
-- GPU training image: add CUDA, stable-baselines3
-- Entry points: `run_inference.sh`, `run_training.sh`
-- Checkpoints written to cloud volume or S3-compatible storage after N million steps
+Two Docker images on one network: a TM server + a PPO trainer.
+
+**`terraforming-mars/Dockerfile`** (TM server):
+```dockerfile
+FROM node:20-bookworm-slim
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev
+COPY . .
+RUN npm run build:server
+EXPOSE 8080
+ENV NODE_ENV=production
+CMD ["node", "build/src/server/server.js"]
+```
+
+**`tm-ai/tm-ai-server/Dockerfile.train`** (PPO trainer with CUDA):
+```dockerfile
+FROM pytorch/pytorch:2.5.0-cuda12.4-cudnn9-runtime
+RUN apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir uv
+WORKDIR /app
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev
+COPY . .
+ENV PYTHONPATH=/app/src TM_SERVER_URL=http://tm-server:8080
+ENTRYPOINT ["uv", "run", "python", "-m", "tm_ai_server.training.train_ppo"]
+```
+
+**`tm-ai/docker-compose.cloud.yml`** orchestrates both, mounts `logs/selfplay` + `models` as volumes, passes `WANDB_API_KEY`. The Vast.ai default images and GCE Deep-Learning VMs both ship with `nvidia-container-toolkit` pre-installed.
+
+**Suggested entry points:** Vast.ai 3090 spot (cheapest), GCE Spot T4 + n1-standard-8 (most managed; budget alerts via `gcloud billing budgets create`). Spot preemption is survivable: with `--checkpoint-interval=50`, at most ~50 games are lost between checkpoints; `--checkpoint=checkpoint_latest.pt` resumes cleanly.
+
+Full step-by-step (gcloud commands, Artifact Registry setup, GCS bucket for checkpoints, `gcsfuse` mount, budget alerts) is in [the active plan, Phase 7](../ai-model-design.md).
 
 ### Model versioning
 
@@ -656,20 +774,23 @@ With context caching + per-generation strategy update + description elision (Pha
 | Component | Status | Notes |
 |---|---|---|
 | Project structure + `pyproject.toml` | ✅ Done | src-layout, setuptools build system, dev deps |
-| `main.py` (root shim) + `src/tm_ai_server/main.py` | ✅ Done | Correct `/move`, `/health`, `/version` endpoints |
-| `schemas.py` | ✅ Done | Correct camelCase schemas matching TM server output |
-| `config.py` | ✅ Done | STATE_DIM=55, constants for phases/boards/expansions/tags |
-| `model.py` | ✅ Done | PolicyValueNet with LayerNorm + Dropout |
+| `main.py` (root shim) + `src/tm_ai_server/main.py` | ✅ Done | `/move`, `/advise`, `/health`, `/version` |
+| `schemas.py` | ✅ Done | camelCase schemas; AdviceRequest carries player_id + user_question |
+| `config.py` | ✅ Done | STATE_DIM=492, 199-card resource vocab, normalisation caps |
+| `model.py` | ✅ Done | Flat MLP PolicyValueNet (LayerNorm + Dropout); Option C refactor planned |
 | `encoding.py` | ✅ Done | encode_state, flatten_options, index_to_response, response_to_index |
-| `inference.py` | ✅ Done | load_model, select_action; routes to LLM if USE_LLM=true, else random fallback |
-| `llm_player.py` | ✅ Done | LLM player (Ollama + Gemini) — setup prompt + action prompt + strategy doc per game; injects board/card context |
-| `game_knowledge.py` | ✅ Done | 970-card DB + board/expansion descriptions; `format_card_context` + `format_game_context` |
+| `inference.py` | ✅ Done | load_model, select_action, select_advice; routes to LLM if USE_LLM=true |
+| `llm_player.py` | ✅ Done | LLM player (Ollama + Gemini); per-generation strategy update; think on every turn; per-player AI Trainer session namespace |
+| `game_knowledge.py` | ✅ Done | 970-card DB + board/expansion descriptions; `format_card_context`, `format_config_context`, `format_board_layout` |
 | `data/card_db.json` | ✅ Done | Generated by `extract_card_db.ts` from TM server card manifests |
 | `training/dataset.py` | ✅ Done | TMDataset from Plan-B training log format |
 | `training/train_supervised.py` | ✅ Done | Cross-entropy + MSE, checkpoint_best/latest |
-| `training/env_tm.py` | ✅ Skeleton | Gymnasium env; requires TM server Phase-2 HTTP endpoints |
-| `training/train_ppo.py` | ✅ Skeleton | MaskablePPO; requires env_tm and sb3-contrib |
-| Tests (test_encoding, test_schemas) | ✅ Done | 20 tests, all passing |
+| `training/env_tm.py` | ✅ Done | Gymnasium env over `/api/ai/new-game` + `/api/ai/step` |
+| `training/train_ppo.py` | ✅ Done | MaskablePPO with manifest/metrics; checkpoints per N games |
+| Tests (test_encoding, test_schemas, test_llm_player) | ✅ Done | 30 tests, all passing |
+| Option C model refactor | 🗒 Planned (Phase 4 of plan) | Card embeddings + spatial board + per-option scoring; see `ai-model-design.md` |
+| LLM bootstrap data run | 🗒 Planned (Phase 5 of plan) | 500-game self-play dataset, ~€25–50 |
+| Docker / Cloud deployment | 🗒 Planned (Phase 7 of plan) | Vast.ai or GCE Spot; budget alerts; gcsfuse for checkpoint persistence |
 
 ---
 
