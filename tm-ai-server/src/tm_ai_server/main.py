@@ -69,7 +69,8 @@ async def advise(request: AdviceRequest):
 
     state = request.state.model_dump()
     advice_text, recommendation = select_advice(
-        state, waiting_for, request.game_id, user_question=request.user_question
+        state, waiting_for, request.game_id, request.player_id,
+        user_question=request.user_question,
     )
     return AdviceResponse(advice_text=advice_text, recommendation=recommendation)
 

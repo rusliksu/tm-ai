@@ -959,30 +959,103 @@ def _select_action(state: dict, waiting_for: dict, game_id: str, last_error: str
 # ---------------------------------------------------------------------------
 
 _TRAINER_SYSTEM_SUFFIX = (
-    "\n\nYou are a strategy coach helping a human player. Your job is to advise, not to play. "
-    "Always produce TWO outputs in the same response:\n"
-    "1. A human-readable coaching section with strategic advice.\n"
-    "2. A hidden machine-readable section wrapped in <recommendation>...</recommendation> tags "
-    "using the same CHOICE: N [PAYMENT: ...] format as normal action responses."
+    "\n\nYou are a strategy coach helping a human player. Your job is to advise, not to play.\n"
+    "Output rules (STRICT — failure to follow breaks the UI):\n"
+    "  • Plain text ONLY. No markdown. No bullet points. No asterisks, no headers, no backticks.\n"
+    "  • Keep coaching to 1-3 short sentences. Be direct and concrete.\n"
+    "  • End EVERY response with a machine-readable block:\n"
+    "      <recommendation>\n"
+    "      CHOICE: <number>\n"
+    "      [PAYMENT: MC=<n>[, STEEL=<n>] ...   # only if payment is required]\n"
+    "      </recommendation>\n"
+    "  • For setup decisions, follow the requested CORPORATION / BUY_CARDS / PRELUDE_CARDS / "
+    "CEO_CARD / STRATEGY format inside the recommendation block instead."
 )
+
+
+def _build_trainer_system(state: dict) -> str:
+    """Build the trainer system prompt: TM rules + game config + board + coaching persona."""
+    from .game_knowledge import format_config_context, format_board_layout
+    g = state.get("game", {})
+    game_ctx = format_config_context(g)
+    board_layout = format_board_layout(state.get("boardSpaces") or [])
+    system = (
+        TM_RULES + "\n\n" + game_ctx + "\n\n"
+        + (board_layout + "\n\n" if board_layout else "")
+    )
+    return system + _TRAINER_SYSTEM_SUFFIX
+
+
+def _select_setup_advise(
+    state: dict,
+    waiting_for: dict,
+    trainer_game_id: str,
+    user_question: str | None,
+) -> tuple[str, dict]:
+    """Coach a human through initialCards / prelude. Reuses the setup prompt builder."""
+    game_id_part = trainer_game_id.split(":", 2)[1] if trainer_game_id.startswith("trainer:") else trainer_game_id
+    setup_prompt = _build_setup_prompt(state, waiting_for, game_id_part)
+
+    prompt_lines = [
+        setup_prompt,
+        "",
+        "You are coaching a human, not playing. Provide 1-3 short plain-text sentences explaining",
+        "the best opening choice, then output the setup decision inside a <recommendation> block",
+        "using the SAME CORPORATION / BUY_CARDS / PRELUDE_CARDS / CEO_CARD / STRATEGY format from",
+        "the request above.",
+    ]
+    if user_question:
+        prompt_lines.append(f'\nUser\'s question: "{user_question}"')
+    user = "\n".join(prompt_lines)
+
+    has_session = trainer_game_id in (
+        _game_chat_sessions if _LLM_PROVIDER == "gemini" else _game_sessions
+    )
+    if not has_session:
+        system = _build_trainer_system(state)
+        text = _call_llm_init(trainer_game_id, system, user, think=True)
+    else:
+        text = _call_llm_continue(trainer_game_id, user)
+
+    rec_match = re.search(r"<recommendation>(.*?)</recommendation>", text, re.DOTALL | re.IGNORECASE)
+    if rec_match:
+        rec_text = rec_match.group(1).strip()
+        advice_text = (text[:rec_match.start()] + text[rec_match.end():]).strip()
+    else:
+        rec_text = text
+        advice_text = text
+
+    recommendation, _ = _parse_setup_response(rec_text, waiting_for, game_id_part)
+    return advice_text or "(no advice text)", recommendation
 
 
 def select_action_advise(
     state: dict,
     waiting_for: dict,
     game_id: str,
+    player_id: str,
     user_question: str | None = None,
 ) -> tuple[str, dict]:
     """Return (advice_text, recommendation_input_response) for the AI Trainer feature.
 
-    Uses a distinct session namespace ('trainer:<game_id>') to avoid colliding with any
-    concurrent AI-player session in the same game.
+    Each player gets an isolated session via the namespace 'trainer:<game_id>:<player_id>'
+    so the LLM never confuses the two players' tableaux or strategies.
+
+    Supports both setup phases (initialCards / prelude) and action turns.
     """
+    wf_type = waiting_for.get("type", "")
+    trainer_game_id = f"trainer:{game_id}:{player_id}"
+
+    # ------------------------------------------------------------------
+    # Setup-phase coaching (initialCards / prelude) — the action-options
+    # flattener returns nothing for these, so they had no advice path before.
+    # ------------------------------------------------------------------
+    if wf_type in SETUP_TYPES:
+        return _select_setup_advise(state, waiting_for, trainer_game_id, user_question)
+
     options = flatten_options(waiting_for)
     if not options:
         return ("No actions available.", _default_response(waiting_for))
-
-    trainer_game_id = f"trainer:{game_id}"
 
     if _LLM_PROVIDER == "gemini":
         generation = state.get("game", {}).get("generation", 1)
@@ -994,27 +1067,18 @@ def select_action_advise(
         prompt_lines.append(f"\nUser's question: \"{user_question}\"")
     prompt_lines += [
         "",
-        "Provide strategic coaching advice for the human player, then give your recommendation.",
-        "Format your response as:",
-        "  [Coaching advice paragraph(s)]",
-        "  <recommendation>",
-        "  CHOICE: <number>",
-        "  [PAYMENT: MC=<n>[, STEEL=<n>] ...  # only if payment is required]",
-        "  </recommendation>",
+        "Coach the human in 1-3 short sentences (plain text, no markdown), then end with:",
+        "<recommendation>",
+        "CHOICE: <number>",
+        "[PAYMENT: MC=<n>[, STEEL=<n>] ...  # only when payment is required]",
+        "</recommendation>",
     ]
     user = "\n".join(prompt_lines)
 
-    # Use or initialise a trainer session (separate namespace from the AI-player session)
+    # Use or initialise a per-player trainer session
     if trainer_game_id not in (_game_chat_sessions if _LLM_PROVIDER == "gemini" else _game_sessions):
-        # Build trainer system prompt: same rules + coaching persona
-        system = _session_base_system.get(game_id, "") or _session_base_system.get(trainer_game_id, "")
-        if not system:
-            from .game_knowledge import format_config_context
-            g = state.get("game", {})
-            game_ctx = format_config_context(g)
-            system = TM_RULES + "\n\n" + game_ctx
-        system = system + _TRAINER_SYSTEM_SUFFIX
-        text = _call_llm_init(trainer_game_id, system, user, think=False)
+        system = _build_trainer_system(state)
+        text = _call_llm_init(trainer_game_id, system, user, think=True)
     else:
         text = _call_llm_continue(trainer_game_id, user)
 

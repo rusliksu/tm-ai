@@ -159,12 +159,12 @@ Key files in `/home/pmunk/workspace/terraforming-mars/src/server/`:
 - `ai/stateMapping.ts` — full state; includes `cardsInHand` (self player only), `recentLog` (opponents' moves + system messages since generation start; own moves filtered out), `boardName`, `expansions`, `availableMilestones`, `availableAwards`, `gameVariants`; `cardResources` is per-card `{name: count}`
 - `ai/TrainingLogger.ts` — writeMeta/appendTurn/writeResult; **skipped entirely for `game.isSelfPlay` games** in Player.process() and Game.gotoEndGame()
 - `routes/ApiAiSelfPlay.ts` — `POST /api/ai/new-game` and `POST /api/ai/step`
-- `routes/ApiAiAdvice.ts` — `POST /api/ai/advice` and `POST /api/ai/play-recommendation` (AI Trainer; requires `game.aiTrainerEnabled`)
+- `routes/ApiAiAdvice.ts` — `POST /api/ai/advice` and `POST /api/ai/play-recommendation` (AI Trainer; opt-in per-player via UI toggle, no game-wide flag)
 - `routes/ApiCreateGame.ts` — isAI flag, writeMeta at game creation
 - `common/app/paths.ts` — `API_AI_NEW_GAME`, `API_AI_STEP`, `API_AI_ADVICE`, `API_AI_PLAY_RECOMMENDATION` path constants
 - `tools/extract_card_db.ts` — extracts card DB including prelude/CEO descriptions via renderData traversal
 - `client/components/ai/AiTrainerChat.vue` — coaching chat sidebar; auto-fetches advice on each new decision, shows Play Recommendation button
-- `client/components/create/CreateGameForm.vue` — `aiTrainerEnabled` checkbox (under Show timers)
+- `client/components/PlayerHome.vue` — per-player 🤖 toggle button + sidebar; navigatePage hotkey handler skips `<input>` / `<textarea>` / contentEditable so chat typing doesn't trigger page jumps
 
 ## Running the Stack
 
@@ -240,7 +240,7 @@ Supports Ollama (local, free) and Gemini (cloud, fast). Select via `LLM_PROVIDER
 
 **Gemini transient errors**: `_gemini_with_retry` retries on 503/429 with exponential backoff (5s, 10s, 3 attempts).
 
-**AI Trainer** (`select_action_advise`): activated via `POST /advise` when `aiTrainerEnabled=true`. Uses `trainer:<game_id>` session namespace (separate from AI-player session). Instructs the LLM to produce coaching text + `<recommendation>CHOICE: N [PAYMENT: ...]</recommendation>` in one response; the server splits these before returning `{advice_text, recommendation}`. Requires `USE_LLM=true`.
+**AI Trainer** (`select_action_advise`): per-player coaching via `POST /advise`. Opt-in per player from the UI toggle — no game-wide flag. Session namespace `trainer:<game_id>:<player_id>` isolates each player's session. Setup phases (`initialCards`, `prelude`) handled by `_select_setup_advise` so the trainer can recommend opening corp + cards, not just action turns. System prompt (`_TRAINER_SYSTEM_SUFFIX`) requires plain-text 1-3 sentence coaching plus a `<recommendation>` block; markdown is forbidden. Think enabled (`GEMINI_THINKING_BUDGET`). Requires `USE_LLM=true`. Play Recommendation in `AiTrainerChat.vue` reloads the page on success.
 
 ## Remaining Work
 

@@ -109,13 +109,14 @@ def select_advice(
     state: dict,
     waiting_for: dict,
     game_id: str,
+    player_id: str,
     user_question: str | None = None,
 ) -> tuple[str, dict]:
     """Return (advice_text, recommendation) for the AI Trainer feature.
 
-    Only available when USE_LLM=true.
+    Each player gets an isolated session via player_id. Only available when USE_LLM=true.
     """
     if os.getenv("USE_LLM", "false").lower() != "true":
         raise RuntimeError("AI Trainer requires USE_LLM=true")
     from .llm_player import select_action_advise
-    return select_action_advise(state, waiting_for, game_id, user_question=user_question)
+    return select_action_advise(state, waiting_for, game_id, player_id, user_question=user_question)

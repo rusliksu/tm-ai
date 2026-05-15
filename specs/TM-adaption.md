@@ -211,7 +211,7 @@ The Python env (`env_tm.py`) calls these endpoints sequentially; the model plays
 
 ## AI Trainer API
 
-Two TM-server routes for the human-facing coaching sidebar, implemented in `src/server/routes/ApiAiAdvice.ts`. Only available when `game.aiTrainerEnabled === true`.
+Two TM-server routes for the human-facing coaching sidebar, implemented in `src/server/routes/ApiAiAdvice.ts`. Opt-in **per player** via a client-side toggle in `PlayerHome.vue` (state persisted to `localStorage` under `ai_trainer_visible:<participantId>`). No game-wide flag — any player can open their own trainer panel on demand.
 
 ### `POST /api/ai/advice`
 
@@ -247,17 +247,18 @@ Request:
 }
 ```
 
-Response: `{"success": true}`
+Response: `{"success": true}`. On success the client triggers `window.location.reload()` so the next decision renders identically to the regular Play-button path.
 
-### Game option: `aiTrainerEnabled`
+### Per-player UI toggle
 
-Added to `GameOptions` (default `false`). Propagated through:
-- `NewGameConfig.aiTrainerEnabled?: boolean` (client → server)
-- `ApiCreateGame` → `gameOptions.aiTrainerEnabled`
-- `Game.aiTrainerEnabled: boolean` instance field
-- `ServerModel` → `GameOptionsModel.aiTrainerEnabled`
-- `AiTrainerChat.vue` renders in `PlayerHome.vue` when `game.gameOptions.aiTrainerEnabled`
-- Checkbox in `CreateGameForm.vue` under the timers option
+- `PlayerHome.vue` exposes a fixed 🤖 button (bottom-right) that toggles `aiTrainerVisible` for the current participant
+- State is persisted to `localStorage[ai_trainer_visible:<participantId>]`
+- When visible, the trainer sidebar mounts `AiTrainerChat` and per-decision advice fetches start
+- The AI server's session namespace is `trainer:<game_id>:<player_id>`, so two players in the same game get isolated trainer sessions
+
+### Hotkey isolation
+
+`PlayerHome.vue:navigatePage` now skips global single-key shortcuts when the keydown target is `<input>`, `<textarea>`, or any `contentEditable` element. Previously only `<input>` was checked, which let keys like `s` / `d` jump the page mid-chat in the trainer's `<textarea>` input.
 
 ---
 

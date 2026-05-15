@@ -536,7 +536,7 @@ Think is enabled on **every** turn (setup, prelude, action, per-generation refle
 
 ### AI Trainer (`select_action_advise`)
 
-The AI Trainer is a coaching sidebar that advises a **human** player (rather than playing for them). Enabled per-game via `aiTrainerEnabled: true` in `GameOptions`.
+The AI Trainer is a coaching sidebar that advises a **human** player (rather than playing for them). It is **opt-in per player** — there is no game-wide flag; each player toggles the trainer panel on/off from their own UI (state persisted to `localStorage` keyed by `ai_trainer_visible:<participantId>`).
 
 **Flow:**
 1. Human sees a "🤖 AI Trainer" panel in the game UI (`AiTrainerChat.vue`).
@@ -546,9 +546,13 @@ The AI Trainer is a coaching sidebar that advises a **human** player (rather tha
 5. Human can click **Play Recommendation** to submit it, or play manually.
 6. Human can also type a follow-up question and click **Ask** — the conversation continues in the same session.
 
-**Session isolation**: trainer sessions use the namespace `trainer:<game_id>` in `_game_sessions` / `_game_chat_sessions`, so they never collide with a concurrent AI-player session in the same game.
+**Per-player session isolation**: trainer sessions use the namespace `trainer:<game_id>:<player_id>` in `_game_sessions` / `_game_chat_sessions`. Each player gets a fresh, isolated session — the LLM never sees the other player's tableau or strategy. Distinct from any concurrent AI-player session in the same game.
 
-**Dual-format response**: the LLM is instructed to always produce two sections in one reply — a coaching paragraph, then `<recommendation>CHOICE: N [PAYMENT: ...]</recommendation>`. `select_action_advise` splits these: `advice_text` is shown to the human; the recommendation block is parsed by `index_to_response` to produce the ready-to-submit `recommendation` dict.
+**Setup-phase coaching** (`_select_setup_advise`): handles `initialCards` and `prelude` — the trainer can recommend a corporation + cards to buy, not just action turns. Reuses `_build_setup_prompt` and `_parse_setup_response`. Wraps the structured CORPORATION/BUY_CARDS/PRELUDE_CARDS/CEO_CARD/STRATEGY block inside `<recommendation>` so the client can submit it via the same Play Recommendation flow.
+
+**Dual-format response**: the LLM is instructed (in `_TRAINER_SYSTEM_SUFFIX`) to produce **plain text, no markdown**, **1–3 short sentences** of coaching, followed by a `<recommendation>` block (CHOICE: N + optional PAYMENT). `select_action_advise` strips the recommendation block from `advice_text` and parses it via `index_to_response`.
+
+**Think enabled**: trainer turns set `think=True` (uses `GEMINI_THINKING_BUDGET` for Gemini); the trainer's deliberation budget is unconstrained by the AI-player's cost optimizations.
 
 **Requires `USE_LLM=true`** — returns an error if the neural-net mode is active instead.
 
@@ -571,7 +575,9 @@ The AI Trainer is a coaching sidebar that advises a **human** player (rather tha
 - `_capture_strategy_then_trim(game_id, session)` — Ollama: capture strategy then rebuild trimmed session
 - `_per_generation_strategy_update(game_id, chat, generation)` — Gemini: at each generation boundary, send a structured restate prompt and capture the response as the updated strategy
 - `_maybe_per_generation_update(game_id, generation)` — fires `_per_generation_strategy_update` on generation bump; no-op when generation unchanged
-- `select_action_advise(state, waiting_for, game_id, user_question)` — AI Trainer entry point; returns `(advice_text, recommendation)`
+- `select_action_advise(state, waiting_for, game_id, player_id, user_question)` — AI Trainer entry point; returns `(advice_text, recommendation)`. Per-player session: `trainer:<game_id>:<player_id>`. Dispatches to `_select_setup_advise` for `initialCards`/`prelude` decisions.
+- `_select_setup_advise(state, waiting_for, trainer_game_id, user_question)` — coaching path for setup phases
+- `_build_trainer_system(state)` — composes the trainer's system prompt (rules + game config + board layout + coaching persona)
 
 ### Game Knowledge Database (`game_knowledge.py`)
 

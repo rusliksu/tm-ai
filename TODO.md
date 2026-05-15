@@ -161,14 +161,13 @@ uv run python -m tm_ai_server.training.train_ppo \
 
 
 # ai trainer fix
-- ai trainer side is a player-specific toogle button, not a game wide one.
-- from the chat it seems the llm has a hard time to separate both players. make sure that each player get's a separat ai trainer
-- update prompt of ai trainer to make output shorter
-- add to prompt not to use markdown, just plain text for formatting
-- play recommendation should trigger a refresh of the page in a similar way as if the the "play" button is pressed by the user
-- ai trainer did not recommend to take any of the initial cards
-- it seems some keys like s or d make the page jump to a specific location - this prevents chatting. disable this feature when ai chat is on
-- update the specification then implement the changes
+- [x] ai trainer toggle is per-player (UI button + localStorage[`ai_trainer_visible:<participantId>`]); removed game-wide `aiTrainerEnabled` flag and CreateGameForm checkbox entirely
+- [x] per-player session isolation — namespace `trainer:<game_id>:<player_id>` so two players in the same game never share trainer state
+- [x] prompt rewritten: 1-3 short sentences, plain text only (no markdown), strict format
+- [x] play recommendation now reloads the page after success — same effective behavior as the regular Play button (drops INVALID_RUN_ID path concerns)
+- [x] initial-cards / prelude advice supported via new `_select_setup_advise` (wraps the structured CORPORATION/BUY_CARDS/... block inside `<recommendation>`)
+- [x] navigatePage hotkey handler also skips `<textarea>` + `contentEditable` (was only `<input>`) — `s` / `d` no longer jump the page while typing in the trainer chat
+- [x] specs synced (TM-AI.md, TM-adaption.md, CLAUDE.md)
 
 
 

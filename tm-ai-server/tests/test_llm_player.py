@@ -199,7 +199,7 @@ def test_select_action_advise_dual_format():
          patch.object(llm, '_call_llm_init', return_value=llm_response) as mock_init:
 
         advice, recommendation = llm.select_action_advise(
-            _MINIMAL_STATE, _MINIMAL_WAITING_FOR, "game_advise_test"
+            _MINIMAL_STATE, _MINIMAL_WAITING_FOR, "game_advise_test", "pdummy123",
         )
 
     assert "conserve resources" in advice
@@ -209,21 +209,47 @@ def test_select_action_advise_dual_format():
     assert recommendation["index"] == 0
 
 
-def test_advice_session_isolated_from_play():
-    """select_action_advise uses 'trainer:<game_id>' namespace, not the bare game_id."""
-    llm_response = "Advice text.\n<recommendation>\nCHOICE: 2\n</recommendation>"
+def test_advice_session_isolated_per_player():
+    """select_action_advise uses 'trainer:<game_id>:<player_id>' namespace."""
+    llm_response = "Short coaching.\n<recommendation>\nCHOICE: 2\n</recommendation>"
 
-    play_session_key = "game_iso_test"
-    trainer_session_key = f"trainer:{play_session_key}"
+    game_id = "g_iso_test"
+    player_id = "pAAA"
+    expected_session = f"trainer:{game_id}:{player_id}"
 
     with patch.object(llm, '_LLM_PROVIDER', 'ollama'), \
          patch.object(llm, '_game_sessions', {}), \
          patch.object(llm, '_session_base_system', {}), \
          patch.object(llm, '_call_llm_init', return_value=llm_response) as mock_init:
 
-        llm.select_action_advise(_MINIMAL_STATE, _MINIMAL_WAITING_FOR, play_session_key)
+        llm.select_action_advise(_MINIMAL_STATE, _MINIMAL_WAITING_FOR, game_id, player_id)
 
-        # _call_llm_init was called with the trainer namespace, not the bare game_id
-        called_game_id = mock_init.call_args[0][0]
-        assert called_game_id == trainer_session_key
-        assert called_game_id != play_session_key
+        # _call_llm_init was called with the per-player trainer namespace
+        called_session = mock_init.call_args[0][0]
+        assert called_session == expected_session
+        assert called_session != game_id
+        assert called_session != f"trainer:{game_id}"
+
+
+def test_advice_sessions_separate_for_two_players():
+    """Two players in the same game produce two distinct trainer sessions."""
+    llm_response = "Short.\n<recommendation>\nCHOICE: 1\n</recommendation>"
+
+    sessions: dict = {}
+
+    with patch.object(llm, '_LLM_PROVIDER', 'ollama'), \
+         patch.object(llm, '_game_sessions', sessions), \
+         patch.object(llm, '_session_base_system', {}), \
+         patch.object(llm, '_call_llm_init', return_value=llm_response) as mock_init:
+
+        def fake_init(game_id, system, user, think=False):
+            sessions[game_id] = [{"role": "system", "content": system}]
+            return llm_response
+
+        mock_init.side_effect = fake_init
+
+        llm.select_action_advise(_MINIMAL_STATE, _MINIMAL_WAITING_FOR, "g1", "pSandra")
+        llm.select_action_advise(_MINIMAL_STATE, _MINIMAL_WAITING_FOR, "g1", "pPeter")
+
+    assert "trainer:g1:pSandra" in sessions
+    assert "trainer:g1:pPeter" in sessions
