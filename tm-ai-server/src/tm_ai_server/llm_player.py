@@ -13,9 +13,10 @@ Session-per-game architecture:
   is asked to restate its strategy (standing, engine, milestone/award targets, next-gen
   priority). The response becomes natural chat history (no destructive rebuild) and is
   stored in _game_strategies for debugging + session recovery.
-- Context trimming: Ollama-only — if a session grows beyond MAX_SESSION_MESSAGES, it
-  is rebuilt as: original system + strategy reminder + last 40 messages. Gemini's 1M
-  context window makes trimming unnecessary for normal games.
+- Context trimming: both providers. Ollama: rebuilt after MAX_SESSION_MESSAGES (~30 turns).
+  Gemini: trimmed after GEMINI_MAX_TURNS (default 80) by keeping last 40 message pairs +
+  strategy summary. At ~1938 tokens/turn of accumulated context, 80 turns ≈ 155K tokens
+  per request — safely under the 1M/min paid-tier quota for two concurrent players.
 
 Providers:
   Ollama  — messages[] array; Ollama server reuses KV cache for unchanged prefix.
@@ -87,6 +88,11 @@ _session_base_system: dict[str, str] = {}  # game_id → original system (for tr
 
 # Per-generation Gemini strategy update: game_id → last seen generation number
 _gemini_last_generation: dict[str, int] = {}
+
+# Hand-description elision: game_id → generation number on which the hand was last shown
+# with full descriptions. On subsequent action turns in the same generation, card names
+# are shown only with "(desc. shown earlier this gen)" to save ~400–600 tokens per turn.
+_hand_shown_generation: dict[str, int] = {}
 
 # Trim Ollama sessions when they grow beyond this many messages (system + user/assistant pairs)
 _MAX_SESSION_MESSAGES = 62  # ~30 game turns before trim
@@ -320,11 +326,12 @@ def _call_llm_init(game_id: str, system: str, user: str, think: bool = False) ->
     return text
 
 
-def _call_llm_continue(game_id: str, user: str) -> str:
+def _call_llm_continue(game_id: str, user: str, max_output_tokens: int | None = None) -> str:
     """Continue the existing session for game_id (no system re-sent).
 
     Falls back to a session-recovery call with rules + strategy if the session
     was lost (e.g. server restart mid-game or 503 exhausted on setup).
+    max_output_tokens caps Gemini response length (Ollama: ignored).
     """
     if _LLM_DEBUG:
         _log_prompt(f"=== CONTINUE user (provider={_LLM_PROVIDER} game={game_id}) ===", user)
@@ -335,7 +342,7 @@ def _call_llm_continue(game_id: str, user: str) -> str:
             logger.warning("No Gemini session for game %s — recovering session", game_id)
             text = _session_recovery(game_id, user)
         else:
-            text = _continue_gemini_session(game_id, user, chat)
+            text = _continue_gemini_session(game_id, user, chat, max_output_tokens=max_output_tokens)
     else:
         session = _game_sessions.get(game_id)
         if session is None:
@@ -449,7 +456,19 @@ def _capture_strategy_then_trim(game_id: str, session: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 _GEMINI_RETRY_ATTEMPTS = 3
-_GEMINI_RETRY_DELAY    = 5  # seconds (doubles on each retry: 5, 10)
+_GEMINI_RETRY_DELAY    = 5  # seconds for 503 back-off (doubles: 5, 10)
+
+# Token cap for action-turn responses — keeps context history from growing unboundedly.
+# Strategy updates and setup phases are left uncapped (they need full reasoning).
+_GEMINI_ACTION_MAX_OUTPUT_TOKENS: int = int(os.getenv("GEMINI_ACTION_MAX_OUTPUT_TOKENS", "350"))
+
+# Trim Gemini chat history when the session exceeds this many turns (user+model pairs).
+# At ~1938 tokens/turn of context growth, 80 turns ≈ 155K tokens of history per call —
+# a safe headroom under the 1M/min quota with two concurrent players.
+_MAX_GEMINI_TURNS: int = int(os.getenv("GEMINI_MAX_TURNS", "80"))
+
+# Per-game turn counter for Gemini sessions (for history trimming)
+_gemini_turn_count: dict[str, int] = {}
 
 
 def _is_transient_gemini_error(exc: Exception) -> bool:
@@ -457,19 +476,40 @@ def _is_transient_gemini_error(exc: Exception) -> bool:
     return any(k in msg for k in ("503", "unavailable", "429", "rate limit", "overloaded", "resource exhausted"))
 
 
+def _parse_api_retry_delay(exc: Exception) -> float | None:
+    """Extract retryDelay seconds from a Google API error response, or return None."""
+    m = re.search(r"retryDelay.*?(\d+\.?\d*)s", str(exc))
+    return float(m.group(1)) if m else None
+
+
 def _gemini_with_retry(fn):
-    """Call fn() with exponential back-off on transient Gemini errors."""
+    """Call fn() with back-off on transient Gemini errors.
+
+    429 quota errors: waits the exact retryDelay from the API response (+ 2s buffer) so
+    the minute-window quota resets before retrying. This avoids the old 5s/10s pattern
+    which retried inside the same quota window and tripled token consumption per failure.
+    503/overloaded: standard exponential back-off (5s, 10s).
+    """
     last_exc: Exception | None = None
     for attempt in range(_GEMINI_RETRY_ATTEMPTS):
         try:
             return fn()
         except Exception as exc:
             if attempt < _GEMINI_RETRY_ATTEMPTS - 1 and _is_transient_gemini_error(exc):
-                wait = _GEMINI_RETRY_DELAY * (2 ** attempt)
-                logger.warning(
-                    "Gemini transient error (attempt %d/%d): %s — retrying in %ds",
-                    attempt + 1, _GEMINI_RETRY_ATTEMPTS, exc, wait,
-                )
+                msg = str(exc)
+                if "429" in msg or "resource exhausted" in msg.lower():
+                    api_delay = _parse_api_retry_delay(exc)
+                    wait = (api_delay + 2.0) if api_delay else 62.0  # default: full minute + buffer
+                    logger.warning(
+                        "Gemini 429 quota (attempt %d/%d) — waiting %.0fs (API retryDelay=%.0fs)",
+                        attempt + 1, _GEMINI_RETRY_ATTEMPTS, wait, api_delay or 0,
+                    )
+                else:
+                    wait = _GEMINI_RETRY_DELAY * (2 ** attempt)
+                    logger.warning(
+                        "Gemini transient error (attempt %d/%d): %s — retrying in %ds",
+                        attempt + 1, _GEMINI_RETRY_ATTEMPTS, exc, int(wait),
+                    )
                 time.sleep(wait)
                 last_exc = exc
             else:
@@ -678,13 +718,77 @@ def _maybe_per_generation_update(game_id: str, generation: int, state: dict) -> 
     _gemini_last_generation[game_id] = generation
 
 
-def _continue_gemini_session(game_id: str, user: str, chat: object) -> str:
+def _trim_gemini_session(game_id: str) -> None:
+    """Trim old Gemini chat history to prevent unbounded context growth.
+
+    Keeps the strategy (from _game_strategies) plus the last 40 message pairs
+    (20 user + 20 model) so the per-request token count stays bounded regardless
+    of game length. The per-gen strategy updates ensure recent intent is preserved.
+    """
+    from google.genai import types
+    chat = _game_chat_sessions.get(game_id)
+    if chat is None:
+        return
+    history: list = chat.get_history()  # type: ignore[attr-defined]
+    keep = 40  # user+model messages to retain
+    if len(history) <= keep:
+        return
+
+    strategy = _game_strategies.get(game_id, "Play a balanced game — maximise TR and card synergies.")
+    cache_info = _game_cache_info.get(game_id)
+    system = cache_info["system"] if cache_info else _session_base_system.get(game_id, TM_RULES)
+
+    # Inject strategy as the first kept message pair (synthetic, not sent to API)
+    strategy_summary = f"[Session trimmed to last {keep//2} turns. Your current strategy: {strategy}]"
+    trimmed_history = [
+        types.Content(role="user",  parts=[types.Part(text=strategy_summary)]),
+        types.Content(role="model", parts=[types.Part(text="Understood. Continuing.")]),
+    ] + history[-keep:]
+
+    if cache_info:
+        new_chat = _gemini_client.chats.create(  # type: ignore[union-attr]
+            model=_GEMINI_MODEL,
+            config=types.GenerateContentConfig(
+                cached_content=cache_info["name"],
+                thinking_config=types.ThinkingConfig(thinking_budget=_GEMINI_THINKING_BUDGET),
+            ),
+            history=trimmed_history,
+        )
+    else:
+        new_chat = _gemini_client.chats.create(  # type: ignore[union-attr]
+            model=_GEMINI_MODEL,
+            config=types.GenerateContentConfig(
+                system_instruction=system,
+                thinking_config=types.ThinkingConfig(thinking_budget=_GEMINI_THINKING_BUDGET),
+            ),
+            history=trimmed_history,
+        )
+    _game_chat_sessions[game_id] = new_chat
+    _gemini_turn_count[game_id] = 0
+    logger.info("Trimmed Gemini session for game %s — kept last %d messages", game_id, keep)
+
+
+def _continue_gemini_session(game_id: str, user: str, chat: object,
+                              max_output_tokens: int | None = None) -> str:
     _maybe_refresh_gemini_cache(game_id)
     # Re-fetch chat: _maybe_refresh_gemini_cache may have rebuilt it into _game_chat_sessions.
     # Using the stale reference causes a 403 because the old chat object still references
     # the expired cache.
     chat = _game_chat_sessions.get(game_id) or chat
-    response = _gemini_with_retry(lambda: chat.send_message(user))  # type: ignore[attr-defined]
+
+    # Trim history if session has grown too long (prevents unbounded input token growth).
+    turn = _gemini_turn_count.get(game_id, 0)
+    if turn >= _MAX_GEMINI_TURNS:
+        _trim_gemini_session(game_id)
+        chat = _game_chat_sessions.get(game_id) or chat
+    _gemini_turn_count[game_id] = turn + 1
+
+    if max_output_tokens:
+        from google.genai import types
+        cfg = types.GenerateContentConfig(max_output_tokens=max_output_tokens)
+        response = _gemini_with_retry(lambda: chat.send_message(user, config=cfg))  # type: ignore[attr-defined]
+    else:
+        response = _gemini_with_retry(lambda: chat.send_message(user))  # type: ignore[attr-defined]
     text: str | None = response.text
     if not text:
         logger.warning("Gemini returned empty/None text for game %s", game_id)
@@ -991,13 +1095,17 @@ def _select_action(state: dict, waiting_for: dict, game_id: str, last_error: str
         generation = state.get("game", {}).get("generation", 1)
         _maybe_per_generation_update(game_id, generation, state)
 
-    user = _build_action_prompt(state, waiting_for, options, last_error=last_error)
+    user = _build_action_prompt(state, waiting_for, options, last_error=last_error, game_id=game_id)
+    # Append a brevity instruction so the model doesn't produce multi-paragraph reasoning
+    # that accumulates in the chat history and inflates future input-token counts.
+    user += "\n\nBrief reasoning (1-2 sentences), then CHOICE: N on its own line. No text after CHOICE."
     logger.debug("LLM action (game=%s type=%s options=%d)",
                  game_id, waiting_for.get("type"), len(options))
-    text = _call_llm_continue(game_id, user)
+    text = _call_llm_continue(game_id, user,
+                              max_output_tokens=_GEMINI_ACTION_MAX_OUTPUT_TOKENS if _LLM_PROVIDER == "gemini" else None)
     logger.debug("Action response (game=%s): %s", game_id, text[:300])
 
-    return _parse_action_response(text, options, waiting_for, game_id)
+    return _parse_action_response(text, options, waiting_for, game_id, player=state.get("player"))
 
 
 # ---------------------------------------------------------------------------
@@ -1112,7 +1220,7 @@ def select_action_advise(
 
     if _LLM_PROVIDER == "gemini":
         generation = state.get("game", {}).get("generation", 1)
-        _maybe_per_generation_update(trainer_game_id, generation)
+        _maybe_per_generation_update(trainer_game_id, generation, state)
 
     prompt_lines: list[str] = []
     prompt_lines.append(_build_action_prompt(state, waiting_for, options))
@@ -1156,6 +1264,7 @@ def select_action_advise(
     if wf_type in ("projectCard", "payment"):
         payment = _parse_payment_line(rec_text)
         if payment:
+            payment = _correct_payment(payment, waiting_for, state.get("player", {}))
             recommendation = {**recommendation, "payment": payment}
 
     return advice_text, recommendation
@@ -1203,6 +1312,86 @@ def _parse_payment_line(text: str) -> dict | None:
     return payment
 
 
+def _correct_payment(payment: dict, waiting_for: dict, player: dict) -> dict:
+    """Clamp payment to available resources and ensure it covers the required cost.
+
+    Prevents "You do not have that many resources to spend" rejections by validating
+    the AI-specified payment before submitting it. If the payment exceeds available
+    resources, each component is clamped to what the player actually has, and MC is
+    topped up to cover any resulting shortfall.
+
+    Returns the corrected payment dict. Logs a warning if a correction was needed.
+    """
+    wf_type = waiting_for.get("type", "")
+    po = waiting_for.get("paymentOptions") or {}
+
+    # Required cost
+    if wf_type == "projectCard":
+        cost = waiting_for.get("card", {}).get("calculatedCost", 0) if isinstance(waiting_for.get("card"), dict) else 0
+        # Fallback: look inside the options list for calculatedCost
+        if not cost:
+            for opt in (waiting_for.get("options") or []):
+                c = opt.get("calculatedCost") or opt.get("card", {}).get("calculatedCost", 0)
+                if c:
+                    cost = c
+                    break
+    elif wf_type == "payment":
+        cost = waiting_for.get("amount", 0)
+    else:
+        return payment
+
+    # Available player resources
+    avail: dict[str, int] = {
+        "megacredits": player.get("megacredits", 0),
+        "steel":       player.get("steel", 0)       if wf_type == "projectCard" else 0,
+        "titanium":    player.get("titanium", 0)     if wf_type == "projectCard" else 0,
+        "heat":        player.get("heat", 0)         if po.get("heat") else 0,
+        "plants":      player.get("plants", 0)       if po.get("plants") else 0,
+    }
+    for k in ("microbes", "floaters", "seeds", "graphene",
+              "lunaArchivesScience", "kuiperAsteroids", "auroraiData", "spireScience"):
+        avail[k] = waiting_for.get(k) or 0  # special resources tracked in waitingFor
+
+    # Clamp each component to available
+    corrected = dict(payment)
+    changed = False
+    for field, cap in avail.items():
+        if corrected.get(field, 0) > cap:
+            corrected[field] = cap
+            changed = True
+
+    # Zero out disallowed resources (steel/titanium only valid for projectCard)
+    if wf_type != "projectCard":
+        for field in ("steel", "titanium"):
+            if corrected.get(field, 0):
+                corrected[field] = 0
+                changed = True
+
+    # Compute total value after clamping
+    total_value = corrected.get("megacredits", 0)
+    for field, rate in _PAYMENT_VALUES.items():
+        total_value += corrected.get(field, 0) * rate
+
+    # If we still can't cover the cost (e.g. insufficient resources overall), top up MC
+    shortfall = cost - total_value
+    if shortfall > 0:
+        extra_mc = min(shortfall, avail["megacredits"] - corrected.get("megacredits", 0))
+        if extra_mc > 0:
+            corrected["megacredits"] = corrected.get("megacredits", 0) + extra_mc
+            changed = True
+
+    if changed:
+        logger.warning(
+            "Payment corrected: %s → %s (cost=%d avail=%s)",
+            {k: v for k, v in payment.items() if v},
+            {k: v for k, v in corrected.items() if v},
+            cost,
+            {k: v for k, v in avail.items() if v},
+        )
+
+    return corrected
+
+
 def _format_payment_section(waiting_for: dict, player: dict) -> str:
     """Build the payment options block shown in the action prompt."""
     wf_type = waiting_for.get("type", "")
@@ -1244,19 +1433,26 @@ def _format_payment_section(waiting_for: dict, player: dict) -> str:
             lines.append(f"  {label}: {amt} @ {rate} MC each")
 
     if wf_type == "projectCard":
+        # Show the exact cost so Gemini doesn't have to infer it from the card list
+        cost = 0
+        card = waiting_for.get("card")
+        if isinstance(card, dict):
+            cost = card.get("calculatedCost", 0)
+        cost_str = f" (must cover {cost} MC)" if cost else ""
         lines += [
             "",
-            "After CHOICE, specify how you pay:",
+            f"After CHOICE, specify how you pay{cost_str}:",
             "  PAYMENT: MC=<n>[, STEEL=<n>][, TITANIUM=<n>][, HEAT=<n>][, ...]",
-            "  Total value must cover the card's calculatedCost (can overpay with non-MC).",
+            "  RULE: MC ≤ your current MC. STEEL cubes × 2 + TITANIUM cubes × 3 count toward cost.",
+            "  You can overpay with non-MC resources (surplus discarded). You cannot overpay in MC.",
         ]
     else:  # payment type
         amount = waiting_for.get("amount", 0)
-        lines[1] = f"Payment options for {amount} MC:"
+        lines[1] = f"Payment resources available (need {amount} MC total):"
         lines += [
             "",
-            "Specify payment: PAYMENT: MC=<n>[, HEAT=<n>][, ...]",
-            "  Total value must equal (or exceed) the required amount.",
+            f"Specify payment: PAYMENT: MC=<n>[, HEAT=<n>][, ...]",
+            f"  MC ≤ {mc}. Total value must equal (or exceed) {amount}.",
         ]
     return "\n".join(lines)
 
@@ -1284,7 +1480,8 @@ _BONUS_ABBREV = {
 }
 
 
-def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict], last_error: str | None = None) -> str:
+def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict], last_error: str | None = None,
+                          game_id: str = "") -> str:
     g      = state.get("game", {})
     p      = state.get("player", {})
     prod   = {k: v for k, v in p.get("production", {}).items() if v}
@@ -1345,11 +1542,24 @@ def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict], la
 
     # Cards in hand with descriptions — skip for tile/payment/numeric decisions
     # where the hand plays no role (saves ~100–300 tokens per such turn).
+    # Within a generation, show full descriptions only on the FIRST action turn;
+    # subsequent turns in the same gen show names only to avoid re-sending ~500 tokens
+    # of card descriptions that are already in the model's session context.
     hand_cards = p.get("cardsInHand") or []
+    generation = g.get("generation", 1)
     _hand_irrelevant = wf_type in ("space", "payment", "amount")
     if hand_cards and not _hand_irrelevant:
-        ctx = format_card_context(hand_cards, header=f"Your hand ({len(hand_cards)} cards):", max_cards=30)
-        lines += ["", ctx]
+        last_shown_gen = _hand_shown_generation.get(game_id, -1) if game_id else -1
+        if last_shown_gen == generation:
+            # Already shown with descriptions this gen — name-only to save tokens
+            name_list = ", ".join(hand_cards[:30])
+            lines += ["", f"Your hand ({len(hand_cards)} cards): {name_list}",
+                      "  (Full descriptions shown earlier this generation — rely on your session memory.)"]
+        else:
+            ctx = format_card_context(hand_cards, header=f"Your hand ({len(hand_cards)} cards):", max_cards=30)
+            lines += ["", ctx]
+            if game_id:
+                _hand_shown_generation[game_id] = generation
 
     # Opponents
     opponents = state.get("opponents") or []
@@ -1454,7 +1664,8 @@ def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict], la
 
 
 def _parse_action_response(
-    text: str, options: list[dict], waiting_for: dict, game_id: str
+    text: str, options: list[dict], waiting_for: dict, game_id: str,
+    player: dict | None = None,
 ) -> tuple[dict, dict]:
     m = re.search(r"CHOICE:\s*(\d+)", text)
     chosen = int(m.group(1)) - 1 if m else 0
@@ -1463,11 +1674,12 @@ def _parse_action_response(
     logger.info("Action choice game=%s: %d. %s", game_id, chosen + 1, option["title"])
     response = index_to_response(waiting_for, option["index"])
 
-    # Override payment if AI provided PAYMENT: line
+    # Override payment if AI provided PAYMENT: line; validate and clamp to available resources.
     wf_type = waiting_for.get("type", "")
     if wf_type in ("projectCard", "payment"):
         payment = _parse_payment_line(text)
         if payment:
+            payment = _correct_payment(payment, waiting_for, player or {})
             response = {**response, "payment": payment}
 
     return response, {

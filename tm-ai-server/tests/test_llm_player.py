@@ -97,7 +97,7 @@ def test_per_generation_strategy_update_captures_and_preserves_chat():
          patch.object(llm, '_gemini_last_generation', last_gen):
 
         # Generation bumps from 3 → 4
-        llm._maybe_per_generation_update(game_id, 4)
+        llm._maybe_per_generation_update(game_id, 4, {})
 
         # Strategy was captured and stored
         assert strategies[game_id] == fake_strategy_response.text
@@ -125,7 +125,7 @@ def test_per_generation_update_not_triggered_same_generation():
     with patch.object(llm, '_game_chat_sessions', game_sessions), \
          patch.object(llm, '_gemini_last_generation', last_gen):
 
-        llm._maybe_per_generation_update(game_id, 5)  # Same generation
+        llm._maybe_per_generation_update(game_id, 5, {})  # Same generation
 
         # Chat untouched
         assert game_sessions[game_id] is fake_chat
@@ -153,6 +153,58 @@ def test_hand_card_descriptions_empty_hand():
 def test_hand_card_descriptions_empty_decision():
     """`_is_card_decision_about_hand` returns False when no cards in decision."""
     assert llm._is_card_decision_about_hand([], ["Tardigrades"]) is False
+
+
+# ---------------------------------------------------------------------------
+# test_correct_payment
+# ---------------------------------------------------------------------------
+
+def test_correct_payment_clamps_excess_mc():
+    """_correct_payment clamps MC that exceeds available balance."""
+    payment = {"megacredits": 50, "steel": 0, "titanium": 0, "heat": 0, "plants": 0,
+               "microbes": 0, "floaters": 0, "lunaArchivesScience": 0, "spireScience": 0,
+               "seeds": 0, "auroraiData": 0, "graphene": 0, "kuiperAsteroids": 0}
+    wf = {"type": "payment", "amount": 14}
+    player = {"megacredits": 20, "steel": 0, "titanium": 0, "heat": 0, "plants": 0}
+    result = llm._correct_payment(payment, wf, player)
+    assert result["megacredits"] == 20  # clamped to available
+
+
+def test_correct_payment_clamps_steel_and_tops_up_mc():
+    """_correct_payment clamps steel to available, tops up MC if still short."""
+    payment = {"megacredits": 0, "steel": 10, "titanium": 0, "heat": 0, "plants": 0,
+               "microbes": 0, "floaters": 0, "lunaArchivesScience": 0, "spireScience": 0,
+               "seeds": 0, "auroraiData": 0, "graphene": 0, "kuiperAsteroids": 0}
+    # Card costs 14 MC, player has 3 steel (=6 MC value) and 10 MC
+    wf = {"type": "projectCard", "card": {"calculatedCost": 14}}
+    player = {"megacredits": 10, "steel": 3, "titanium": 0, "heat": 0, "plants": 0}
+    result = llm._correct_payment(payment, wf, player)
+    assert result["steel"] == 3           # clamped from 10 to 3
+    assert result["steel"] * 2 + result["megacredits"] >= 14  # covers cost
+
+
+def test_correct_payment_no_change_when_valid():
+    """_correct_payment leaves a valid payment unchanged."""
+    payment = {"megacredits": 5, "steel": 3, "titanium": 0, "heat": 0, "plants": 0,
+               "microbes": 0, "floaters": 0, "lunaArchivesScience": 0, "spireScience": 0,
+               "seeds": 0, "auroraiData": 0, "graphene": 0, "kuiperAsteroids": 0}
+    wf = {"type": "projectCard", "card": {"calculatedCost": 11}}
+    player = {"megacredits": 10, "steel": 5, "titanium": 0, "heat": 0, "plants": 0}
+    result = llm._correct_payment(payment, wf, player)
+    assert result["megacredits"] == 5
+    assert result["steel"] == 3
+
+
+def test_correct_payment_blocks_steel_on_non_project_card():
+    """_correct_payment zeroes steel/titanium for payment-type (not projectCard)."""
+    payment = {"megacredits": 5, "steel": 3, "titanium": 2, "heat": 0, "plants": 0,
+               "microbes": 0, "floaters": 0, "lunaArchivesScience": 0, "spireScience": 0,
+               "seeds": 0, "auroraiData": 0, "graphene": 0, "kuiperAsteroids": 0}
+    wf = {"type": "payment", "amount": 8}
+    player = {"megacredits": 10, "steel": 5, "titanium": 5, "heat": 0, "plants": 0}
+    result = llm._correct_payment(payment, wf, player)
+    assert result["steel"] == 0
+    assert result["titanium"] == 0
 
 
 # ---------------------------------------------------------------------------

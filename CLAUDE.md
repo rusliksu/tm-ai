@@ -211,6 +211,8 @@ Supports Ollama (local, free) and Gemini (cloud, fast). Select via `LLM_PROVIDER
 | `GEMINI_API_KEY` | — | Google AI Studio key (required for Gemini) |
 | `GEMINI_MODEL` | `gemini-2.5-flash-lite` | Gemini model — supported: `gemini-3-pro`, `gemini-3-flash`, `gemini-3-flash-lite`, `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite` (any Google AI Studio name accepted) |
 | `GEMINI_THINKING_BUDGET` | `512` | Thinking tokens per turn (setup/prelude always use 1024) |
+| `GEMINI_ACTION_MAX_OUTPUT_TOKENS` | `350` | Max output tokens for action turns (caps verbose responses, reduces context growth) |
+| `GEMINI_MAX_TURNS` | `80` | Trim Gemini chat history after this many turns (keeps cumulative input under quota) |
 
 **Session-per-game architecture**: TM rules + board/expansion context sent once at game start (`_call_llm_init`); all subsequent turns continue the same session (`_call_llm_continue`) — no rules repetition.
 
