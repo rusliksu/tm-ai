@@ -8,7 +8,7 @@ cd tm-ai-server && USE_LLM=true OPENROUTER_API_KEY=$OPENROUTER_API_KEY \
   uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000 &
 
 uv run python ../scripts/play_game.py --players 4 \
-  --models "anthropic/claude-sonnet-4-6,openai/gpt-4o,google/gemini-flash-latest,deepseek/deepseek-v4-pro"
+  --models "anthropic/claude-sonnet-4-6,openai/gpt-4o-mini,google/gemini-flash-latest,deepseek/deepseek-v4-pro"
 ```
 
 ## Model mapping
@@ -16,7 +16,7 @@ uv run python ../scripts/play_game.py --players 4 \
 | User request | OpenRouter ID | Note |
 |---|---|---|
 | claude opus 4.6 | `anthropic/claude-sonnet-4-6` | downgraded from opus; ~40% cheaper per token |
-| gpt-5.5 pro | `openai/gpt-4o` | replaced earlier: gpt-5.5-pro costs ~$63/game |
+| gpt-5.5 pro | `openai/gpt-4o-mini` | replaced earlier: gpt-5.5-pro $63 → gpt-4o $8 → mini $0.40 |
 | gemini-3.1-pro | `google/gemini-flash-latest` | downgraded from pro; router → latest flash |
 | deepseek v4 pro | `deepseek/deepseek-v4-pro` | exact match |
 | grok 4.2 | _(removed)_ | dropped to stay within budget |
@@ -30,13 +30,12 @@ per player.
 | Player | Model | $/M in | $/M out | Caching | Est. $/game |
 |---|---|---|---|---|---|
 | Claude Sonnet 4-6 | `anthropic/claude-sonnet-4-6` | $3 | $15 | yes (10% on cached) | ~$4 |
-| GPT-4o | `openai/gpt-4o` | $2.50 | $10 | auto | ~$6 |
+| GPT-4o-mini | `openai/gpt-4o-mini` | $0.15 | $0.60 | auto | ~$0.40 |
 | Gemini Flash Latest | `google/gemini-flash-latest` | ~$0.30 | ~$1.20 | no | ~$1 |
 | DeepSeek V4 Pro | `deepseek/deepseek-v4-pro` | $0.44 | $0.87 | auto | ~$1 |
-| **Total** | | | | | **~$12/game** |
+| **Total** | | | | | **~$6.40/game** |
 
-⚠ Still ~$3 over the $9 budget. To get under $9, replace GPT-4o with `openai/gpt-4o-mini`
-($0.15/M in, $0.60/M out → ~$0.40/game), bringing the total to ~$6.40/game.
+Within the $9 budget with room to spare.
 
 ## Pricing source
 
