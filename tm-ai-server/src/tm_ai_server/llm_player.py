@@ -93,6 +93,10 @@ _MAX_SESSION_MESSAGES = 62  # ~30 user+assistant pairs + system
 
 _KNOWN_CAPABILITIES: dict[str, dict] = {
     # Anthropic via OpenRouter — caching and thinking both available
+    # OpenRouter uses dot notation (4.7) as well as dash (4-7) — both are seeded
+    "anthropic/claude-opus-4.7":        {"caching": True,  "thinking": True},
+    "anthropic/claude-opus-4.7-fast":   {"caching": True,  "thinking": True},
+    "anthropic/claude-opus-4.6-fast":   {"caching": True,  "thinking": True},
     "anthropic/claude-opus-4-7":        {"caching": True,  "thinking": True},
     "anthropic/claude-opus-4-5":        {"caching": True,  "thinking": True},
     "anthropic/claude-sonnet-4-6":      {"caching": True,  "thinking": True},
@@ -101,21 +105,37 @@ _KNOWN_CAPABILITIES: dict[str, dict] = {
     "anthropic/claude-3-7-sonnet":      {"caching": True,  "thinking": True},
     "anthropic/claude-3-5-sonnet":      {"caching": True,  "thinking": False},
     "anthropic/claude-3-5-haiku":       {"caching": True,  "thinking": False},
-    # OpenAI via OpenRouter — automatic caching (no config), no explicit thinking
+    # OpenAI via OpenRouter — automatic caching (no config needed), no explicit thinking
+    "openai/gpt-5.5-pro":              {"caching": False, "thinking": False},
+    "openai/gpt-5.5":                  {"caching": False, "thinking": False},
+    "openai/gpt-5.4-pro":              {"caching": False, "thinking": False},
+    "openai/gpt-5.4":                  {"caching": False, "thinking": False},
     "openai/gpt-4o":                    {"caching": False, "thinking": False},
     "openai/gpt-4o-mini":               {"caching": False, "thinking": False},
     "openai/o3":                        {"caching": False, "thinking": False},
     "openai/o4-mini":                   {"caching": False, "thinking": False},
     "openai/o3-mini":                   {"caching": False, "thinking": False},
-    # xAI Grok via OpenRouter
+    # xAI Grok via OpenRouter — 4.x series supports explicit caching and reasoning
+    "x-ai/grok-4.3":                    {"caching": True,  "thinking": True},
+    "x-ai/grok-4.20":                   {"caching": True,  "thinking": True},
+    "x-ai/grok-4.20-multi-agent":       {"caching": True,  "thinking": True},
     "x-ai/grok-3":                      {"caching": False, "thinking": False},
     "x-ai/grok-3-mini":                 {"caching": False, "thinking": True},
     "x-ai/grok-2-1212":                 {"caching": False, "thinking": False},
-    # Google via OpenRouter — no explicit cache or thinking control
+    # Google via OpenRouter — gemini-pro-latest router supports caching + reasoning
+    "google/gemini-pro-latest":         {"caching": True,  "thinking": True},
+    "google/gemini-flash-latest":       {"caching": False, "thinking": True},
+    "google/gemini-3.1-flash-lite":     {"caching": False, "thinking": True},
+    "google/gemini-3.1-flash-lite-preview": {"caching": False, "thinking": True},
     "google/gemini-2.5-pro":            {"caching": False, "thinking": False},
     "google/gemini-2.5-flash":          {"caching": False, "thinking": False},
     "google/gemini-2.5-flash-lite":     {"caching": False, "thinking": False},
     "google/gemini-2.0-flash":          {"caching": False, "thinking": False},
+    # DeepSeek via OpenRouter — auto-caching (like OpenAI), built-in reasoning
+    "deepseek/deepseek-v4-pro":         {"caching": False, "thinking": True},
+    "deepseek/deepseek-v4-flash":       {"caching": False, "thinking": True},
+    "deepseek/deepseek-r1":             {"caching": False, "thinking": True},
+    "deepseek/deepseek-v3":             {"caching": False, "thinking": False},
     # Ollama local
     "qwen3:4b":                         {"caching": False, "thinking": True},
     "qwen3:8b":                         {"caching": False, "thinking": True},

@@ -7,15 +7,22 @@ Usage (run from the tm-ai repo root, or any directory):
     uv run python ../scripts/play_game.py [options]
 
 Options:
-    --tm-url      TM server base URL      (default: http://localhost:8080)
-    --ai-url      AI server base URL      (default: http://localhost:8000)
-    --board       Board name              (default: random)
-    --players     Number of players 2-4   (default: 2)
+    --tm-url      TM server base URL        (default: http://localhost:8080)
+    --ai-url      AI server base URL        (default: http://localhost:8000)
+    --board       Board name                (default: random)
+    --players     Number of players 2-5     (default: 2)
+    --models      Comma-separated model IDs, one per player (default: AI server default)
+                  Fewer models than players → last model is reused for remaining players.
+                  Examples:
+                    --models anthropic/claude-opus-4.7,openai/gpt-5.5-pro
+                    --models "anthropic/claude-opus-4.7,openai/gpt-5.5-pro,google/gemini-pro-latest,deepseek/deepseek-v4-pro,x-ai/grok-4.3"
     --verbose     Print full state JSON each turn
 
-The script drives both players through the self-play API (/api/ai/new-game +
-/api/ai/step), calling the AI server /move for each decision. With USE_LLM=true
-on the AI server both players use the LLM; without it they use the neural net.
+Models are registered with POST /player/register before the game starts, so each
+player uses a different LLM. Without --models all players use OPENROUTER_MODEL (or
+OLLAMA_MODEL if no API key is set).
+
+Token/cost summary is logged at game end via POST /game-done.
 """
 
 import argparse
@@ -63,7 +70,37 @@ def describe_decision(waiting_for: dict) -> str:
     return f"{wf_type}" + (f": {title}" if title else "")
 
 
-def play_game(tm_url: str, ai_url: str, board: str | None, player_count: int, verbose: bool) -> None:
+def register_players(
+    ai_url: str,
+    game_id: str,
+    player_ids: list[str],
+    models: list[str],
+) -> dict[str, str]:
+    """Register each player_id with its model. Returns {player_id: model}."""
+    assigned: dict[str, str] = {}
+    for i, pid in enumerate(player_ids):
+        model = models[min(i, len(models) - 1)] if models else None
+        payload: dict[str, Any] = {"player_id": pid, "game_id": game_id}
+        if model:
+            payload["model"] = model
+        try:
+            resp = post_json(f"{ai_url}/player/register", payload, timeout=15)
+            assigned[pid] = resp.get("model", model or "?")
+            print(f"  Registered player {pid[:8]}… → {assigned[pid]}", flush=True)
+        except RuntimeError as e:
+            print(f"  ⚠ Could not register player {pid[:8]}…: {e}", flush=True)
+            assigned[pid] = model or "default"
+    return assigned
+
+
+def play_game(
+    tm_url: str,
+    ai_url: str,
+    board: str | None,
+    player_count: int,
+    models: list[str],
+    verbose: bool,
+) -> None:
     # --- Create game ---
     new_game_payload: dict[str, Any] = {"playerCount": player_count}
     if board:
@@ -77,13 +114,21 @@ def play_game(tm_url: str, ai_url: str, board: str | None, player_count: int, ve
     state     = data["state"]
     wf        = data["waitingFor"]
 
-    player_names: dict[str, str] = {}
-    for p in ([state.get("player", {})] + (state.get("opponents") or [])):
-        pid = p.get("id")
-        if pid:
-            player_names[pid] = p.get("name", pid[:8])
+    # Collect all player IDs in seat order: active player first, then opponents
+    all_players: list[dict] = [state.get("player", {})] + (state.get("opponents") or [])
+    player_ids = [p["id"] for p in all_players if p.get("id")]
+    player_names: dict[str, str] = {p["id"]: p.get("name", p["id"][:8])
+                                    for p in all_players if p.get("id")}
 
-    print(f"Game {game_id}  players: {list(player_names.values())}\n", flush=True)
+    # --- Register players with their models ---
+    print(f"\nGame {game_id}", flush=True)
+    assigned_models = register_players(ai_url, game_id, player_ids, models)
+
+    # Show lineup
+    print("\nLineup:")
+    for pid in player_ids:
+        print(f"  {player_names.get(pid, pid[:8]):<14} {assigned_models.get(pid, '?')}")
+    print(flush=True)
 
     turn = 0
     last_gen = 0
@@ -99,7 +144,7 @@ def play_game(tm_url: str, ai_url: str, board: str | None, player_count: int, ve
 
         pname    = player_names.get(player_id, player_id[:8])
         decision = describe_decision(wf)
-        print(f"  [{turn:3d}] {pname:<12} {decision}", end="", flush=True)
+        print(f"  [{turn:3d}] {pname:<14} {decision}", end="", flush=True)
 
         if verbose:
             print(f"\n  state: {json.dumps(state, indent=2)}")
@@ -128,12 +173,19 @@ def play_game(tm_url: str, ai_url: str, board: str | None, player_count: int, ve
             print(f"\n=== Game over (gen {gen}) ===\n")
             result = step_data.get("result") or {}
             for entry in sorted(result.get("playerResults", []), key=lambda r: r.get("rank", 99)):
-                rank = entry.get("rank", "?")
-                name = entry.get("name", "?")
-                vp   = entry.get("vp_total", "?")
-                tr   = entry.get("tr", "?")
-                print(f"  #{rank}  {name:<12}  {vp} VP  (TR {tr})")
+                rank  = entry.get("rank", "?")
+                name  = entry.get("name", "?")
+                vp    = entry.get("vp_total", "?")
+                tr    = entry.get("tr", "?")
+                model = assigned_models.get(entry.get("playerId", ""), "?")
+                print(f"  #{rank}  {name:<14}  {vp} VP  (TR {tr})  [{model}]")
             print()
+
+            # Flush per-player token/cost summary
+            try:
+                post_json(f"{ai_url}/game-done", {"game_id": game_id}, timeout=10)
+            except RuntimeError:
+                pass
             return
 
         state     = step_data["state"]
@@ -153,10 +205,17 @@ def main() -> None:
     parser.add_argument("--ai-url",  default="http://localhost:8000")
     parser.add_argument("--board",   default=None, help="tharsis | hellas | elysium (default: random)")
     parser.add_argument("--players", type=int, default=2)
+    parser.add_argument(
+        "--models", default="",
+        help="Comma-separated OpenRouter model IDs, one per player seat (left to right). "
+             "Fewer than --players → last model repeated.",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
-    play_game(args.tm_url, args.ai_url, args.board, args.players, args.verbose)
+    models = [m.strip() for m in args.models.split(",") if m.strip()]
+
+    play_game(args.tm_url, args.ai_url, args.board, args.players, models, args.verbose)
 
 
 if __name__ == "__main__":
