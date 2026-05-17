@@ -107,7 +107,11 @@ def model_short_name(model: str) -> str:
     # Drop redundant provider prefix in the name (e.g. "Deepseek-V4-Pro" from "deepseek-v4-pro")
     provider = model.split("/")[0] if "/" in model else ""
     if provider and caps.lower().startswith(provider.lower().replace("-", "")):
-        caps = caps[len(provider):]
+        stripped = caps[len(provider):].strip("-")
+        # Only drop the prefix if what remains contains a version/digit (e.g. "V4-Pro", "R1")
+        # Keep it for generic names like "Chat" that need context to be identifiable
+        if stripped and ("-" in stripped or any(c.isdigit() for c in stripped)):
+            caps = stripped
     return caps.strip("-") or name
 
 

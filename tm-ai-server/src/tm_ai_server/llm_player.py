@@ -76,6 +76,8 @@ _model_capabilities: dict[str, dict] = {}
 
 # Pricing cache: model → (input_usd_per_token, output_usd_per_token)
 _pricing_cache: dict[str, tuple[float, float]] = {}
+_pricing_fetched = False
+_pricing_lock = __import__("threading").Lock()
 
 # Lazy-init OpenRouter client
 _openrouter_client = None
@@ -166,6 +168,7 @@ def _ensure_openrouter_client() -> None:
             base_url="https://openrouter.ai/api/v1",
             api_key=_OPENROUTER_API_KEY,
         )
+        _prefetch_pricing()
 
 
 # ---------------------------------------------------------------------------
@@ -257,31 +260,42 @@ def _probe_ollama_thinking(model: str) -> bool:
 # Pricing (OpenRouter models API)
 # ---------------------------------------------------------------------------
 
+def _prefetch_pricing() -> None:
+    """Fetch all OpenRouter model pricing once and cache it. Thread-safe."""
+    global _pricing_fetched
+    if _pricing_fetched:
+        return
+    with _pricing_lock:
+        if _pricing_fetched:
+            return
+        try:
+            r = requests.get(
+                "https://openrouter.ai/api/v1/models",
+                headers={"Authorization": f"Bearer {_OPENROUTER_API_KEY}"},
+                timeout=10,
+            )
+            r.raise_for_status()
+            for entry in r.json().get("data", []):
+                mid     = entry.get("id", "")
+                pricing = entry.get("pricing") or {}
+                raw_in  = pricing.get("prompt")      or pricing.get("input")  or 0
+                raw_out = pricing.get("completion")  or pricing.get("output") or 0
+                try:
+                    in_p  = float(raw_in)
+                    out_p = float(raw_out)
+                except (TypeError, ValueError):
+                    in_p, out_p = 0.0, 0.0
+                _pricing_cache[mid] = (in_p, out_p)
+            _pricing_fetched = True
+            logger.info("Fetched OpenRouter model pricing (%d models)", len(_pricing_cache))
+        except Exception as e:
+            logger.warning("OpenRouter pricing fetch failed: %s", e)
+
+
 def _get_openrouter_pricing(model: str) -> tuple[float, float]:
-    """Return (input_usd_per_token, output_usd_per_token). Fetched once, cached."""
-    if model in _pricing_cache:
-        return _pricing_cache[model]
-    try:
-        r = requests.get(
-            "https://openrouter.ai/api/v1/models",
-            headers={"Authorization": f"Bearer {_OPENROUTER_API_KEY}"},
-            timeout=10,
-        )
-        r.raise_for_status()
-        for entry in r.json().get("data", []):
-            mid     = entry.get("id", "")
-            pricing = entry.get("pricing") or {}
-            raw_in  = pricing.get("prompt")      or pricing.get("input")  or 0
-            raw_out = pricing.get("completion")  or pricing.get("output") or 0
-            try:
-                in_p  = float(raw_in)
-                out_p = float(raw_out)
-            except (TypeError, ValueError):
-                in_p, out_p = 0.0, 0.0
-            _pricing_cache[mid] = (in_p, out_p)
-        logger.info("Fetched OpenRouter model pricing (%d models)", len(_pricing_cache))
-    except Exception as e:
-        logger.warning("OpenRouter pricing fetch failed: %s", e)
+    """Return (input_usd_per_token, output_usd_per_token) from the pre-fetched cache."""
+    if not _pricing_fetched:
+        _prefetch_pricing()
     return _pricing_cache.get(model, (0.0, 0.0))
 
 
@@ -2028,15 +2042,26 @@ def _parse_action_response(
             payment = _correct_payment(payment, waiting_for, p)
             response = {**response, "payment": payment}
     elif response.get("type") == "or":
-        # or-option that resolves to a project card play — extract/auto-generate payment
+        # or-option that resolves to a project card play — extract card + payment
         inner = response.get("response", {})
         if inner.get("type") == "projectCard":
+            sub_node = option.get("node", {})
+            available_cards = sub_node.get("cards", []) if isinstance(sub_node, dict) else []
+            # Find which card the AI mentioned — scan text for any known card name,
+            # keep the last match (AI typically names the card it's about to play)
+            card_name = inner.get("card", "")
+            text_lower = text.lower()
+            for c in available_cards:
+                cname = c.get("name", "")
+                if cname and cname.lower() in text_lower:
+                    card_name = cname
             payment = _parse_payment_line(text)
             if payment:
                 payment = _correct_payment(payment, {"type": "projectCard"}, p)
             else:
-                payment = _auto_payment_for_card(inner.get("card", ""), option.get("node", {}), p)
-            response = {**response, "response": {**inner, "payment": payment}}
+                payment = _auto_payment_for_card(card_name, sub_node, p)
+            inner = {"type": "projectCard", "card": card_name, "payment": payment}
+            response = {**response, "response": inner}
 
     return response, {
         "llm_choice": chosen + 1,
