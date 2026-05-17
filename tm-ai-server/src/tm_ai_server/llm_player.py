@@ -1450,7 +1450,7 @@ def _parse_setup_response(
 # Action phase
 # ---------------------------------------------------------------------------
 
-_MAX_PAYMENT_RETRIES = 2
+_MAX_ACTION_RETRIES = 2
 
 
 def _select_action(
@@ -1473,30 +1473,46 @@ def _select_action(
     logger.debug("LLM action (player=%s type=%s options=%d)",
                  player.player_id, waiting_for.get("type"), len(options))
 
-    _or = _OPENROUTER_MAX_OUTPUT_TOKENS if player.provider == "openrouter" else None
-    text = player.continue_session(user, max_output_tokens=_or)
+    _max_out = _OPENROUTER_MAX_OUTPUT_TOKENS if player.provider == "openrouter" else None
+    text = player.continue_session(user, max_output_tokens=_max_out)
 
     response: dict = {}
     debug: dict    = {}
-    for attempt in range(_MAX_PAYMENT_RETRIES + 1):
+    for attempt in range(_MAX_ACTION_RETRIES + 1):
         logger.debug("Action response (player=%s attempt=%d): %s",
                      player.player_id, attempt + 1, text[:300])
         response, debug = _parse_action_response(text, options, waiting_for, player.player_id, player=p)
 
+        errors: list[str] = []
+
+        # Check CHOICE line is present
+        if not re.search(r"CHOICE:\s*(\d+)", text):
+            opts_str = "  ".join(f"{i+1}. {o['title'][:40]}" for i, o in enumerate(options))
+            errors.append(
+                f"Your response did not include a CHOICE: N line. "
+                f"You must end with CHOICE: N on its own line where N is the option number. "
+                f"Options: {opts_str}"
+            )
+
+        # Check payment is sufficient
         pay_err = _check_payment_valid(response, options, waiting_for, p)
-        if pay_err is None:
+        if pay_err:
+            errors.append(pay_err)
+
+        if not errors:
             break
 
-        if attempt < _MAX_PAYMENT_RETRIES:
+        combined = "\n".join(f"⚠ {e}" for e in errors)
+        if attempt < _MAX_ACTION_RETRIES:
             logger.warning(
-                "Payment retry %d/%d (player=%s): %s",
-                attempt + 1, _MAX_PAYMENT_RETRIES, player.player_id, pay_err,
+                "Action retry %d/%d (player=%s):\n%s",
+                attempt + 1, _MAX_ACTION_RETRIES, player.player_id, combined,
             )
-            text = player.continue_session(f"⚠ {pay_err}", max_output_tokens=_or)
+            text = player.continue_session(combined, max_output_tokens=_max_out)
         else:
             logger.error(
-                "Payment still invalid after %d retries (player=%s): %s — sending best-effort",
-                _MAX_PAYMENT_RETRIES, player.player_id, pay_err,
+                "Action still invalid after %d retries (player=%s):\n%s — sending best-effort",
+                _MAX_ACTION_RETRIES, player.player_id, combined,
             )
 
     g = state.get("game", {})
