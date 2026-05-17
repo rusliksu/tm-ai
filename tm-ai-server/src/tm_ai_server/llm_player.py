@@ -98,6 +98,159 @@ _hand_shown_generation: dict[str, int] = {}
 _MAX_SESSION_MESSAGES = 62  # ~30 game turns before trim
 
 # ---------------------------------------------------------------------------
+# Token usage tracking
+# ---------------------------------------------------------------------------
+
+# Per-game cumulative token counters: game_id → {calls, input, output, cached, thinking}
+_game_token_usage: dict[str, dict] = {}
+
+# Games whose final token summary has already been logged (avoid double-log)
+_game_summary_logged: set[str] = set()
+
+# Cached Gemini pricing (fetched once from models API, falls back to table)
+_gemini_prices_cached: tuple[float, float, float, float] | None = None
+
+# USD per 1M tokens: (input, output, cached_input, thinking_output)
+# Sources: ai.google.dev/pricing (2025-05). "3.x" models treated as equivalents.
+_GEMINI_PRICES_FALLBACK: dict[str, tuple[float, float, float, float]] = {
+    "gemini-2.5-pro":        (1.25, 10.00, 0.3125, 3.50),
+    "gemini-2.5-flash":      (0.15,  0.60, 0.0375, 3.50),
+    "gemini-2.5-flash-lite": (0.10,  0.40, 0.025,  0.0),
+    "gemini-3-pro":          (1.25, 10.00, 0.3125, 3.50),
+    "gemini-3-flash":        (0.15,  0.60, 0.0375, 3.50),
+    "gemini-3-flash-lite":   (0.10,  0.40, 0.025,  0.0),
+    "gemini-3.1-flash-lite": (0.10,  0.40, 0.025,  0.0),
+}
+_GEMINI_PRICES_DEFAULT = (0.10, 0.40, 0.025, 0.0)
+
+
+def _get_gemini_prices() -> tuple[float, float, float, float]:
+    """Return (input/M, output/M, cached_input/M, thinking/M) in USD.
+
+    Tries the models.get() API first (some SDK versions expose a `pricing` field);
+    falls back to the hardcoded table above.
+    """
+    global _gemini_prices_cached
+    if _gemini_prices_cached is not None:
+        return _gemini_prices_cached
+
+    try:
+        model_info = _gemini_client.models.get(_GEMINI_MODEL)  # type: ignore[union-attr]
+        p = getattr(model_info, "pricing", None)
+        if p is not None:
+            inp  = float(getattr(p, "input_per_million_tokens",        None) or
+                         getattr(p, "prompt_token_price_per_million",  None) or 0)
+            out  = float(getattr(p, "output_per_million_tokens",       None) or
+                         getattr(p, "response_token_price_per_million", None) or 0)
+            cach = float(getattr(p, "cached_input_per_million_tokens", None) or inp * 0.25)
+            thk  = float(getattr(p, "thinking_per_million_tokens",     None) or 0)
+            if inp > 0 and out > 0:
+                _gemini_prices_cached = (inp, out, cach, thk)
+                logger.info("Gemini pricing from API: input=$%.4f out=$%.4f cached=$%.4f thinking=$%.4f (per 1M tokens)",
+                            inp, out, cach, thk)
+                return _gemini_prices_cached
+    except Exception:
+        pass
+
+    bare = _GEMINI_MODEL.removeprefix("models/")
+    prices = _GEMINI_PRICES_FALLBACK.get(bare)
+    if prices is None:
+        for key, val in _GEMINI_PRICES_FALLBACK.items():
+            if bare.startswith(key) or key.startswith(bare):
+                prices = val
+                break
+    _gemini_prices_cached = prices or _GEMINI_PRICES_DEFAULT
+    logger.info("Gemini pricing (fallback table, model=%s): input=$%.4f out=$%.4f cached=$%.4f thinking=$%.4f (per 1M tokens)",
+                bare, *_gemini_prices_cached)
+    return _gemini_prices_cached
+
+
+def _extract_gemini_usage(response) -> tuple[int, int, int, int]:
+    """Extract (input, output, cached, thinking) token counts from a Gemini response."""
+    um = getattr(response, "usage_metadata", None)
+    if um is None:
+        return 0, 0, 0, 0
+    in_tok  = int(getattr(um, "prompt_token_count",          0) or 0)
+    out_tok = int(getattr(um, "candidates_token_count",      0) or 0)
+    cac_tok = int(getattr(um, "cached_content_token_count",  0) or 0)
+    thk_tok = int(getattr(um, "thoughts_token_count",        0) or 0)
+    return in_tok, out_tok, cac_tok, thk_tok
+
+
+def _accum_tokens(game_id: str, call_type: str,
+                  in_tok: int, out_tok: int,
+                  cached_tok: int = 0, thinking_tok: int = 0) -> None:
+    """Record token counts for one LLM call and log the per-call + running total.
+
+    For Gemini, also logs a running cost estimate.
+    """
+    usage = _game_token_usage.setdefault(game_id, {
+        "calls": 0, "input": 0, "output": 0, "cached": 0, "thinking": 0,
+    })
+    usage["calls"]   += 1
+    usage["input"]   += in_tok
+    usage["output"]  += out_tok
+    usage["cached"]  += cached_tok
+    usage["thinking"] += thinking_tok
+
+    if _LLM_PROVIDER == "gemini":
+        prices = _get_gemini_prices()
+        in_p, out_p, cac_p, thk_p = prices
+        billed_in  = usage["input"]  - usage["cached"]
+        cost = (billed_in * in_p + usage["cached"] * cac_p
+                + (usage["output"] - usage["thinking"]) * out_p
+                + usage["thinking"] * thk_p) / 1_000_000
+        logger.info(
+            "tokens[%s] game=%s  in=%d out=%d cached=%d thinking=%d"
+            "  |  total calls=%d in=%d out=%d cached=%d est_cost=$%.4f",
+            call_type, game_id, in_tok, out_tok, cached_tok, thinking_tok,
+            usage["calls"], usage["input"], usage["output"], usage["cached"], cost,
+        )
+    else:
+        logger.info(
+            "tokens[%s] game=%s  in=%d out=%d"
+            "  |  total calls=%d in=%d out=%d",
+            call_type, game_id, in_tok, out_tok,
+            usage["calls"], usage["input"], usage["output"],
+        )
+
+
+def log_game_token_summary(game_id: str) -> None:
+    """Log final token usage and cost for a completed game. Safe to call multiple times."""
+    if game_id in _game_summary_logged:
+        return
+    _game_summary_logged.add(game_id)
+    usage = _game_token_usage.get(game_id)
+    if not usage:
+        logger.info("TOKEN SUMMARY game=%s  (no data)", game_id)
+        return
+
+    if _LLM_PROVIDER == "gemini":
+        in_p, out_p, cac_p, thk_p = _get_gemini_prices()
+        billed_in   = usage["input"]   - usage["cached"]
+        billed_out  = usage["output"]  - usage["thinking"]
+        cost_in     = billed_in        * in_p  / 1_000_000
+        cost_cac    = usage["cached"]  * cac_p / 1_000_000
+        cost_out    = billed_out       * out_p / 1_000_000
+        cost_thk    = usage["thinking"] * thk_p / 1_000_000
+        total_cost  = cost_in + cost_cac + cost_out + cost_thk
+        logger.info(
+            "TOKEN SUMMARY game=%s | model=%s | calls=%d"
+            " | input=%d (billed=%d cached=%d) | output=%d (thinking=%d)"
+            " | cost: input=$%.4f cached=$%.4f output=$%.4f thinking=$%.4f | TOTAL=$%.4f",
+            game_id, _GEMINI_MODEL, usage["calls"],
+            usage["input"], billed_in, usage["cached"],
+            usage["output"], usage["thinking"],
+            cost_in, cost_cac, cost_out, cost_thk, total_cost,
+        )
+    else:
+        logger.info(
+            "TOKEN SUMMARY game=%s | model=%s | calls=%d | input=%d | output=%d",
+            game_id, _OLLAMA_MODEL, usage["calls"], usage["input"], usage["output"],
+        )
+
+
+# ---------------------------------------------------------------------------
 # Terraforming Mars rules reference — injected into every system prompt
 # ---------------------------------------------------------------------------
 
@@ -166,10 +319,15 @@ AVAILABLE ACTIONS (choose 1 or 2 per turn):
 STANDARD PROJECTS (always available to any player):
   1. Sell patents:  discard N cards → gain N MC.
   2. Power plant:   11 MC → +1 energy production.
-  3. Asteroid:      14 MC → +1 temperature (+1 TR).
-  4. Aquifer:       18 MC → place ocean tile (+1 TR, +placement bonus).
+       WEAK — only useful if energy production < 3/gen or you need a card threshold.
+       Once you can already convert heat regularly, more energy gives almost nothing.
+       NEVER choose Power Plant when City, Asteroid, or Aquifer is also affordable.
+  3. Asteroid:      14 MC → +1 temperature (+1 TR).  [GOOD VALUE: 14 MC per TR]
+  4. Aquifer:       18 MC → place ocean tile (+1 TR, +placement bonus).  [GOOD]
   5. Greenery:      23 MC → place greenery (+1 oxygen, +1 TR).
   6. City:          25 MC → place city tile + 1 MC production.
+       HIGH VALUE — gives TR + permanent +1 MC income + board VP potential +
+       progress toward Mayor milestone. Almost always better than Power Plant.
 
 MILESTONES (5 VP, costs 8 MC; only 3 total can be claimed in entire game):
   1. Terraformer: TR ≥ 35.
@@ -197,6 +355,9 @@ INITIAL SETUP (generation 1 — no research phase):
     (The cost shown on a card is its PLAY cost during the game, not the buy cost.)
   • You CANNOT buy more cards than: floor(starting_MC / 3).
   • Unselected cards are discarded. Cards in hand are played during future action phases.
+  • BUY AS MANY CARDS AS POSSIBLE — 3 MC per card is cheap relative to in-game value.
+    A thin opening hand starves your engine for the entire game. Unless a card has
+    zero synergy with your corporation, buy it. Aim to buy the maximum you can afford.
 
 PAYMENT:
   • Pay card play cost in MC; optionally substitute steel (building) or titanium (space).
@@ -216,6 +377,22 @@ STRATEGIC TIPS:
   • Don't fund awards in early phase as this gives opponents a clear target to contest.
   • Accelerate terraforming if you have high TR or need to end before opponents
     can catch up.
+  • TR is income AND VP: each +1 TR permanently raises your MC income by 1/generation
+    AND scores +1 VP at game end. Raising a global parameter is doubly valuable —
+    treat terraforming as your primary objective, not an afterthought.
+  • Convert heat/plants before passing: ≥8 heat with temperature < 8°C = a FREE +1 TR
+    sitting unused (action G). ≥8 plants with O₂ < 14% = free greenery + TR (action F).
+    These zero-MC actions are the highest-value moves in the game. NEVER end your turn
+    or pass a generation while you have enough heat or plants to convert.
+  • Match cards to your resources in the research phase: if you have stockpiled titanium,
+    BUY space-tag cards — titanium pays for them at 3 MC/cube. If you have steel, BUY
+    building-tag cards — steel pays at 2 MC/cube. Resources sitting in your stockpile
+    with no cards to spend them on are pure wasted production.
+  • Energy production has diminishing returns: once you convert heat to temperature every
+    generation, extra energy-to-heat adds nothing. Power Plant SP (11 MC) is almost never
+    the right Standard Project — City SP (25 MC) gives TR + income + board VP + milestone
+    progress and is almost always better value. Only build Power Plants when your energy
+    production is below ~3/gen or a specific card requires it.
 
 ADVANCED STRATEGIES:
   Science/Jupiter engine:
@@ -241,12 +418,32 @@ ADVANCED STRATEGIES:
     – If you are behind in VP but ahead in TR, ACCELERATE — end the game
       before opponents' engines overtake you.
 
+  City-greenery VP engine:
+    – Place your first city EARLY — it anchors a region for your greeneries and scores
+      1 VP per greenery that ends up adjacent to it. Each greenery you place near a city
+      is worth 2 VP (1 greenery VP + 1 city-adjacency VP) instead of just 1 VP.
+    – Choose the city location where 4-5 adjacent hexes are free land (not ocean-reserved)
+      so you have room to surround it with greeneries later.
+    – A greenery adjacent to 2 cities scores +2 city VP (1 per city) plus its own 1 VP
+      = 3 VP total. A greenery adjacent to 3 cities = 4 VP total.
+    – Ideal 3-city triangle layout: place 3 cities so they share common adjacent hexes.
+      Then fill those shared hexes with greeneries:
+        (a) One central greenery adjacent to all 3 cities: 3 city VPs + 1 greenery VP = 4 VP
+        (b) One greenery between each pair of cities (adjacent to 2 cities): 2+1 = 3 VP each
+      Result: 3 cities + 4 greeneries = 13+ VP from board tiles alone.
+    – Cities cannot be adjacent to each other, but two cities CAN both be adjacent to the
+      same hex — that shared hex is where your high-value greenery goes.
+    – Deny opponents: avoid placing greeneries next to their cities unless you have no choice.
+
 OPPONENT ANALYSIS — read opponents constantly:
   • Their played cards reveal their engine (energy → heat, plant engine, etc.).
   • Funded awards signal what they are optimising for — don't help them win it.
   • Claimed milestones tell you what to block or race for next.
   • High hand size + few played cards → they are building toward a big combo.
   • Low MC + many played cards → they over-extended; they may pass soon.
+  • Hand size gap: if they have 8+ cards and you have 2, they have 4× more engine
+    options per turn. A persistent hand-size deficit means your engine will be weaker
+    every generation — prioritise buying more cards in the research phase.
 
 DRAFTING (when research phase offers card selection):
   • Do not pass a card that strongly benefits an opponent's visible engine
@@ -290,6 +487,42 @@ def _ensure_gemini_client() -> None:
     if _gemini_client is None:
         from google import genai
         _gemini_client = genai.Client(api_key=_GEMINI_API_KEY)
+
+
+def validate_llm_config() -> None:
+    """Called at server startup. Raises RuntimeError if the configured LLM is unreachable or invalid."""
+    if os.getenv("USE_LLM", "false").lower() != "true":
+        return
+    if _LLM_PROVIDER == "gemini":
+        if not _GEMINI_API_KEY:
+            raise RuntimeError("USE_LLM=true with LLM_PROVIDER=gemini but GEMINI_API_KEY is not set")
+        _ensure_gemini_client()
+        try:
+            available = [m.name for m in _gemini_client.models.list()]  # type: ignore[union-attr]
+        except Exception as exc:
+            raise RuntimeError(f"Cannot reach Gemini API: {exc}") from exc
+        # Model names come back as "models/gemini-..." — check both bare and prefixed forms
+        bare = _GEMINI_MODEL.removeprefix("models/")
+        if not any(m.removeprefix("models/") == bare for m in available):
+            flash_models = [m.removeprefix("models/") for m in available if "flash" in m.lower()]
+            raise RuntimeError(
+                f"GEMINI_MODEL={_GEMINI_MODEL!r} is not available via this API key.\n"
+                f"Available flash models: {flash_models}\n"
+                f"All models: {[m.removeprefix('models/') for m in available]}"
+            )
+        logger.info("Gemini model validated: %s", _GEMINI_MODEL)
+    elif _LLM_PROVIDER == "ollama":
+        import requests as _req
+        try:
+            r = _req.get(f"{_OLLAMA_URL}/api/tags", timeout=5)
+            r.raise_for_status()
+            names = [m["name"] for m in r.json().get("models", [])]
+        except Exception as exc:
+            raise RuntimeError(f"Cannot reach Ollama at {_OLLAMA_URL}: {exc}") from exc
+        if _OLLAMA_MODEL not in names:
+            raise RuntimeError(
+                f"OLLAMA_MODEL={_OLLAMA_MODEL!r} not found in Ollama. Available: {names}"
+            )
 
 
 def _log_prompt(header: str, text: str) -> None:
@@ -391,9 +624,13 @@ def _init_ollama_session(game_id: str, system: str, user: str, think: bool) -> s
         payload["think"] = think
     r = requests.post(f"{_OLLAMA_URL}/api/chat", json=payload, timeout=_OLLAMA_TIMEOUT)
     r.raise_for_status()
-    text: str = r.json()["message"]["content"]
+    data = r.json()
+    text: str = data["message"]["content"]
     session.append({"role": "assistant", "content": text})
     _game_sessions[game_id] = session
+    _accum_tokens(game_id, "init",
+                  data.get("prompt_eval_count", 0),
+                  data.get("eval_count", 0))
     return text
 
 
@@ -406,8 +643,12 @@ def _continue_ollama_session(game_id: str, user: str, session: list[dict]) -> st
         payload["think"] = True  # think on every turn (was False — caused shallow choices)
     r = requests.post(f"{_OLLAMA_URL}/api/chat", json=payload, timeout=_OLLAMA_TIMEOUT)
     r.raise_for_status()
-    text: str = r.json()["message"]["content"]
+    data = r.json()
+    text: str = data["message"]["content"]
     session.append({"role": "assistant", "content": text})
+    _accum_tokens(game_id, "continue",
+                  data.get("prompt_eval_count", 0),
+                  data.get("eval_count", 0))
     return text
 
 
@@ -429,8 +670,12 @@ def _capture_strategy_then_trim(game_id: str, session: list[dict]) -> None:
     try:
         r = requests.post(f"{_OLLAMA_URL}/api/chat", json=payload, timeout=_OLLAMA_TIMEOUT)
         r.raise_for_status()
-        strategy = r.json()["message"]["content"].strip()
+        data = r.json()
+        strategy = data["message"]["content"].strip()
         _game_strategies[game_id] = strategy
+        _accum_tokens(game_id, "strategy_capture",
+                      data.get("prompt_eval_count", 0),
+                      data.get("eval_count", 0))
         logger.info("Captured strategy before Ollama trim (game=%s): %.100s…", game_id, strategy)
     except Exception as exc:
         logger.warning("Strategy capture before trim failed (game=%s): %s", game_id, exc)
@@ -612,6 +857,8 @@ def _init_gemini_session(game_id: str, system: str, user: str, think: bool) -> s
 
     response = _gemini_with_retry(_call_init)
     text: str = response.text
+    in_tok, out_tok, cac_tok, thk_tok = _extract_gemini_usage(response)
+    _accum_tokens(game_id, "init", in_tok, out_tok, cac_tok, thk_tok)
 
     # Create chat with the setup exchange as initial history.
     # Action calls use _GEMINI_THINKING_BUDGET (default 1024) — think on every turn.
@@ -641,8 +888,29 @@ _PER_GEN_STRATEGY_PROMPT = (
     "4. AWARD TARGET: which award will you fund and place 1st in (5 VP for 1st, 2 VP for 2nd, "
     "max 3 funded at 8/14/20 MC)? Don't fund awards you can't win.\n"
     "5. NEXT-GEN PRIORITY: concrete plan for this generation's actions. "
+    "IMPORTANT: if you currently have >=8 heat and temperature < 8°C, 'Convert 8 heat' MUST be "
+    "one of your first actions this generation (free +1 TR = +1 VP + +1 MC income every gen). "
+    "If you have >=8 plants and O₂ < 14%, 'Convert 8 plants' MUST be a first action (free +1 TR). "
+    "These are your highest-value zero-cost actions — never skip them. "
+    "Also identify which cards in your hand you plan to play and why they fit your strategy. "
     "Reminder: DO NOT use Convert Heat if temperature is already 8°C, and DO NOT place "
-    "greenery tiles if O₂ is already 14% (both are wasted actions at max)."
+    "greenery tiles if O₂ is already 14% (both are wasted actions at max).\n\n"
+    "!! MANDATORY DEFERRAL LOOP CHECK !!\n"
+    "Scroll back through your last 2-3 strategy updates visible in this conversation. "
+    "For every goal you listed in previous NEXT-GEN PRIORITY sections: has the relevant "
+    "game state actually changed, or did you write the same priority again without acting?\n"
+    "Examples of deferral loops:\n"
+    "  • 'Build 3rd city for Mayor' stated last gen → still have same city count → LOOP\n"
+    "  • 'Claim milestone X' stated last gen → milestone still unclaimed → LOOP\n"
+    "  • 'Play card Y' stated last gen → card still in hand → LOOP\n"
+    "  • 'Fund award Z' stated last gen → award still unfunded → LOOP\n"
+    "If you detect a deferral loop:\n"
+    "  1. Name it explicitly: 'I have deferred [action] for N generations.'\n"
+    "  2. Execute it as your ABSOLUTE FIRST action this generation — before heat conversion, "
+    "before card plays, before any other action. Nothing else comes first.\n"
+    "  3. Do NOT write it as a plan for a third time. Repeating the plan without executing "
+    "it is a critical failure: you lose the milestone/award/card value AND fall further "
+    "behind your opponent who is scoring every generation while you plan."
 )
 
 
@@ -683,6 +951,20 @@ def _per_generation_strategy_update(game_id: str, chat: object, generation: int,
             income_parts.append(f"{res_label}:{v}")
     income_note = "Your production income this generation: " + ", ".join(income_parts) + "\n"
 
+    # Alert on immediately actionable stockpiles (≥8 ready to convert right now).
+    current_heat = p.get("heat", 0)
+    current_plants = p.get("plants", 0)
+    if current_heat >= 8 and temp < 8:
+        income_note += (
+            f">> HEAT STOCKPILE: {current_heat} — 'Convert 8 heat' is AVAILABLE NOW (+1 TR, 0 MC cost). "
+            f"Plan this as your first action this generation.\n"
+        )
+    if current_plants >= 8 and oxygen < 14:
+        income_note += (
+            f">> PLANTS STOCKPILE: {current_plants} — 'Convert 8 plants' is AVAILABLE NOW (+1 TR, 0 MC cost). "
+            f"Plan this as your first action this generation.\n"
+        )
+
     prompt = _PER_GEN_STRATEGY_PROMPT.format(
         prev_gen=generation - 1,
         gen=generation,
@@ -693,6 +975,8 @@ def _per_generation_strategy_update(game_id: str, chat: object, generation: int,
         _log_prompt(f"=== PER-GEN STRATEGY UPDATE (game={game_id} gen={generation}) ===", prompt)
     try:
         response = _gemini_with_retry(lambda: chat.send_message(prompt))  # type: ignore[attr-defined]
+        in_tok, out_tok, cac_tok, thk_tok = _extract_gemini_usage(response)
+        _accum_tokens(game_id, f"strategy_gen{generation}", in_tok, out_tok, cac_tok, thk_tok)
         strategy = response.text.strip()
         _game_strategies[game_id] = strategy
         logger.info("Per-gen strategy update (game=%s gen=%d):\n%s", game_id, generation, strategy)
@@ -789,6 +1073,8 @@ def _continue_gemini_session(game_id: str, user: str, chat: object,
         response = _gemini_with_retry(lambda: chat.send_message(user, config=cfg))  # type: ignore[attr-defined]
     else:
         response = _gemini_with_retry(lambda: chat.send_message(user))  # type: ignore[attr-defined]
+    in_tok, out_tok, cac_tok, thk_tok = _extract_gemini_usage(response)
+    _accum_tokens(game_id, "continue", in_tok, out_tok, cac_tok, thk_tok)
     text: str | None = response.text
     if not text:
         logger.warning("Gemini returned empty/None text for game %s", game_id)
@@ -877,6 +1163,9 @@ def _build_setup_prompt(state: dict, waiting_for: dict, game_id: str) -> str:
                 "## Project Cards Available to Add to Hand",
                 "  Each costs 3 MC to buy now. Play cost (during game) shown in [brackets].",
                 "  You cannot buy more cards than: floor(chosen_corporation_starting_MC / 3).",
+                "  BUYING GUIDANCE: buy as many cards as you can afford that have any synergy",
+                "  with your corporation. 3 MC is cheap — a larger opening hand gives you more",
+                "  engine options every draft round. A thin hand starves your engine all game.",
             ]
             for i, c in enumerate(buyable, 1):
                 name = c.get("name", f"Card {i}")
@@ -1098,14 +1387,26 @@ def _select_action(state: dict, waiting_for: dict, game_id: str, last_error: str
     user = _build_action_prompt(state, waiting_for, options, last_error=last_error, game_id=game_id)
     # Append a brevity instruction so the model doesn't produce multi-paragraph reasoning
     # that accumulates in the chat history and inflates future input-token counts.
-    user += "\n\nBrief reasoning (1-2 sentences), then CHOICE: N on its own line. No text after CHOICE."
+    user += (
+        "\n\nBefore choosing, check: does this action advance my engine, milestone/award targets, and pace plan?"
+        " 1-2 sentences explaining how your choice fits your strategy, then CHOICE: N on its own line. No text after CHOICE."
+    )
     logger.debug("LLM action (game=%s type=%s options=%d)",
                  game_id, waiting_for.get("type"), len(options))
     text = _call_llm_continue(game_id, user,
                               max_output_tokens=_GEMINI_ACTION_MAX_OUTPUT_TOKENS if _LLM_PROVIDER == "gemini" else None)
     logger.debug("Action response (game=%s): %s", game_id, text[:300])
 
-    return _parse_action_response(text, options, waiting_for, game_id, player=state.get("player"))
+    result = _parse_action_response(text, options, waiting_for, game_id, player=state.get("player"))
+
+    # Auto-log the token summary when all global parameters are maxed (end of game).
+    g = state.get("game", {})
+    if (g.get("temperature", -30) >= 8
+            and g.get("oxygen", 0) >= 14
+            and g.get("oceanCount", 0) >= 9):
+        log_game_token_summary(game_id)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1530,6 +1831,21 @@ def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict], la
         lines.append("⚠ O₂ is at maximum (14%). DO NOT place greenery tiles — they give no benefit.")
     if oceans >= 9:
         lines.append("⚠ All 9 oceans are placed. No more ocean tiles can be placed.")
+
+    # Highlight free conversion opportunities — highest-value zero-MC actions.
+    heat_now = p.get("heat", 0)
+    plants_now = p.get("plants", 0)
+    if heat_now >= 8 and temp < 8:
+        lines.append(
+            f">> ACTION AVAILABLE: you have {heat_now} heat (>=8) and temperature is not maxed."
+            f" 'Convert 8 heat' raises temperature +1 TR (+1 VP, +1 MC income every remaining gen)."
+            f" Do this BEFORE passing."
+        )
+    if plants_now >= 8 and oxygen < 14:
+        lines.append(
+            f">> ACTION AVAILABLE: you have {plants_now} plants (>=8) and O2 is not maxed."
+            f" 'Convert 8 plants' places a greenery tile (+1 O2, +1 TR, +1 VP). Do this BEFORE passing."
+        )
     if prod:
         lines.append(f"Production: {prod}")
     if tags:
@@ -1560,6 +1876,27 @@ def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict], la
             lines += ["", ctx]
             if game_id:
                 _hand_shown_generation[game_id] = generation
+            # Show effective cost for cards discounted by steel or titanium
+            steel_now = p.get("steel", 0)
+            ti_now = p.get("titanium", 0)
+            eff_notes: list[str] = []
+            for card_name in hand_cards[:30]:
+                card_name_str = card_name if isinstance(card_name, str) else card_name.get("name", "")
+                info = CARD_DB.get(card_name_str, {})
+                cost = info.get("cost", 0) or 0
+                card_tags = info.get("tags") or []
+                if "building" in card_tags and steel_now >= 2:
+                    discount = min(steel_now, cost // 2) * 2
+                    eff = max(0, cost - discount)
+                    if discount > 0:
+                        eff_notes.append(f"  {card_name_str}: {cost}MC → {eff}MC effective (use {discount//2} steel)")
+                elif "space" in card_tags and ti_now >= 3:
+                    discount = min(ti_now, cost // 3) * 3
+                    eff = max(0, cost - discount)
+                    if discount > 0:
+                        eff_notes.append(f"  {card_name_str}: {cost}MC → {eff}MC effective (use {discount//3} titanium)")
+            if eff_notes:
+                lines += ["Effective cost with your resources (steel/titanium):"] + eff_notes
 
     # Opponents
     opponents = state.get("opponents") or []
@@ -1569,9 +1906,11 @@ def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict], la
         opp_name = opp.get("name", f"Opponent{'' if len(opponents) == 1 else i}")
         opp_vp = opp.get("victoryPoints")
         opp_vp_str = f" VP:{opp_vp}" if opp_vp is not None else ""
+        opp_hs = opp.get("handSize")
+        opp_hs_str = f"  hand:{opp_hs}cards" if opp_hs is not None else ""
         lines.append(
-            f"{opp_name}: TR:{opp.get('terraformRating',20)}{opp_vp_str}  MC:{opp.get('megacredits',0)}  "
-            f"prod:{opp_prod}  tags:{opp_tags}"
+            f"{opp_name}: TR:{opp.get('terraformRating',20)}{opp_vp_str}  MC:{opp.get('megacredits',0)}"
+            f"{opp_hs_str}  prod:{opp_prod}  tags:{opp_tags}"
         )
     if ms:
         lines.append(f"Milestones claimed: {ms}")
@@ -1608,22 +1947,51 @@ def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict], la
             if own_cities:
                 lines.append(
                     f"Placement tip: place this greenery ADJACENT to one of your {own_cities} "
-                    f"city tile(s) — each adjacent greenery scores +1 VP for the city at game end."
+                    f"city tile(s) — each adjacent greenery scores +1 VP for the city at game end "
+                    f"(2 VP total per greenery next to a city). Even better: a hex adjacent to 2 "
+                    f"of your cities = 3 VP from 1 greenery. Avoid placing greeneries next to "
+                    f"opponent cities."
                 )
             else:
                 lines.append(
-                    "Placement tip: you have no cities yet. Consider placing this greenery where "
-                    "a future city can sit next to it, or near the center for flexibility."
+                    "Placement tip: you have no cities yet. Place this greenery in a central area "
+                    "where a future city can sit next to it — plan ahead for the 3-city triangle "
+                    "pattern (see strategy memory)."
                 )
         elif "city" in title_lower:
-            lines.append(
-                "Placement tip: place this city where greenery tiles can later surround it — "
-                "each adjacent greenery scores +1 VP for this city at game end. "
-                "Cities cannot be adjacent to other cities."
+            own_city_count = sum(
+                1 for s in (state.get("boardSpaces") or [])
+                if s.get("tileType") == "city" and s.get("playerColor") == p.get("color")
             )
+            if own_city_count == 0:
+                lines.append(
+                    "Placement tip: place your FIRST city in a location where 4-5 adjacent hexes "
+                    "are free land (not ocean-reserved), so you can later surround it with greeneries. "
+                    "This city anchors your city-greenery VP engine. Plan for a 3-city triangle: "
+                    "3 cities sharing common adjacent hexes, with greeneries filling those shared "
+                    "hexes (1 central greenery adjacent to all 3 cities = 4 VP; greeneries between "
+                    "each pair = 3 VP each). Cities cannot be adjacent to other cities."
+                )
+            else:
+                lines.append(
+                    f"Placement tip: you have {own_city_count} city/cities. Place this new city "
+                    f"close enough to an existing one that they share an adjacent hex — that shared "
+                    f"hex will later hold a greenery worth 3 VP (adjacent to 2 cities). "
+                    f"Cities cannot be adjacent to other cities, but CAN share a common neighbor hex."
+                )
 
     # Card descriptions for explicit card-selection decisions (research, discard, etc.)
     if wf_type == "card":
+        # Steer the AI toward cards that match its stockpiled resources.
+        steel_now = p.get("steel", 0)
+        ti_now = p.get("titanium", 0)
+        resource_hints = []
+        if ti_now >= 3:
+            resource_hints.append(f"you have {ti_now} titanium → favor SPACE-tag cards (titanium pays at 3 MC/cube)")
+        if steel_now >= 3:
+            resource_hints.append(f"you have {steel_now} steel → favor BUILDING-tag cards (steel pays at 2 MC/cube)")
+        if resource_hints:
+            lines.append("Resource tip: " + "; ".join(resource_hints) + ".")
         card_names_in_decision = _extract_card_names(waiting_for)
         if card_names_in_decision:
             if _is_card_decision_about_hand(card_names_in_decision, hand_cards):

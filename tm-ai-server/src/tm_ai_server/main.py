@@ -1,5 +1,6 @@
 import logging
 import subprocess
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 
 _app_logger = logging.getLogger("tm_ai_server")
@@ -12,6 +13,7 @@ if not _app_logger.handlers:
 
 from .config import STATE_DIM, HIDDEN_SIZES, ACTION_SPACE_SIZE, PORT
 from .inference import select_action, select_advice
+from .llm_player import validate_llm_config, log_game_token_summary
 from .schemas import (
     AdviceRequest, AdviceResponse, HealthResponse, MoveDebug,
     MoveRequest, MoveResponse, VersionResponse,
@@ -19,7 +21,14 @@ from .schemas import (
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="TM AI Server", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    validate_llm_config()
+    yield
+
+
+app = FastAPI(title="TM AI Server", version="0.1.0", lifespan=lifespan)
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -73,6 +82,20 @@ async def advise(request: AdviceRequest):
         user_question=request.user_question,
     )
     return AdviceResponse(advice_text=advice_text, recommendation=recommendation)
+
+
+@app.post("/game-done")
+async def game_done(body: dict):
+    """Log the final token summary for a completed game.
+
+    Called by the TM server after game end, or manually via curl:
+      curl -X POST http://localhost:8000/game-done -H 'Content-Type: application/json' -d '{"game_id":"gXXX"}'
+    """
+    game_id = body.get("game_id", "")
+    if not game_id:
+        raise HTTPException(status_code=400, detail="game_id required")
+    log_game_token_summary(game_id)
+    return {"ok": True, "game_id": game_id}
 
 
 if __name__ == "__main__":
