@@ -526,6 +526,8 @@ class LLMPlayer:
                 response = _with_retry(lambda: _openrouter_client.chat.completions.create(**kwargs))  # type: ignore[union-attr]
                 break
             except Exception as e:
+                if _is_transient_error(e):
+                    raise  # transient (429/503) — don't permanently disable capabilities
                 err = str(e).lower()
                 if "cache" in err and caps.get("caching"):
                     caps["caching"] = False
@@ -535,7 +537,7 @@ class LLMPlayer:
                     kwargs["messages"] = messages
                     extra_headers.pop("anthropic-beta", None)
                     kwargs.pop("extra_headers", None)
-                    logger.info("Disabled caching for %s after error", self.model)
+                    logger.info("Disabled caching for %s after error: %s", self.model, e)
                     continue
                 if ("thinking" in err or "budget" in err or "reasoning" in err) and caps.get("thinking"):
                     caps["thinking"] = False
@@ -546,7 +548,7 @@ class LLMPlayer:
                         kwargs["extra_body"] = extra_body
                     else:
                         kwargs.pop("extra_body", None)
-                    logger.info("Disabled thinking for %s after error", self.model)
+                    logger.info("Disabled thinking for %s after error: %s", self.model, e)
                     continue
                 raise
 
@@ -1719,6 +1721,12 @@ def _correct_payment(payment: dict, waiting_for: dict, player: dict) -> dict:
     needed_mc = max(0, cost - covered)
     if payment.get("megacredits", 0) < needed_mc:
         payment["megacredits"] = min(needed_mc, mc_avail)
+        if mc_avail < needed_mc:
+            logger.warning(
+                "Payment underfunded: cost=%d covered_by_resources=%d need_mc=%d have_mc=%d — "
+                "player cannot fully cover this card",
+                cost, covered, needed_mc, mc_avail,
+            )
 
     return payment
 
@@ -2027,6 +2035,11 @@ def _parse_action_response(
     player: dict | None = None,
 ) -> tuple[dict, dict]:
     m = re.search(r"CHOICE:\s*(\d+)", text)
+    if not m:
+        logger.warning(
+            "No CHOICE line in response (player=%s) — defaulting to option 1. Response: %.300s",
+            player_id, text,
+        )
     chosen = int(m.group(1)) - 1 if m else 0
     chosen = max(0, min(chosen, len(options) - 1))
     option = options[chosen]
@@ -2041,6 +2054,11 @@ def _parse_action_response(
         if payment:
             payment = _correct_payment(payment, waiting_for, p)
             response = {**response, "payment": payment}
+        else:
+            logger.warning(
+                "No PAYMENT line for %s decision (player=%s) — using default payment. Response: %.200s",
+                wf_type, player_id, text,
+            )
     elif response.get("type") == "or":
         # or-option that resolves to a project card play — extract card + payment
         inner = response.get("response", {})
@@ -2057,11 +2075,29 @@ def _parse_action_response(
                     cname = c.get("name", "")
                     if cname and cname.lower() in text_lower:
                         card_name = cname
+                        break
+            if not card_name:
+                if available_cards:
+                    card_name = available_cards[0].get("name", "")
+                    logger.warning(
+                        "or→projectCard: no card name found in response (player=%s) — using first: %r. "
+                        "Response: %.200s", player_id, card_name, text,
+                    )
+                else:
+                    logger.error(
+                        "or→projectCard: no card name and no available cards (player=%s). "
+                        "Response: %.200s", player_id, text,
+                    )
+            if payment:
                 card_info = next((c for c in available_cards if c.get("name") == card_name), {})
                 stub_wf = {"type": "projectCard", "amount": card_info.get("calculatedCost", 0)}
                 payment = _correct_payment(payment, stub_wf, p)
             else:
                 payment = _auto_payment_for_card(card_name, sub_node, p)
+                logger.info(
+                    "Auto-payment for card %r (player=%s, no PAYMENT line): %s",
+                    card_name, player_id, payment,
+                )
             inner = {"type": "projectCard", "card": card_name, "payment": payment}
             response = {**response, "response": inner}
 
