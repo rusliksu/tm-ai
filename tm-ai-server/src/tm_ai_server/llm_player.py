@@ -2047,18 +2047,17 @@ def _parse_action_response(
         if inner.get("type") == "projectCard":
             sub_node = option.get("node", {})
             available_cards = sub_node.get("cards", []) if isinstance(sub_node, dict) else []
-            # Find which card the AI mentioned — scan text for any known card name,
-            # keep the last match (AI typically names the card it's about to play)
             card_name = inner.get("card", "")
-            text_lower = text.lower()
-            for c in available_cards:
-                cname = c.get("name", "")
-                if cname and cname.lower() in text_lower:
-                    card_name = cname
-            card_info = next((c for c in available_cards if c.get("name") == card_name), {})
             payment = _parse_payment_line(text)
             if payment:
-                # Pass actual cost so _correct_payment can top up MC if AI underpaid
+                # AI wrote an explicit PAYMENT line — find which card it named in the text
+                # (only when PAYMENT present; avoids false matches on incidental words)
+                text_lower = text.lower()
+                for c in available_cards:
+                    cname = c.get("name", "")
+                    if cname and cname.lower() in text_lower:
+                        card_name = cname
+                card_info = next((c for c in available_cards if c.get("name") == card_name), {})
                 stub_wf = {"type": "projectCard", "amount": card_info.get("calculatedCost", 0)}
                 payment = _correct_payment(payment, stub_wf, p)
             else:
