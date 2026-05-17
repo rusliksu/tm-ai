@@ -1450,6 +1450,9 @@ def _parse_setup_response(
 # Action phase
 # ---------------------------------------------------------------------------
 
+_MAX_PAYMENT_RETRIES = 2
+
+
 def _select_action(
     state: dict, waiting_for: dict, player: LLMPlayer, last_error: str | None = None
 ) -> tuple[dict, dict]:
@@ -1460,6 +1463,7 @@ def _select_action(
     generation = state.get("game", {}).get("generation", 1)
     _maybe_per_generation_update(player, generation, state)
 
+    p = state.get("player", {})
     user = _build_action_prompt(state, waiting_for, options, last_error=last_error, player=player)
     user += (
         "\n\nBefore choosing, check: does this action advance my engine, milestone/award targets, and pace plan?"
@@ -1468,12 +1472,32 @@ def _select_action(
     )
     logger.debug("LLM action (player=%s type=%s options=%d)",
                  player.player_id, waiting_for.get("type"), len(options))
-    text = player.continue_session(user, max_output_tokens=_OPENROUTER_MAX_OUTPUT_TOKENS
-                                   if player.provider == "openrouter" else None)
-    logger.debug("Action response (player=%s): %s", player.player_id, text[:300])
 
-    result = _parse_action_response(text, options, waiting_for, player.player_id,
-                                    player=state.get("player"))
+    _or = _OPENROUTER_MAX_OUTPUT_TOKENS if player.provider == "openrouter" else None
+    text = player.continue_session(user, max_output_tokens=_or)
+
+    response: dict = {}
+    debug: dict    = {}
+    for attempt in range(_MAX_PAYMENT_RETRIES + 1):
+        logger.debug("Action response (player=%s attempt=%d): %s",
+                     player.player_id, attempt + 1, text[:300])
+        response, debug = _parse_action_response(text, options, waiting_for, player.player_id, player=p)
+
+        pay_err = _check_payment_valid(response, options, waiting_for, p)
+        if pay_err is None:
+            break
+
+        if attempt < _MAX_PAYMENT_RETRIES:
+            logger.warning(
+                "Payment retry %d/%d (player=%s): %s",
+                attempt + 1, _MAX_PAYMENT_RETRIES, player.player_id, pay_err,
+            )
+            text = player.continue_session(f"⚠ {pay_err}", max_output_tokens=_or)
+        else:
+            logger.error(
+                "Payment still invalid after %d retries (player=%s): %s — sending best-effort",
+                _MAX_PAYMENT_RETRIES, player.player_id, pay_err,
+            )
 
     g = state.get("game", {})
     if (g.get("temperature", -30) >= 8
@@ -1481,7 +1505,7 @@ def _select_action(
             and g.get("oceanCount", 0) >= 9):
         log_game_token_summary(player.game_id)
 
-    return result
+    return response, debug
 
 
 # ---------------------------------------------------------------------------
@@ -1729,6 +1753,63 @@ def _correct_payment(payment: dict, waiting_for: dict, player: dict) -> dict:
             )
 
     return payment
+
+
+def _check_payment_valid(
+    response: dict,
+    options: list[dict],
+    waiting_for: dict,
+    player: dict,
+) -> str | None:
+    """Return a human-readable error string if the response payment is underfunded, else None."""
+    mc  = player.get("megacredits", 0)
+    st  = player.get("steel",       0)
+    ti  = player.get("titanium",    0)
+
+    def _total(payment: dict) -> int:
+        return payment.get("megacredits", 0) + sum(
+            payment.get(f, 0) * _PAYMENT_VALUES[f] for f in _PAYMENT_VALUES if f in payment
+        )
+
+    def _msg(card_name: str, payment: dict, cost: int) -> str | None:
+        if cost <= 0:
+            return None
+        total = _total(payment)
+        if total >= cost:
+            return None
+        return (
+            f"Your payment for {card_name!r} is insufficient: "
+            f"total {total} MC but card costs {cost} MC. "
+            f"Available resources: MC={mc}, Steel={st} (×2={st*2} MC for building-tag), "
+            f"Titanium={ti} (×3={ti*3} MC for space-tag). "
+            f"Reply with PAYMENT totalling ≥{cost} MC, or choose a different option."
+        )
+
+    wf_type = waiting_for.get("type", "")
+
+    if wf_type == "projectCard":
+        card_node = waiting_for.get("card", {})
+        cost = card_node.get("calculatedCost", 0) if card_node else waiting_for.get("amount", 0)
+        return _msg(response.get("card", "card"), response.get("payment", {}), cost)
+
+    if wf_type == "payment":
+        cost = waiting_for.get("amount", 0)
+        return _msg("standard project", response.get("payment", {}), cost)
+
+    if response.get("type") == "or":
+        inner = response.get("response", {})
+        if inner.get("type") == "projectCard":
+            card_name  = inner.get("card", "")
+            payment    = inner.get("payment", {})
+            chosen_idx = response.get("index", 0)
+            sub_option = next((o for o in options if o.get("index") == chosen_idx), {})
+            sub_node   = sub_option.get("node", {})
+            cards      = sub_node.get("cards", []) if isinstance(sub_node, dict) else []
+            card_info  = next((c for c in cards if c.get("name") == card_name), {})
+            cost       = card_info.get("calculatedCost", 0)
+            return _msg(card_name, payment, cost)
+
+    return None
 
 
 # ---------------------------------------------------------------------------
