@@ -193,95 +193,86 @@ Called by the TM server's `ApiAiAdvice` route when the human player in an AI-tra
 }
 ```
 
+### `POST /player/register`
+
+Called by the TM server or play script before a game starts, once per AI player, to assign a specific model to that player. If not called, the first `/move` request auto-creates a player with the default model (with a warning).
+
+**Request body:**
+```json
+{"player_id": "p456...", "game_id": "g123...", "model": "anthropic/claude-opus-4-7"}
+```
+
+`model` is optional — omit to use `OPENROUTER_MODEL` (or `OLLAMA_MODEL` if no API key).
+
+**Response body:**
+```json
+{"ok": true, "player_id": "p456...", "model": "anthropic/claude-opus-4-7"}
+```
+
+### `POST /game-done`
+
+Called after game end to flush the per-player token/cost summary to the log. Idempotent — second call for the same `game_id` is silently ignored.
+
+**Request body:**
+```json
+{"game_id": "g123..."}
+```
+
+**Response body:**
+```json
+{"ok": true, "game_id": "g123..."}
+```
+
 ---
 
 ## Pydantic Schemas (`schemas.py`)
 
-The current `schemas.py` in `tm-ai-server/` uses the wrong format (old snake_case structure with a nested `global_` field). It must be replaced with the following, which matches the actual TM server output:
+Current `schemas.py` — matches the actual TM server camelCase output:
 
 ```python
-from typing import Any, Dict, List, Optional
-from pydantic import BaseModel
-
-
 class GameContext(BaseModel):
-    id: str
-    phase: str
-    generation: int
-    oxygen: int
-    temperature: int
-    oceanCount: int
-
+    id: str; phase: str; generation: int; oxygen: int; temperature: int; oceanCount: int
+    boardName: str = "tharsis"; expansions: List[str] = []
+    availableMilestones: List[Dict[str, str]] = []; availableAwards: List[Dict[str, str]] = []
+    gameVariants: Dict[str, Any] = {}; recentLog: List[str] = []
 
 class PlayerProduction(BaseModel):
-    megacredits: int
-    steel: int
-    titanium: int
-    plants: int
-    heat: int
-    energy: int
-
+    megacredits: int; steel: int; titanium: int; plants: int; heat: int; energy: int
 
 class PlayerContext(BaseModel):
-    id: str
-    name: str
-    color: str
-    terraformRating: int
-    megacredits: int
-    steel: int
-    titanium: int
-    plants: int
-    energy: int
-    heat: int
-    handSize: int
-    production: PlayerProduction
-    tags: Dict[str, int] = {}
-    isAI: bool = False
-
+    id: str; name: str; color: str; terraformRating: int
+    megacredits: int; steel: int; titanium: int; plants: int; energy: int; heat: int
+    handSize: int; production: PlayerProduction; tags: Dict[str, int] = {}
+    isAI: bool = False; playedCards: List[str] = []; playedCardCount: int = 0
+    corporations: List[str] = []; cardResources: Dict[str, Any] = {}
+    boardTiles: Dict[str, int] = {}; cardsInHand: List[str] = []
+    victoryPoints: Optional[int] = None
 
 class MoveRequestState(BaseModel):
-    game: GameContext
-    player: PlayerContext
-    waitingFor: Optional[Dict[str, Any]] = None
-
-
-class LegalAction(BaseModel):
-    action_id: str
-    type: str
-    title: str
-    payload: Optional[Dict[str, Any]] = None
-
-
-class Metadata(BaseModel):
-    schema_version: int = 1
-
+    game: GameContext; player: PlayerContext; waitingFor: Optional[Dict[str, Any]] = None
+    opponents: List[Dict[str, Any]] = []; milestones: List[Dict[str, Any]] = []
+    awards: List[Dict[str, Any]] = []; board: List[Dict[str, Any]] = []
+    boardSpaces: List[Dict[str, Any]] = []
 
 class MoveRequest(BaseModel):
-    game_id: str
-    player_id: str
-    state: MoveRequestState
-    legal_actions: List[LegalAction]
-    metadata: Metadata
-
-
-class MoveDebug(BaseModel):
-    policy_logits: Optional[List[float]] = None
-    value_estimate: Optional[float] = None
-
+    game_id: str; player_id: str; state: MoveRequestState
+    legal_actions: List[LegalAction]; metadata: Metadata
+    last_error: Optional[str] = None
 
 class MoveResponse(BaseModel):
-    input_response: Dict[str, Any]
-    debug: Optional[MoveDebug] = None
+    input_response: Dict[str, Any]; debug: Optional[MoveDebug] = None
 
+class AdviceRequest(MoveRequest):
+    user_question: Optional[str] = None
 
-class HealthResponse(BaseModel):
-    status: str = "ok"
+class AdviceResponse(BaseModel):
+    advice_text: str; recommendation: Dict[str, Any]; debug: Optional[MoveDebug] = None
 
+class PlayerRegisterRequest(BaseModel):
+    player_id: str; game_id: str; model: Optional[str] = None
 
-class VersionResponse(BaseModel):
-    model_version: str
-    git_commit: str
-    config: Dict[str, Any]
+class PlayerRegisterResponse(BaseModel):
+    ok: bool; player_id: str; model: str
 ```
 
 ---
@@ -587,115 +578,125 @@ Version format: `v<major>.<minor>.<patch>`. Bump minor on architecture changes, 
 
 ## LLM Player (`llm_player.py`)
 
-An alternative to the trained neural net that uses an LLM for strategic decision-making. Activated via `USE_LLM=true`; `inference.py` routes to it before any NN logic. Supports two providers via `LLM_PROVIDER`:
+An alternative to the trained neural net that uses an LLM for strategic decision-making. Activated via `USE_LLM=true`; `inference.py` routes to it before any NN logic. Supports two providers:
 
-- **`ollama`** (default) — local inference, no API cost, requires Ollama daemon running
-- **`gemini`** — Google Gemini cloud API, fast (~1s/move), free tier available
+- **OpenRouter** (cloud) — unified API gateway at `https://openrouter.ai/api/v1`; gives access to Anthropic Claude, OpenAI, xAI Grok, Google Gemini, and hundreds of other models via one API key and the standard `openai` Python SDK. Set `OPENROUTER_API_KEY`.
+- **Ollama** (local) — local inference via direct HTTP; free, no API key. Model name has no `/` (e.g. `qwen3:4b`).
 
-### Architecture — Session-per-game
+**Provider is inferred from model name**: any model containing `/` routes through OpenRouter; bare `name:tag` models route through Ollama.
+
+### Architecture — One `LLMPlayer` instance per AI player
 
 ```
-Game start (initialCards)
-    → _call_llm_init: TM rules + board/expansion/milestone/award context sent ONCE
-      think=True (chain-of-thought), outputs corp/card selection + strategy document
-      (100-200 words) including TABLEAU section (played cards + key effects)
+_player_registry: dict[player_id → LLMPlayer]
+_game_players:    dict[game_id  → list[player_id]]
 
-All subsequent decisions (prelude, action phase)
-    → _call_llm_continue: continues same session — no rules re-sent
-      think=False (fast direct answer)
-      Prompt shows: resources, hand cards with descriptions, opponent state,
-      recent game log (current generation), numbered options with blue-card
-      action descriptions inline, payment section where applicable
-      → outputs: CHOICE: N  [PAYMENT: MC=N, STEEL=N, ...]
+Game start (POST /player/register)
+    → register_player(player_id, game_id, model)
+      creates LLMPlayer, stores in _player_registry
+
+First decision (initialCards)
+    → player.init_session(system, user, think=True)
+      TM rules + board/expansion/milestone/award context sent ONCE
+      → corp/card selection + 150-250 word strategy doc with TABLEAU section
+
+All subsequent decisions
+    → player.continue_session(user)
+      No rules re-sent; session messages[] grows organically
+      Prompt: resources, hand cards with costs/tags/desc, opponent info (+ hand size),
+      recent game log, numbered options annotated with card-action descriptions,
+      payment section for projectCard/payment decisions
+      → CHOICE: N  [PAYMENT: MC=N, STEEL=N, ...]
+
+Per-generation boundary
+    → _per_generation_strategy_update(player, generation, state)
+      Structured restate prompt: standing, engine, milestone/award targets, next-gen priority
+      Response stored in player.strategy; no session rebuild
 ```
 
-**Strategy documents** are stored per `game_id` in `_game_strategies`. Initial strategy is written at setup (and updated at prelude); subsequently re-written at every generation boundary via `_per_generation_strategy_update` (see below).
+**LLMPlayer class** (`player_id`, `game_id`, `model`, `provider`, `session`, `strategy`, `token_usage`): encapsulates all state for one AI player across the entire game. Session is a standard `messages[]` list (works identically for OpenRouter and Ollama).
 
-**Session recovery** (`_session_recovery`): when no session is found (503 exhausted on setup, or server restart), a new session is initialised with the stored strategy as context. Future turns continue it normally.
+**Model capability detection**: `_get_model_capabilities(model)` returns `{caching: bool, thinking: bool}`. 25+ models are pre-seeded in `_KNOWN_CAPABILITIES`; unknown models are probed with two tiny API calls on first use. If a feature is rejected mid-session, it is disabled and subsequent calls skip it without retry.
 
-**Ollama context trim**: when session exceeds `MAX_SESSION_MESSAGES` (~30 turns), `_capture_strategy_then_trim` makes an extra API call to capture current strategy (including TABLEAU), then rebuilds the session as: original system + strategy reminder + last 40 messages.
+- **Anthropic caching** (OpenRouter): `cache_control: {"type": "ephemeral"}` on system message content + `anthropic-beta: prompt-caching-2024-07-31` header. System prompt billed once per game.
+- **Anthropic thinking** (OpenRouter): `extra_body={"thinking": {"type": "enabled", "budget_tokens": N}}` + `anthropic-beta: interleaved-thinking-2025-05-14` header. `_extract_text` strips thinking blocks from the response.
+- **OpenAI caching**: automatic for prompts >1024 tokens; no configuration needed.
+- **Ollama thinking**: `"think": true` in payload — effective on qwen3 family.
 
-**Gemini context caching**: at game start, `_init_gemini_session` creates a Gemini context cache (`client.caches.create`) containing the full system prompt (TM rules + game config), with TTL 3600s. All subsequent `generate_content` and `chats.create` calls reference the cache via `cached_content=name` — the system prompt is billed once instead of repeating every turn. Cache name stored in `_game_cache_info[game_id]`. TTL is refreshed every 50 min via `_maybe_refresh_gemini_cache`; if refresh fails (cache expired), the chat is reconstructed with inline `system_instruction` using `get_history()`.
+**Token/cost tracking** — per-player, not per-game: `player.token_usage` accumulates `calls`, `input`, `output`, `cache_read`, `cache_write`. Cost is estimated from the OpenRouter pricing API (`GET /api/v1/models`, fetched once and cached). `log_game_token_summary(game_id)` iterates `_game_players[game_id]` and calls `player.log_token_summary()` for each.
 
-**Gemini per-generation strategy update** (`_per_generation_strategy_update`): at the first action turn of each new generation, `_maybe_per_generation_update` detects when `game.generation` increases and sends a structured restate prompt to the existing chat. The prompt asks the model to cover: standing vs opponents, current engine + scoring path, milestone target (with explicit "if you already meet a requirement, claim it next action"), award target (only if winnable), and concrete next-gen priority. The response becomes natural chat history and is stored in `_game_strategies` for debugging + recovery. The chat is **not** rebuilt — Gemini's 1M-token context handles a full 15-gen session organically.
+**Context trimming**: when session exceeds `_MAX_SESSION_MESSAGES` (62), the session is rebuilt as: system message + strategy reminder + last 40 messages. For Ollama, strategy is captured first via an extra API call.
 
-This replaces an earlier `_trim_gemini_session` that re-injected a fake `"Summarize strategy" → "[CONTEXT TRIM …]"` user/model pair at chat position 0 each generation; the model would then anchor on that stale text and paraphrase it for every subsequent trim. Empirically (game `ga097581101aa`, 16 generations) the same opening-strategy stub was re-emitted at every trim from gen 2 through gen 13, depriving the AI of any tactical evolution.
+**Session recovery**: if no session exists (server restart), `player.recover_session(user)` re-initialises from the stored strategy.
 
-**Description elision**: for `wf_type == "card"` decisions (discard, keep, draft) where all candidate cards are already in the hand block of the prompt, `_is_card_decision_about_hand` returns True and `format_card_context` is replaced with a lightweight `"(see hand above)"` note, saving ~50–200 tokens per such turn.
+**Description elision**: for `wf_type == "card"` (discard/keep/draft) where all candidate cards are already shown in the hand block, descriptions are replaced with `"(see hand above)"` — saves ~50–200 tokens per such turn.
 
-**Error feedback**: when `last_error` is set in the request, the action prompt prepends `⚠ Your previous response was rejected: "..."` so the AI can correct its choice or payment.
+**Error feedback**: when `last_error` is set, the action prompt prepends `⚠ Your previous response was rejected: "..."`.
 
-**Payment selection**: for `projectCard` and `payment` decisions, the prompt shows available payment resources (MC, steel, titanium, heat, special resources) and asks the AI to specify `PAYMENT: MC=N[, STEEL=N][, TITANIUM=N]...`. Parsed and merged into the `input_response`.
+**Payment**: for `projectCard` and `payment` decisions, the prompt shows available resources and asks for `PAYMENT: MC=N[, STEEL=N][, TITANIUM=N]...`. `_correct_payment` validates and clamps the parsed payment before submitting.
+
+**Effective card cost**: hand display shows cost after steel/titanium discounts: e.g. `Nuclear Power [cost: 10 MC, effective: 4 MC with 3 steel]`.
+
+**Opponent hand size**: action prompt includes opponent hand count: e.g. `Bob: 14 MC, TR:25, hand: 6 cards`.
+
+**Transient error retry**: `_with_retry` retries on 503/429 with exponential backoff (5s, 10s, 3 attempts). Parses `Retry-After` header when present.
 
 ### Env vars
 
 | Var | Default | Description |
 |-----|---------|-------------|
 | `USE_LLM` | `false` | Enable LLM player |
-| `LLM_PROVIDER` | `ollama` | `ollama` or `gemini` |
-| `LLM_DEBUG` | `false` | Log prompts (lines prefixed `>`) and responses (lines prefixed `<`) |
+| `LLM_DEBUG` | `false` | Log prompts (`>` prefix) and responses (`<` prefix) |
+| `OPENROUTER_API_KEY` | _(required for OpenRouter)_ | API key from openrouter.ai |
+| `OPENROUTER_MODEL` | `anthropic/claude-opus-4-7` | Default model for new players |
+| `OPENROUTER_THINKING_BUDGET` | `512` | Thinking tokens for capable models (setup/prelude always use 1024) |
+| `OPENROUTER_MAX_OUTPUT_TOKENS` | `350` | Cap on action response length |
+| `OPENROUTER_MAX_TURNS` | `80` | Trim session after this many turns |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama server base URL |
-| `OLLAMA_MODEL` | `qwen3:4b` | Ollama model tag |
+| `OLLAMA_MODEL` | `qwen3:4b` | Default Ollama model |
 | `OLLAMA_TIMEOUT` | `600` | Ollama request timeout (seconds) |
-| `GEMINI_API_KEY` | _(required for Gemini)_ | Google AI Studio API key |
-| `GEMINI_MODEL` | `gemini-2.5-flash-lite` | Gemini model name; supported: `gemini-3-pro`, `gemini-3-flash`, `gemini-3-flash-lite`, `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite` (any Google AI Studio model name is accepted verbatim) |
-| `GEMINI_THINKING_BUDGET` | `1024` | Thinking tokens per turn (setup + every action + per-gen reflection) |
 
 ### Think mode
 
-Think is enabled on **every** turn (setup, prelude, action, per-generation reflection) — not just setup. Action-turn deliberation was previously disabled to save tokens, but the game-log analysis (`ga097581101aa`) showed the AI consistently emitted one-line `CHOICE: N` responses without considering milestones it already qualified for. Enabling think gives the model a deliberation budget on every decision.
-
-- **Ollama**: `"think": true` in `/api/chat` payload — effective on qwen3 family.
-- **Gemini**: every `Chat` is constructed with `ThinkingConfig(thinking_budget=_GEMINI_THINKING_BUDGET)`, default 1024 tokens. Setup uses `generate_content` (supports thinking), then creates a `Chat` with that exchange as history; all subsequent action turns inherit the same thinking budget.
-
-### Gemini resilience
-
-`_gemini_with_retry` retries transient errors (503/429/overloaded) with exponential backoff (5s, 10s, 3 attempts total). If setup exhausts retries, the first action call triggers session recovery via `_session_recovery`.
+Think is enabled on every turn (setup, prelude, action, per-generation reflection) for models that support it. Setup/prelude always use budget 1024; action turns use `OPENROUTER_THINKING_BUDGET` (default 512). Models without thinking capability fall back gracefully.
 
 ### AI Trainer (`select_action_advise`)
 
-The AI Trainer is a coaching sidebar that advises a **human** player (rather than playing for them). It is **opt-in per player** — there is no game-wide flag; each player toggles the trainer panel on/off from their own UI (state persisted to `localStorage` keyed by `ai_trainer_visible:<participantId>`).
+The AI Trainer is a coaching sidebar that advises a **human** player. It is **opt-in per player** — no game-wide flag; each player toggles the trainer panel from their own UI (`localStorage[ai_trainer_visible:<participantId>]`).
 
-**Flow:**
-1. Human sees a "🤖 AI Trainer" panel in the game UI (`AiTrainerChat.vue`).
-2. When the game waits for the player's decision, the panel automatically POSTs to `/api/ai/advice` (TM server proxy).
-3. TM server calls `POST /advise` on the AI server, which calls `select_action_advise`.
-4. Response contains both human-readable advice and a `<recommendation>` block parsed into a valid `input_response`.
-5. Human can click **Play Recommendation** to submit it, or play manually.
-6. Human can also type a follow-up question and click **Ask** — the conversation continues in the same session.
+**Per-player session isolation**: trainer sessions are registered as `trainer:<player_id>` in `_player_registry`. Each player gets a fresh, isolated `LLMPlayer` instance — the LLM never sees the other player's tableau or strategy. The model used is inherited from the human player's registered model (or the default).
 
-**Per-player session isolation**: trainer sessions use the namespace `trainer:<game_id>:<player_id>` in `_game_sessions` / `_game_chat_sessions`. Each player gets a fresh, isolated session — the LLM never sees the other player's tableau or strategy. Distinct from any concurrent AI-player session in the same game.
+**Setup-phase coaching** (`_select_setup_advise`): handles `initialCards` and `prelude` — recommends corp + cards, wrapping output in `<recommendation>` for the Play Recommendation button.
 
-**Setup-phase coaching** (`_select_setup_advise`): handles `initialCards` and `prelude` — the trainer can recommend a corporation + cards to buy, not just action turns. Reuses `_build_setup_prompt` and `_parse_setup_response`. Wraps the structured CORPORATION/BUY_CARDS/PRELUDE_CARDS/CEO_CARD/STRATEGY block inside `<recommendation>` so the client can submit it via the same Play Recommendation flow.
+**Dual-format response**: plain text coaching (1–3 sentences, no markdown), then `<recommendation>\nCHOICE: N\n[PAYMENT: ...]\n</recommendation>`. `select_action_advise` strips the block from `advice_text` and parses it via `index_to_response`.
 
-**Dual-format response**: the LLM is instructed (in `_TRAINER_SYSTEM_SUFFIX`) to produce **plain text, no markdown**, **1–3 short sentences** of coaching, followed by a `<recommendation>` block (CHOICE: N + optional PAYMENT). `select_action_advise` strips the recommendation block from `advice_text` and parses it via `index_to_response`.
-
-**Think enabled**: trainer turns set `think=True` (uses `GEMINI_THINKING_BUDGET` for Gemini); the trainer's deliberation budget is unconstrained by the AI-player's cost optimizations.
-
-**Requires `USE_LLM=true`** — returns an error if the neural-net mode is active instead.
+**Requires `USE_LLM=true`** — `inference.py` raises `RuntimeError` otherwise.
 
 ### Key functions in `llm_player.py`
 
-- `select_action_llm(state, waiting_for, last_error)` — public entry point; routes to `_select_setup` or `_select_action`
-- `_call_llm_init(game_id, system, user, think)` — starts new session; stores base system for trim
-- `_call_llm_continue(game_id, user)` — continues session; falls back to `_session_recovery` if none
-- `_session_recovery(game_id, user)` — re-initialises a proper session from stored strategy
-- `_select_setup(state, waiting_for, game_id)` — rich prompt for `initialCards`/`prelude`; injects board/expansion/milestone/award context
-- `_select_action(state, waiting_for, game_id, last_error)` — compact action prompt
-- `_build_action_prompt(state, waiting_for, options, last_error)` — assembles the action prompt
-- `_build_setup_prompt(state, waiting_for, game_id)` — setup prompt with corp/card/prelude/CEO options
-- `_parse_setup_response(text, waiting_for, game_id)` — extracts CORPORATION/BUY_CARDS/PRELUDE_CARDS/CEO_CARD/STRATEGY
-- `_parse_action_response(text, options, waiting_for, game_id)` — extracts CHOICE + optional PAYMENT
-- `_format_payment_section(waiting_for, player)` — builds payment options block for projectCard/payment decisions
-- `_parse_payment_line(text)` — parses `PAYMENT: MC=N, STEEL=N, ...` into a Payment dict
-- `_get_card_desc_for_option(opt)` — returns description for `Use <CardName> action` options
-- `_extract_card_names(waiting_for)` — collects card names from `card`-type decision nodes (for research/discard descriptions)
-- `_capture_strategy_then_trim(game_id, session)` — Ollama: capture strategy then rebuild trimmed session
-- `_per_generation_strategy_update(game_id, chat, generation)` — Gemini: at each generation boundary, send a structured restate prompt and capture the response as the updated strategy
-- `_maybe_per_generation_update(game_id, generation)` — fires `_per_generation_strategy_update` on generation bump; no-op when generation unchanged
-- `select_action_advise(state, waiting_for, game_id, player_id, user_question)` — AI Trainer entry point; returns `(advice_text, recommendation)`. Per-player session: `trainer:<game_id>:<player_id>`. Dispatches to `_select_setup_advise` for `initialCards`/`prelude` decisions.
-- `_select_setup_advise(state, waiting_for, trainer_game_id, user_question)` — coaching path for setup phases
-- `_build_trainer_system(state)` — composes the trainer's system prompt (rules + game config + board layout + coaching persona)
+- `register_player(player_id, game_id, model)` — create and store an `LLMPlayer`; called by `POST /player/register`
+- `get_or_create_player(player_id, game_id)` — return existing player or auto-create with default model
+- `log_game_token_summary(game_id)` — log per-player token/cost summary; idempotent
+- `select_action_llm(state, waiting_for, game_id, player_id, last_error)` — public entry point; routes to `_select_setup` or `_select_action`
+- `LLMPlayer.init_session(system, user, think)` — start new session, store in `self.session`
+- `LLMPlayer.continue_session(user, max_output_tokens)` — append user turn, call API, append response
+- `LLMPlayer.recover_session(user)` — re-initialise from `self.strategy` when session is lost
+- `LLMPlayer.trim_session()` — rebuild session as system + strategy + last 40 messages
+- `_get_model_capabilities(model)` — `{caching, thinking}` — pre-seeded table + lazy probe + in-session fallback
+- `_get_openrouter_pricing(model)` — `(input_usd/tok, output_usd/tok)` — cached from `/api/v1/models`
+- `_extract_text(response)` — strip Anthropic thinking blocks, return plain text
+- `_strip_cache_control(messages)` — remove `cache_control` fields for retry without caching
+- `_per_generation_strategy_update(player, generation, state)` — send restate prompt, store response in `player.strategy`
+- `_maybe_per_generation_update(player, generation, state)` — fire on generation bump; no-op otherwise
+- `_select_setup(state, waiting_for, player)` — rich prompt for `initialCards`/`prelude`
+- `_select_action(state, waiting_for, player, last_error)` — compact action prompt
+- `_build_action_prompt(state, waiting_for, options, last_error, player)` — assemble action prompt with hand, opponents, options
+- `_build_setup_prompt(state, waiting_for)` — corp/card/prelude/CEO options with descriptions
+- `_parse_setup_response(text, waiting_for, player)` — extract CORPORATION/BUY_CARDS/PRELUDE_CARDS/CEO_CARD/STRATEGY
+- `_parse_action_response(text, options, waiting_for, player_id, player)` — extract CHOICE + PAYMENT
+- `_correct_payment(payment, wf, player)` — clamp/validate payment against available resources
+- `_get_trainer_player(game_id, player_id, state)` — return or create trainer session (`trainer:<player_id>`)
+- `select_action_advise(state, waiting_for, game_id, player_id, user_question)` — AI Trainer entry point
 
 ### Game Knowledge Database (`game_knowledge.py`)
 
@@ -711,61 +712,66 @@ The AI Trainer is a coaching sidebar that advises a **human** player (rather tha
 | Model | RAM | Action time | Notes |
 |-------|-----|-------------|-------|
 | `qwen3:4b` | 2.5 GB | ~30–60s | **Recommended** — built-in think mode, free |
-| `phi4-mini` | 4 GB | ~20–40s | Fast, strong reasoning |
-| `gemma4:e4b` | 9.9 GB | ~90–120s | Larger, slower; needs 14 GB RAM total |
+| `qwen3:8b` | 5 GB | ~60–120s | Better reasoning, still free |
+| `llama3.2:3b` | 2 GB | ~15–30s | Fast, no thinking |
 
 ### Running
 
 ```bash
 # Ollama (local, free — Ollama daemon must be running)
-cd tm-ai-server && USE_LLM=true LLM_PROVIDER=ollama OLLAMA_MODEL=qwen3:4b LLM_DEBUG=true \
+cd tm-ai-server && USE_LLM=true OLLAMA_MODEL=qwen3:4b LLM_DEBUG=true \
   uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000 >> /tmp/ai-server.log 2>&1 &
 
-# Gemini (cloud, ~1s/move, free tier — get key at aistudio.google.com/apikey)
+# OpenRouter — Claude Opus (cloud; get key at openrouter.ai)
 source /home/pmunk/workspace/tm-ai/.env
-cd tm-ai-server && USE_LLM=true LLM_PROVIDER=gemini GEMINI_API_KEY=$GEMINI_API_KEY LLM_DEBUG=true \
+cd tm-ai-server && USE_LLM=true OPENROUTER_API_KEY=$OPENROUTER_API_KEY \
+  OPENROUTER_MODEL=anthropic/claude-opus-4-7 LLM_DEBUG=true \
   uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000 >> /tmp/ai-server.log 2>&1 &
+
+# OpenRouter — 4-player multi-model game (register each player after game creation):
+# curl -X POST http://localhost:8000/player/register \
+#   -H 'Content-Type: application/json' \
+#   -d '{"player_id":"p1abc","game_id":"g123","model":"anthropic/claude-opus-4-7"}'
+# (repeat for p2 with openai/gpt-4o, p3 with x-ai/grok-3, p4 with google/gemini-2.5-pro)
 ```
 
 ---
 
-## Cloud LLM Provider Comparison
+## Cloud LLM Provider Comparison (via OpenRouter)
 
-Cost basis: 200 moves/game × 1,000 input + 100 output tokens = 200K input / 20K output per game.
-With context caching + per-generation strategy update + description elision (Phase 1 optimisations), Gemini effective cost is significantly lower — the system prompt is billed once per game (not per turn) via context caching; the per-generation update grows chat history organically rather than rebuilding it, relying on Gemini's 1M-token window to absorb full 15-gen sessions.
+All models are accessed through `https://openrouter.ai/api/v1` with a single `OPENROUTER_API_KEY`. Cost basis: 200 moves/game × ~1,000 input + 100 output tokens = ~200K input / 20K output per game. Anthropic models benefit from prompt caching — system prompt billed once per game, subsequent turns at 10% of input rate.
 
-| Provider / Model | Input $/1M | Output $/1M | TTFT | Speed | $/game | $/1K games | Free tier |
+| Model (OpenRouter ID) | Input $/1M | Output $/1M | Speed | $/game | $/1K games | Caching | Thinking |
 |---|---|---|---|---|---|---|---|
-| Groq Llama 3.1 8B Instant | $0.05 | $0.08 | <0.3s | 660 t/s | $0.001 | $1.20 | 1K req/day |
-| Groq Llama 4 Scout | $0.11 | $0.34 | <0.4s | 447 t/s | $0.003 | $2.90 | 1K req/day |
-| Cerebras Llama 3.1 8B | $0.10 | $0.10 | <0.2s | 2,326 t/s | $0.002 | $2.20 | 1M tok/day |
-| **Gemini 2.5 Flash-Lite** | **$0.10** | **$0.40** | **0.3–0.6s** | 393 t/s | **$0.003** | **$2.80** | 1.5K req/day |
-| GPT-4.1-nano | $0.10 | $0.40 | ~0.9s | 80 t/s | $0.003 | $2.80 | none |
-| DeepSeek V3 | $0.14 | $0.28 | ~1.0s | 100 t/s | $0.003 | $3.40 | 5M tok free |
-| GPT-4o-mini | $0.15 | $0.60 | ~0.9s | 80 t/s | $0.004 | $4.20 | none |
-| **Gemini 2.5 Flash** | **$0.30** | **$2.50** | **~0.6s** | 220 t/s | **$0.011** | **$11.00** | **1.5K req/day** |
-| Groq Llama 3.3 70B | $0.59 | $0.79 | <0.5s | 276 t/s | $0.013 | $13.40 | 1K req/day |
-| Cerebras Llama 3.3 70B | $0.60 | $0.60 | <0.3s | 1,800 t/s | $0.013 | $13.20 | 1M tok/day |
-| Claude Haiku 4.5 | $1.00 | $5.00 | ~0.8s | 98 t/s | $0.030 | $30.00 | none |
-| Claude Sonnet 4.6 | $3.00 | $15.00 | ~1.2s | 75 t/s | $0.090 | $90.00 | none |
+| `google/gemini-2.5-flash-lite` | $0.10 | $0.40 | fast | $0.003 | $2.80 | no | no |
+| `openai/gpt-4o-mini` | $0.15 | $0.60 | fast | $0.004 | $4.20 | auto | no |
+| `google/gemini-2.5-flash` | $0.30 | $2.50 | fast | $0.011 | $11.00 | no | no |
+| `openai/gpt-4o` | $2.50 | $10.00 | fast | $0.065 | $65.00 | auto | no |
+| `x-ai/grok-3` | $3.00 | $15.00 | fast | $0.090 | $90.00 | no | no |
+| `anthropic/claude-haiku-4-5` | $1.00 | $5.00 | fast | ~$0.005 | ~$5.00 | yes | no |
+| `anthropic/claude-sonnet-4-6` | $3.00 | $15.00 | medium | ~$0.015 | ~$15.00 | yes | yes |
+| `anthropic/claude-opus-4-7` | $15.00 | $75.00 | medium | ~$0.075 | ~$75.00 | yes | yes |
 
-**Recommendations by scenario:**
-- **Interactive play (single game)**: Gemini 2.5 Flash free tier — 1,500 req/day, sub-1s responses, zero cost to start
-- **PPO training at scale**: Groq Llama 4 Scout ($2.90/1K games) or Groq Llama 3.1 8B ($1.20/1K games)
-- **Best quality/cost for training**: Gemini 2.5 Flash-Lite ($2.80/1K games, frontier quality)
-- **Avoid**: reasoning models (o4-mini, DeepSeek-R1) — 5–30s/move; Claude Sonnet — 30–75× more expensive
+Anthropic estimates use caching: effective input cost is ~10× lower for cached tokens.
 
-### Gemini Free Tier Setup
+**Recommendations by use case:**
+- **Low-cost batch / training data**: `google/gemini-2.5-flash-lite` ($2.80/1K games)
+- **Best quality AI player**: `anthropic/claude-opus-4-7` with caching (~$0.075/game)
+- **Multi-model 4-player game**: register each `player_id` with a different model via `POST /player/register`
+- **Local/free**: Ollama `qwen3:4b` (no API cost, ~30–60s/move)
 
-1. Go to **https://aistudio.google.com/apikey** → create API key (no credit card required)
-2. Free limits for `gemini-2.5-flash-lite`: **1,500 req/day**, 15 RPM, 1M TPM
+### OpenRouter Setup
+
+1. Sign up at **https://openrouter.ai** and create an API key
+2. Add to `tm-ai/.env`: `OPENROUTER_API_KEY=sk-or-...`
 3. Start the AI server:
    ```bash
-   cd tm-ai-server && USE_LLM=true LLM_PROVIDER=gemini \
-     GEMINI_API_KEY=<your-key> LLM_DEBUG=true \
+   source /home/pmunk/workspace/tm-ai/.env
+   cd tm-ai-server && USE_LLM=true OPENROUTER_API_KEY=$OPENROUTER_API_KEY \
+     OPENROUTER_MODEL=anthropic/claude-opus-4-7 LLM_DEBUG=true \
      uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000
    ```
-4. Monitor: `tail -f /tmp/ai-server.log` — prompts and responses logged when `LLM_DEBUG=true`
+4. Monitor: `tail -f /tmp/ai-server.log` — prompts/responses logged when `LLM_DEBUG=true`
 
 ---
 
@@ -774,20 +780,20 @@ With context caching + per-generation strategy update + description elision (Pha
 | Component | Status | Notes |
 |---|---|---|
 | Project structure + `pyproject.toml` | ✅ Done | src-layout, setuptools build system, dev deps |
-| `main.py` (root shim) + `src/tm_ai_server/main.py` | ✅ Done | `/move`, `/advise`, `/health`, `/version` |
-| `schemas.py` | ✅ Done | camelCase schemas; AdviceRequest carries player_id + user_question |
+| `main.py` (root shim) + `src/tm_ai_server/main.py` | ✅ Done | `/move`, `/advise`, `/health`, `/version`, `/player/register`, `/game-done` |
+| `schemas.py` | ✅ Done | camelCase schemas; AdviceRequest + PlayerRegisterRequest/Response |
 | `config.py` | ✅ Done | STATE_DIM=492, 199-card resource vocab, normalisation caps |
 | `model.py` | ✅ Done | Flat MLP PolicyValueNet (LayerNorm + Dropout); Option C refactor planned |
 | `encoding.py` | ✅ Done | encode_state, flatten_options, index_to_response, response_to_index |
 | `inference.py` | ✅ Done | load_model, select_action, select_advice; routes to LLM if USE_LLM=true |
-| `llm_player.py` | ✅ Done | LLM player (Ollama + Gemini); per-generation strategy update; think on every turn; per-player AI Trainer session namespace |
+| `llm_player.py` | ✅ Done | LLM player (OpenRouter + Ollama); LLMPlayer class per AI player; capability detection; per-player token/cost tracking; per-generation strategy update |
 | `game_knowledge.py` | ✅ Done | 970-card DB + board/expansion descriptions; `format_card_context`, `format_config_context`, `format_board_layout` |
 | `data/card_db.json` | ✅ Done | Generated by `extract_card_db.ts` from TM server card manifests |
 | `training/dataset.py` | ✅ Done | TMDataset from Plan-B training log format |
 | `training/train_supervised.py` | ✅ Done | Cross-entropy + MSE, checkpoint_best/latest |
 | `training/env_tm.py` | ✅ Done | Gymnasium env over `/api/ai/new-game` + `/api/ai/step` |
 | `training/train_ppo.py` | ✅ Done | MaskablePPO with manifest/metrics; checkpoints per N games |
-| Tests (test_encoding, test_schemas, test_llm_player) | ✅ Done | 30 tests, all passing |
+| Tests (test_encoding, test_schemas, test_llm_player) | ✅ Done | 46 tests, all passing |
 | Option C model refactor | 🗒 Planned (Phase 4 of plan) | Card embeddings + spatial board + per-option scoring; see `ai-model-design.md` |
 | LLM bootstrap data run | 🗒 Planned (Phase 5 of plan) | 500-game self-play dataset, ~€25–50 |
 | Docker / Cloud deployment | 🗒 Planned (Phase 7 of plan) | Vast.ai or GCE Spot; budget alerts; gcsfuse for checkpoint persistence |

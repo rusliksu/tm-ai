@@ -36,6 +36,8 @@ The existing game loop must remain intact; AI behavior is a clean extension poin
 | `game.isSelfPlay` flag (suppresses auto AI trigger) | ✅ Done | `src/server/Game.ts`, `IGame.ts`, `Player.ts` |
 | `requestAiMove` retry on `process()` failure (up to 2×, sends `last_error`) | ✅ Done | `src/server/Player.ts` |
 | `extract_card_db.ts` — renderData traversal for prelude/CEO descriptions | ✅ Done | `src/server/tools/extract_card_db.ts` |
+| AI server `POST /player/register` — assign model to player before game | ✅ Done | `tm-ai-server/src/tm_ai_server/main.py` |
+| AI server `POST /game-done` — flush per-player token/cost summary | ✅ Done | `tm-ai-server/src/tm_ai_server/main.py` |
 
 ---
 
@@ -254,7 +256,7 @@ Response: `{"success": true}`. On success the client triggers `window.location.r
 - `PlayerHome.vue` exposes a fixed 🤖 button (bottom-right) that toggles `aiTrainerVisible` for the current participant
 - State is persisted to `localStorage[ai_trainer_visible:<participantId>]`
 - When visible, the trainer sidebar mounts `AiTrainerChat` and per-decision advice fetches start
-- The AI server's session namespace is `trainer:<game_id>:<player_id>`, so two players in the same game get isolated trainer sessions
+- The AI server's session namespace is `trainer:<player_id>`, so two players in the same game get isolated trainer sessions
 
 ### Hotkey isolation
 
