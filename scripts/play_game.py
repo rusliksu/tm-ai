@@ -93,6 +93,24 @@ def register_players(
     return assigned
 
 
+def model_short_name(model: str) -> str:
+    """Derive a short display name from an OpenRouter model ID."""
+    # "anthropic/claude-sonnet-4-6" → "Claude-Sonnet-4-6"
+    # "openai/gpt-4o-mini"          → "GPT-4o-mini"
+    # "google/gemini-flash-latest"  → "Gemini-Flash"
+    # "deepseek/deepseek-v4-pro"    → "DeepSeek-V4-Pro"
+    # "qwen3:4b"                    → "Qwen3-4b"
+    name = model.split("/")[-1] if "/" in model else model.replace(":", "-")
+    # Capitalise each dash-separated word for readability
+    parts = name.replace("_", "-").split("-")
+    caps = "-".join(p.capitalize() if not p[0].isupper() else p for p in parts if p)
+    # Drop redundant provider prefix in the name (e.g. "Deepseek-V4-Pro" from "deepseek-v4-pro")
+    provider = model.split("/")[0] if "/" in model else ""
+    if provider and caps.lower().startswith(provider.lower().replace("-", "")):
+        caps = caps[len(provider):]
+    return caps.strip("-") or name
+
+
 def play_game(
     tm_url: str,
     ai_url: str,
@@ -101,8 +119,12 @@ def play_game(
     models: list[str],
     verbose: bool,
 ) -> None:
+    # Derive player names from model IDs
+    player_name_list = [model_short_name(models[min(i, len(models) - 1)]) if models else f"AI-{i+1}"
+                        for i in range(player_count)]
+
     # --- Create game ---
-    new_game_payload: dict[str, Any] = {"playerCount": player_count}
+    new_game_payload: dict[str, Any] = {"playerCount": player_count, "playerNames": player_name_list}
     if board:
         new_game_payload["boardName"] = board
 
