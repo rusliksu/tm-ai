@@ -1,50 +1,38 @@
 """
-LLM-based action selection — supports Ollama (local) and Gemini (cloud).
+LLM-based action selection — supports OpenRouter (cloud, any model) and Ollama (local).
 
-Session-per-game architecture:
-- Setup (initialCards): full system prompt (TM rules + board context) sent ONCE to
-  initialise the session. The model writes an opening strategy document.
-- All subsequent decisions (prelude / action): continue the same session. Only the
-  current game state and numbered options are sent — rules/board context are in
-  session memory, so they are NOT repeated each turn.
-- Thinking is enabled on EVERY turn (setup, prelude, actions, per-gen reflection).
-  Default budget controllable via GEMINI_THINKING_BUDGET (default 1024 tokens).
-- Per-generation strategy update: at the first action of each new generation, the LLM
-  is asked to restate its strategy (standing, engine, milestone/award targets, next-gen
-  priority). The response becomes natural chat history (no destructive rebuild) and is
-  stored in _game_strategies for debugging + session recovery.
-- Context trimming: both providers. Ollama: rebuilt after MAX_SESSION_MESSAGES (~30 turns).
-  Gemini: trimmed after GEMINI_MAX_TURNS (default 80) by keeping last 40 message pairs +
-  strategy summary. At ~1938 tokens/turn of accumulated context, 80 turns ≈ 155K tokens
-  per request — safely under the 1M/min paid-tier quota for two concurrent players.
+Architecture:
+- One LLMPlayer instance per AI player, stored in _player_registry keyed by player_id.
+- Session key is always the unique player_id from the TM server (never game_id alone).
+- Provider is derived from the model name: "model/name" → OpenRouter, "bare:tag" → Ollama.
+- Model capabilities (caching, thinking) are probed once per model and cached in memory.
+  Known models are pre-seeded to skip probing. Unknown models are probed on first use.
+  If a feature fails mid-session the error is caught and the model is marked as incapable
+  so subsequent calls skip it without retrying.
+- Token usage and cost are tracked per-player; log_game_token_summary aggregates by game.
 
 Providers:
-  Ollama  — messages[] array; Ollama server reuses KV cache for unchanged prefix.
-  Gemini  — Chat API (client.chats.create + chat.send_message); history cached server-side.
-            Setup uses generate_content with think=True, then chat is initialised with
-            that exchange as history.
+  OpenRouter — single openai.OpenAI client pointed at https://openrouter.ai/api/v1.
+               Uses standard messages[] format. Supports caching (Anthropic models) and
+               thinking (Anthropic + some others) via extra_headers / extra_body.
+  Ollama     — direct HTTP to localhost:11434 via requests. Uses same messages[] format.
+               Thinking via "think": True in payload (qwen3 and capable models).
 
 Env vars:
-  USE_LLM=true              Enable this module (checked in inference.py)
-  LLM_PROVIDER              'ollama' (default) or 'gemini'
-  LLM_DEBUG=true            Log full prompts and raw responses
-
-  Ollama (LLM_PROVIDER=ollama):
-    OLLAMA_URL              Base URL  (default: http://localhost:11434)
-    OLLAMA_MODEL            Model tag (default: qwen3:4b)
-    OLLAMA_TIMEOUT          Request timeout seconds (default: 600)
-
-  Gemini (LLM_PROVIDER=gemini):
-    GEMINI_API_KEY          Google AI Studio API key (required)
-    GEMINI_MODEL            Model name (default: gemini-2.5-flash-lite)
-                            Supported: gemini-3-pro, gemini-3-flash, gemini-3-flash-lite,
-                            gemini-2.5-pro, gemini-2.5-flash, gemini-2.5-flash-lite
-                            (any Google AI Studio model name is accepted verbatim)
-    GEMINI_THINKING_BUDGET  Thinking tokens per turn (default: 1024)
+  USE_LLM                     Enable LLM player (default: false)
+  OPENROUTER_API_KEY          Required for OpenRouter models
+  OPENROUTER_MODEL            Default model (default: anthropic/claude-opus-4-7)
+  OPENROUTER_THINKING_BUDGET  Thinking tokens for capable models (default: 512;
+                              setup/prelude always use 1024)
+  OPENROUTER_MAX_OUTPUT_TOKENS Cap on action response length (default: 350)
+  OPENROUTER_MAX_TURNS        Trim session after this many turns (default: 80)
+  OLLAMA_URL                  Ollama base URL (default: http://localhost:11434)
+  OLLAMA_MODEL                Default Ollama model (default: qwen3:4b)
+  OLLAMA_TIMEOUT              Ollama request timeout seconds (default: 600)
+  LLM_DEBUG                   Log full prompts and responses (default: false)
 """
 
 from __future__ import annotations
-import hashlib
 import logging
 import os
 import re
@@ -57,197 +45,734 @@ from .game_knowledge import CARD_DB, format_card_context, format_config_context,
 
 logger = logging.getLogger(__name__)
 
-_LLM_PROVIDER   = os.getenv("LLM_PROVIDER", "ollama").lower()
-_LLM_DEBUG      = os.getenv("LLM_DEBUG", "false").lower() == "true"
+_LLM_DEBUG = os.getenv("LLM_DEBUG", "false").lower() == "true"
+
+# OpenRouter settings
+_OPENROUTER_API_KEY         = os.getenv("OPENROUTER_API_KEY", "")
+_OPENROUTER_MODEL           = os.getenv("OPENROUTER_MODEL", "anthropic/claude-opus-4-7")
+_OPENROUTER_THINKING_BUDGET = int(os.getenv("OPENROUTER_THINKING_BUDGET", "512"))
+_OPENROUTER_MAX_OUTPUT_TOKENS = int(os.getenv("OPENROUTER_MAX_OUTPUT_TOKENS", "350"))
+_OPENROUTER_MAX_TURNS       = int(os.getenv("OPENROUTER_MAX_TURNS", "80"))
 
 # Ollama settings
 _OLLAMA_URL     = os.getenv("OLLAMA_URL",   "http://localhost:11434")
 _OLLAMA_MODEL   = os.getenv("OLLAMA_MODEL", "qwen3:4b")
 _OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "600"))
 
-# Gemini settings
-_GEMINI_API_KEY        = os.getenv("GEMINI_API_KEY", "")
-_GEMINI_MODEL          = os.getenv("GEMINI_MODEL",  "gemini-2.5-flash-lite")
-_GEMINI_THINKING_BUDGET = int(os.getenv("GEMINI_THINKING_BUDGET", "512"))   # setup/prelude always use 1024
-
-_gemini_client = None  # lazy-initialised
-
 SETUP_TYPES = {"initialCards", "prelude"}
 
-# Per-game strategy documents: game_id → strategy text (for logging and trim recovery)
-_game_strategies: dict[str, str] = {}
-
-# Per-game session history: game_id → messages list (Ollama) or Chat object (Gemini)
-_game_sessions: dict[str, list[dict]] = {}
-_game_chat_sessions: dict[str, object] = {}
-
-# Gemini context caching: game_id → {name, created_at, system}
-_game_cache_info: dict[str, dict] = {}
-_CACHE_REFRESH_AFTER = 50 * 60  # seconds — refresh TTL before cache expires at 3600s
-_session_base_system: dict[str, str] = {}  # game_id → original system (for trim)
-
-# Per-generation Gemini strategy update: game_id → last seen generation number
-_gemini_last_generation: dict[str, int] = {}
-
-# Hand-description elision: game_id → generation number on which the hand was last shown
-# with full descriptions. On subsequent action turns in the same generation, card names
-# are shown only with "(desc. shown earlier this gen)" to save ~400–600 tokens per turn.
-_hand_shown_generation: dict[str, int] = {}
-
-# Trim Ollama sessions when they grow beyond this many messages (system + user/assistant pairs)
-_MAX_SESSION_MESSAGES = 62  # ~30 game turns before trim
-
 # ---------------------------------------------------------------------------
-# Token usage tracking
+# Module-level state
 # ---------------------------------------------------------------------------
 
-# Per-game cumulative token counters: game_id → {calls, input, output, cached, thinking}
-_game_token_usage: dict[str, dict] = {}
+# Registry: player_id → LLMPlayer instance
+_player_registry: dict[str, LLMPlayer] = {}  # type: ignore[name-defined]
 
-# Games whose final token summary has already been logged (avoid double-log)
+# Game → player mapping for summary logging
+_game_players: dict[str, list[str]] = {}
+
+# Capability cache: model → {caching: bool, thinking: bool}
+_model_capabilities: dict[str, dict] = {}
+
+# Pricing cache: model → (input_usd_per_token, output_usd_per_token)
+_pricing_cache: dict[str, tuple[float, float]] = {}
+
+# Lazy-init OpenRouter client
+_openrouter_client = None
+
+# Games whose summary has been logged (avoid duplicate logging)
 _game_summary_logged: set[str] = set()
 
-# Cached Gemini pricing (fetched once from models API, falls back to table)
-_gemini_prices_cached: tuple[float, float, float, float] | None = None
+# Maximum session length before trimming (message count including system)
+_MAX_SESSION_MESSAGES = 62  # ~30 user+assistant pairs + system
 
-# USD per 1M tokens: (input, output, cached_input, thinking_output)
-# Sources: ai.google.dev/pricing (2025-05). "3.x" models treated as equivalents.
-_GEMINI_PRICES_FALLBACK: dict[str, tuple[float, float, float, float]] = {
-    "gemini-2.5-pro":        (1.25, 10.00, 0.3125, 3.50),
-    "gemini-2.5-flash":      (0.15,  0.60, 0.0375, 3.50),
-    "gemini-2.5-flash-lite": (0.10,  0.40, 0.025,  0.0),
-    "gemini-3-pro":          (1.25, 10.00, 0.3125, 3.50),
-    "gemini-3-flash":        (0.15,  0.60, 0.0375, 3.50),
-    "gemini-3-flash-lite":   (0.10,  0.40, 0.025,  0.0),
-    "gemini-3.1-flash-lite": (0.10,  0.40, 0.025,  0.0),
+
+# ---------------------------------------------------------------------------
+# Known model capabilities — skip probing for these
+# ---------------------------------------------------------------------------
+
+_KNOWN_CAPABILITIES: dict[str, dict] = {
+    # Anthropic via OpenRouter — caching and thinking both available
+    "anthropic/claude-opus-4-7":        {"caching": True,  "thinking": True},
+    "anthropic/claude-opus-4-5":        {"caching": True,  "thinking": True},
+    "anthropic/claude-sonnet-4-6":      {"caching": True,  "thinking": True},
+    "anthropic/claude-sonnet-4-5":      {"caching": True,  "thinking": True},
+    "anthropic/claude-haiku-4-5":       {"caching": True,  "thinking": False},
+    "anthropic/claude-3-7-sonnet":      {"caching": True,  "thinking": True},
+    "anthropic/claude-3-5-sonnet":      {"caching": True,  "thinking": False},
+    "anthropic/claude-3-5-haiku":       {"caching": True,  "thinking": False},
+    # OpenAI via OpenRouter — automatic caching (no config), no explicit thinking
+    "openai/gpt-4o":                    {"caching": False, "thinking": False},
+    "openai/gpt-4o-mini":               {"caching": False, "thinking": False},
+    "openai/o3":                        {"caching": False, "thinking": False},
+    "openai/o4-mini":                   {"caching": False, "thinking": False},
+    "openai/o3-mini":                   {"caching": False, "thinking": False},
+    # xAI Grok via OpenRouter
+    "x-ai/grok-3":                      {"caching": False, "thinking": False},
+    "x-ai/grok-3-mini":                 {"caching": False, "thinking": True},
+    "x-ai/grok-2-1212":                 {"caching": False, "thinking": False},
+    # Google via OpenRouter — no explicit cache or thinking control
+    "google/gemini-2.5-pro":            {"caching": False, "thinking": False},
+    "google/gemini-2.5-flash":          {"caching": False, "thinking": False},
+    "google/gemini-2.5-flash-lite":     {"caching": False, "thinking": False},
+    "google/gemini-2.0-flash":          {"caching": False, "thinking": False},
+    # Ollama local
+    "qwen3:4b":                         {"caching": False, "thinking": True},
+    "qwen3:8b":                         {"caching": False, "thinking": True},
+    "qwen3:14b":                        {"caching": False, "thinking": True},
+    "qwen3:32b":                        {"caching": False, "thinking": True},
+    "llama3.2:3b":                      {"caching": False, "thinking": False},
+    "llama3.3:70b":                     {"caching": False, "thinking": False},
 }
-_GEMINI_PRICES_DEFAULT = (0.10, 0.40, 0.025, 0.0)
 
 
-def _get_gemini_prices() -> tuple[float, float, float, float]:
-    """Return (input/M, output/M, cached_input/M, thinking/M) in USD.
+# ---------------------------------------------------------------------------
+# Provider resolution
+# ---------------------------------------------------------------------------
 
-    Tries the models.get() API first (some SDK versions expose a `pricing` field);
-    falls back to the hardcoded table above.
-    """
-    global _gemini_prices_cached
-    if _gemini_prices_cached is not None:
-        return _gemini_prices_cached
-
-    try:
-        model_info = _gemini_client.models.get(_GEMINI_MODEL)  # type: ignore[union-attr]
-        p = getattr(model_info, "pricing", None)
-        if p is not None:
-            inp  = float(getattr(p, "input_per_million_tokens",        None) or
-                         getattr(p, "prompt_token_price_per_million",  None) or 0)
-            out  = float(getattr(p, "output_per_million_tokens",       None) or
-                         getattr(p, "response_token_price_per_million", None) or 0)
-            cach = float(getattr(p, "cached_input_per_million_tokens", None) or inp * 0.25)
-            thk  = float(getattr(p, "thinking_per_million_tokens",     None) or 0)
-            if inp > 0 and out > 0:
-                _gemini_prices_cached = (inp, out, cach, thk)
-                logger.info("Gemini pricing from API: input=$%.4f out=$%.4f cached=$%.4f thinking=$%.4f (per 1M tokens)",
-                            inp, out, cach, thk)
-                return _gemini_prices_cached
-    except Exception:
-        pass
-
-    bare = _GEMINI_MODEL.removeprefix("models/")
-    prices = _GEMINI_PRICES_FALLBACK.get(bare)
-    if prices is None:
-        for key, val in _GEMINI_PRICES_FALLBACK.items():
-            if bare.startswith(key) or key.startswith(bare):
-                prices = val
-                break
-    _gemini_prices_cached = prices or _GEMINI_PRICES_DEFAULT
-    logger.info("Gemini pricing (fallback table, model=%s): input=$%.4f out=$%.4f cached=$%.4f thinking=$%.4f (per 1M tokens)",
-                bare, *_gemini_prices_cached)
-    return _gemini_prices_cached
+def _provider_for(model: str) -> str:
+    """Return 'openrouter' if model contains '/', else 'ollama'."""
+    return "openrouter" if "/" in model else "ollama"
 
 
-def _extract_gemini_usage(response) -> tuple[int, int, int, int]:
-    """Extract (input, output, cached, thinking) token counts from a Gemini response."""
-    um = getattr(response, "usage_metadata", None)
-    if um is None:
-        return 0, 0, 0, 0
-    in_tok  = int(getattr(um, "prompt_token_count",          0) or 0)
-    out_tok = int(getattr(um, "candidates_token_count",      0) or 0)
-    cac_tok = int(getattr(um, "cached_content_token_count",  0) or 0)
-    thk_tok = int(getattr(um, "thoughts_token_count",        0) or 0)
-    return in_tok, out_tok, cac_tok, thk_tok
-
-
-def _accum_tokens(game_id: str, call_type: str,
-                  in_tok: int, out_tok: int,
-                  cached_tok: int = 0, thinking_tok: int = 0) -> None:
-    """Record token counts for one LLM call and log the per-call + running total.
-
-    For Gemini, also logs a running cost estimate.
-    """
-    usage = _game_token_usage.setdefault(game_id, {
-        "calls": 0, "input": 0, "output": 0, "cached": 0, "thinking": 0,
-    })
-    usage["calls"]   += 1
-    usage["input"]   += in_tok
-    usage["output"]  += out_tok
-    usage["cached"]  += cached_tok
-    usage["thinking"] += thinking_tok
-
-    if _LLM_PROVIDER == "gemini":
-        prices = _get_gemini_prices()
-        in_p, out_p, cac_p, thk_p = prices
-        billed_in  = usage["input"]  - usage["cached"]
-        cost = (billed_in * in_p + usage["cached"] * cac_p
-                + (usage["output"] - usage["thinking"]) * out_p
-                + usage["thinking"] * thk_p) / 1_000_000
-        logger.info(
-            "tokens[%s] game=%s  in=%d out=%d cached=%d thinking=%d"
-            "  |  total calls=%d in=%d out=%d cached=%d est_cost=$%.4f",
-            call_type, game_id, in_tok, out_tok, cached_tok, thinking_tok,
-            usage["calls"], usage["input"], usage["output"], usage["cached"], cost,
+def _ensure_openrouter_client() -> None:
+    global _openrouter_client
+    if _openrouter_client is None:
+        import openai
+        _openrouter_client = openai.OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=_OPENROUTER_API_KEY,
         )
+
+
+# ---------------------------------------------------------------------------
+# Capability detection (probe on first use, cache result)
+# ---------------------------------------------------------------------------
+
+def _get_model_capabilities(model: str) -> dict:
+    """Return {caching: bool, thinking: bool} for model. Probe if unknown."""
+    if model in _model_capabilities:
+        return _model_capabilities[model]
+    # Check pre-seeded table first (exact match, then prefix match)
+    if model in _KNOWN_CAPABILITIES:
+        _model_capabilities[model] = dict(_KNOWN_CAPABILITIES[model])
+        return _model_capabilities[model]
+    for key, caps in _KNOWN_CAPABILITIES.items():
+        if model.startswith(key) or key.startswith(model.split(":")[0]):
+            _model_capabilities[model] = dict(caps)
+            logger.info("Capability inferred for %s from known entry %s: %s", model, key, caps)
+            return _model_capabilities[model]
+    # Unknown model — probe both features (one tiny call each)
+    if _provider_for(model) == "openrouter":
+        _ensure_openrouter_client()
+        caching  = _probe_caching(model)
+        thinking = _probe_thinking(model)
     else:
-        logger.info(
-            "tokens[%s] game=%s  in=%d out=%d"
-            "  |  total calls=%d in=%d out=%d",
-            call_type, game_id, in_tok, out_tok,
-            usage["calls"], usage["input"], usage["output"],
+        # Ollama: check if model advertises thinking by testing with think=True
+        caching  = False
+        thinking = _probe_ollama_thinking(model)
+    caps = {"caching": caching, "thinking": thinking}
+    _model_capabilities[model] = caps
+    logger.info("Probed capabilities for %s: %s", model, caps)
+    return caps
+
+
+def _probe_caching(model: str) -> bool:
+    try:
+        _openrouter_client.chat.completions.create(  # type: ignore[union-attr]
+            model=model,
+            messages=[{
+                "role": "system",
+                "content": [{"type": "text", "text": "test",
+                             "cache_control": {"type": "ephemeral"}}],
+            }, {"role": "user", "content": "ping"}],
+            max_tokens=1,
+            extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
         )
+        return True
+    except Exception as e:
+        logger.debug("Caching probe for %s failed: %s", model, e)
+        return False
+
+
+def _probe_thinking(model: str) -> bool:
+    try:
+        _openrouter_client.chat.completions.create(  # type: ignore[union-attr]
+            model=model,
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=1,
+            extra_body={"thinking": {"type": "enabled", "budget_tokens": 256}},
+            extra_headers={"anthropic-beta": "interleaved-thinking-2025-05-14"},
+        )
+        return True
+    except Exception as e:
+        logger.debug("Thinking probe for %s failed: %s", model, e)
+        return False
+
+
+def _probe_ollama_thinking(model: str) -> bool:
+    try:
+        r = requests.post(
+            f"{_OLLAMA_URL}/api/chat",
+            json={"model": model, "stream": False, "messages": [{"role": "user", "content": "ping"}], "think": True},
+            timeout=30,
+        )
+        return r.ok
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Pricing (OpenRouter models API)
+# ---------------------------------------------------------------------------
+
+def _get_openrouter_pricing(model: str) -> tuple[float, float]:
+    """Return (input_usd_per_token, output_usd_per_token). Fetched once, cached."""
+    if model in _pricing_cache:
+        return _pricing_cache[model]
+    try:
+        r = requests.get(
+            "https://openrouter.ai/api/v1/models",
+            headers={"Authorization": f"Bearer {_OPENROUTER_API_KEY}"},
+            timeout=10,
+        )
+        r.raise_for_status()
+        for entry in r.json().get("data", []):
+            mid     = entry.get("id", "")
+            pricing = entry.get("pricing") or {}
+            raw_in  = pricing.get("prompt")      or pricing.get("input")  or 0
+            raw_out = pricing.get("completion")  or pricing.get("output") or 0
+            try:
+                in_p  = float(raw_in)
+                out_p = float(raw_out)
+            except (TypeError, ValueError):
+                in_p, out_p = 0.0, 0.0
+            _pricing_cache[mid] = (in_p, out_p)
+        logger.info("Fetched OpenRouter model pricing (%d models)", len(_pricing_cache))
+    except Exception as e:
+        logger.warning("OpenRouter pricing fetch failed: %s", e)
+    return _pricing_cache.get(model, (0.0, 0.0))
+
+
+# ---------------------------------------------------------------------------
+# Retry logic (generic)
+# ---------------------------------------------------------------------------
+
+_RETRY_ATTEMPTS = 3
+_RETRY_BASE_DELAY = 5.0  # seconds, doubles on each attempt
+
+
+def _is_transient_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(k in msg for k in ("503", "unavailable", "429", "rate limit",
+                                   "overloaded", "resource exhausted", "timeout"))
+
+
+def _parse_retry_delay(exc: Exception) -> float | None:
+    m = re.search(r"retry.?after[:\s]+(\d+\.?\d*)", str(exc), re.IGNORECASE)
+    if not m:
+        m = re.search(r"retryDelay.*?(\d+\.?\d*)s", str(exc))
+    return float(m.group(1)) if m else None
+
+
+def _with_retry(fn, attempts: int = _RETRY_ATTEMPTS, base_delay: float = _RETRY_BASE_DELAY):
+    """Call fn() with exponential back-off on transient errors (429/503)."""
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except Exception as exc:
+            if attempt < attempts - 1 and _is_transient_error(exc):
+                msg = str(exc)
+                if "429" in msg or "resource exhausted" in msg.lower():
+                    api_delay = _parse_retry_delay(exc)
+                    wait = (api_delay + 2.0) if api_delay else 62.0
+                    logger.warning("Rate-limited (attempt %d/%d) — waiting %.0fs",
+                                   attempt + 1, attempts, wait)
+                else:
+                    wait = base_delay * (2 ** attempt)
+                    logger.warning("Transient error (attempt %d/%d): %s — retrying in %.0fs",
+                                   attempt + 1, attempts, exc, wait)
+                time.sleep(wait)
+                last_exc = exc
+            else:
+                raise
+    raise last_exc  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# LLMPlayer class
+# ---------------------------------------------------------------------------
+
+class LLMPlayer:
+    """Stateful LLM session for one AI player in a TM game."""
+
+    def __init__(self, player_id: str, game_id: str, model: str) -> None:
+        self.player_id = player_id
+        self.game_id   = game_id
+        self.model     = model
+        self.provider  = _provider_for(model)
+
+        # Session state
+        self.session:               list[dict] = []
+        self.base_system:           str = ""
+        self.strategy:              str = ""
+        self.last_generation:       int = -1
+        self.hand_shown_generation: int = -1
+
+        # Token tracking (per-player)
+        self.token_usage: dict = {
+            "calls": 0, "input": 0, "output": 0,
+            "cache_read": 0, "cache_write": 0, "thinking": 0,
+        }
+        self.summary_logged: bool = False
+
+    # ------------------------------------------------------------------
+    # Session management
+    # ------------------------------------------------------------------
+
+    def init_session(self, system: str, user: str, think: bool = True) -> str:
+        """Start a new session: send system + first user message, store response."""
+        self.base_system = system
+        if _LLM_DEBUG:
+            _log_prompt(f"=== INIT system (player={self.player_id} model={self.model}) ===", system)
+            _log_prompt(f"=== INIT user (player={self.player_id}) ===", user)
+
+        if self.provider == "openrouter":
+            text = self._call_openrouter(system, user, think=think)
+        else:
+            text = self._call_ollama(system, user, think=think)
+
+        if _LLM_DEBUG:
+            _log_response(f"=== INIT response (player={self.player_id}) ===", text)
+        return text
+
+    def continue_session(self, user: str, max_output_tokens: int | None = None) -> str:
+        """Continue the session with a new user message. Recovers if session is lost."""
+        if not self.session:
+            logger.warning("No session for player %s — recovering", self.player_id)
+            return self.recover_session(user)
+
+        if _LLM_DEBUG:
+            _log_prompt(f"=== CONTINUE user (player={self.player_id}) ===", user)
+
+        if self.provider == "openrouter":
+            text = self._continue_openrouter(user, max_output_tokens=max_output_tokens)
+        else:
+            text = self._continue_ollama(user)
+
+        if _LLM_DEBUG:
+            _log_response(f"=== CONTINUE response (player={self.player_id}) ===", text)
+        return text
+
+    def recover_session(self, user: str) -> str:
+        """Re-initialise from strategy when session is lost (server restart / exhaustion)."""
+        strategy = self.strategy or "Play a balanced game — maximise TR and card synergies."
+        system = (
+            TM_RULES + "\n\n"
+            "You are a Terraforming Mars player. Your current strategy:\n"
+            f"{strategy}\n\n"
+            "Pick the single best action. Respond ONLY:\n"
+            "CHOICE: <number>"
+        )
+        logger.info("Session recovery for player %s (strategy: %.80s…)", self.player_id, strategy)
+        return self.init_session(system, user, think=False)
+
+    def trim_session(self) -> None:
+        """Trim old session history to prevent unbounded context growth."""
+        if len(self.session) <= _MAX_SESSION_MESSAGES:
+            return
+        strategy = self.strategy or ""
+        system_msg = self.session[0] if self.session else {"role": "system", "content": self.base_system}
+        base = system_msg.get("content", self.base_system)
+        if isinstance(base, list):
+            # Extract text from cache_control content blocks
+            base = " ".join(b.get("text", "") for b in base if isinstance(b, dict))
+        system_with_reminder = (
+            base + f"\n\n[CONTEXT TRIM — current strategy:\n{strategy}]" if strategy else base
+        )
+        tail = self.session[-40:]  # keep last 40 messages (user+assistant pairs)
+        self.session.clear()
+        if self.provider == "openrouter":
+            caps = _get_model_capabilities(self.model)
+            sys_content = (
+                [{"type": "text", "text": system_with_reminder,
+                  "cache_control": {"type": "ephemeral"}}]
+                if caps.get("caching") else system_with_reminder
+            )
+            self.session.append({"role": "system", "content": sys_content})
+        else:
+            self.session.append({"role": "system", "content": system_with_reminder})
+        self.session.extend(tail)
+        logger.info("Session trimmed for player %s — kept last 40 messages + strategy", self.player_id)
+
+    # ------------------------------------------------------------------
+    # Internal call helpers
+    # ------------------------------------------------------------------
+
+    def _build_system_message(self, system: str) -> dict:
+        """Wrap system text in cache_control block if the model supports caching."""
+        caps = _get_model_capabilities(self.model)
+        if caps.get("caching"):
+            return {
+                "role": "system",
+                "content": [{"type": "text", "text": system,
+                             "cache_control": {"type": "ephemeral"}}],
+            }
+        return {"role": "system", "content": system}
+
+    def _call_openrouter(self, system: str, user: str, think: bool) -> str:
+        """First call: build messages[], store in self.session, return response text."""
+        _ensure_openrouter_client()
+        sys_msg  = self._build_system_message(system)
+        messages = [sys_msg, {"role": "user", "content": user}]
+        text = self._do_openrouter_call(messages, think=think, max_output_tokens=None)
+        self.session = messages + [{"role": "assistant", "content": text}]
+        return text
+
+    def _continue_openrouter(self, user: str, max_output_tokens: int | None) -> str:
+        """Continue call: append user msg, call, append response."""
+        self.trim_session()
+        self.session.append({"role": "user", "content": user})
+        text = self._do_openrouter_call(self.session, think=True, max_output_tokens=max_output_tokens)
+        self.session.append({"role": "assistant", "content": text})
+        return text
+
+    def _do_openrouter_call(
+        self,
+        messages: list[dict],
+        think: bool,
+        max_output_tokens: int | None,
+    ) -> str:
+        caps = _get_model_capabilities(self.model)
+        kwargs: dict = {"model": self.model, "messages": messages}
+        if max_output_tokens:
+            kwargs["max_tokens"] = max_output_tokens
+
+        extra_headers: dict = {}
+        extra_body: dict    = {}
+
+        if think and caps.get("thinking"):
+            budget = _OPENROUTER_THINKING_BUDGET
+            extra_body["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            extra_headers["anthropic-beta"] = "interleaved-thinking-2025-05-14"
+
+        if caps.get("caching"):
+            # Ensure the anthropic-beta header covers caching too
+            existing = extra_headers.get("anthropic-beta", "")
+            if "prompt-caching" not in existing:
+                extra_headers["anthropic-beta"] = (
+                    existing + ",prompt-caching-2024-07-31" if existing
+                    else "prompt-caching-2024-07-31"
+                )
+
+        if extra_headers:
+            kwargs["extra_headers"] = extra_headers
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+
+        # Capability-fallback loop: retry without the failing feature on first error
+        for _attempt in range(3):
+            try:
+                response = _with_retry(lambda: _openrouter_client.chat.completions.create(**kwargs))  # type: ignore[union-attr]
+                break
+            except Exception as e:
+                err = str(e).lower()
+                if "cache" in err and caps.get("caching"):
+                    caps["caching"] = False
+                    _model_capabilities[self.model]["caching"] = False
+                    # Rebuild messages without cache_control blocks
+                    messages = _strip_cache_control(messages)
+                    kwargs["messages"] = messages
+                    extra_headers.pop("anthropic-beta", None)
+                    kwargs.pop("extra_headers", None)
+                    logger.info("Disabled caching for %s after error", self.model)
+                    continue
+                if ("thinking" in err or "budget" in err) and caps.get("thinking"):
+                    caps["thinking"] = False
+                    _model_capabilities[self.model]["thinking"] = False
+                    extra_body.pop("thinking", None)
+                    if extra_body:
+                        kwargs["extra_body"] = extra_body
+                    else:
+                        kwargs.pop("extra_body", None)
+                    logger.info("Disabled thinking for %s after error", self.model)
+                    continue
+                raise
+
+        text = _extract_text(response)
+        self._accum_openrouter(response)
+        return text
+
+    def _call_ollama(self, system: str, user: str, think: bool) -> str:
+        """First Ollama call: build messages[], return response."""
+        caps = _get_model_capabilities(self.model)
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user},
+        ]
+        payload: dict = {"model": self.model, "stream": False, "messages": messages}
+        if caps.get("thinking"):
+            payload["think"] = think
+        r = _with_retry(lambda: requests.post(f"{_OLLAMA_URL}/api/chat",
+                                              json=payload, timeout=_OLLAMA_TIMEOUT))
+        r.raise_for_status()
+        data = r.json()
+        text: str = data["message"]["content"]
+        messages.append({"role": "assistant", "content": text})
+        self.session = messages
+        self._accum_ollama(data, "init")
+        return text
+
+    def _continue_ollama(self, user: str) -> str:
+        """Continue Ollama call: trim if needed, append user + response."""
+        if len(self.session) > _MAX_SESSION_MESSAGES:
+            self._capture_ollama_strategy()
+            self.trim_session()
+        caps = _get_model_capabilities(self.model)
+        self.session.append({"role": "user", "content": user})
+        payload: dict = {"model": self.model, "stream": False, "messages": self.session}
+        if caps.get("thinking"):
+            payload["think"] = True
+        r = _with_retry(lambda: requests.post(f"{_OLLAMA_URL}/api/chat",
+                                              json=payload, timeout=_OLLAMA_TIMEOUT))
+        r.raise_for_status()
+        data = r.json()
+        text: str = data["message"]["content"]
+        self.session.append({"role": "assistant", "content": text})
+        self._accum_ollama(data, "continue")
+        return text
+
+    def _capture_ollama_strategy(self) -> None:
+        """Ask the model for its strategy before trimming the Ollama session."""
+        pending = self.session.pop()  # temporarily remove pending user msg
+        self.session.append({
+            "role": "user",
+            "content": (
+                "Before we continue: write out your current strategy in 150-200 words — "
+                "engine type, priority tags, milestone/award targets, pace plan, key watch-outs. "
+                "Include a TABLEAU section listing every card you have played and its key ongoing effect."
+            ),
+        })
+        payload: dict = {"model": self.model, "stream": False,
+                         "messages": self.session, "think": False}
+        try:
+            r = requests.post(f"{_OLLAMA_URL}/api/chat", json=payload, timeout=_OLLAMA_TIMEOUT)
+            r.raise_for_status()
+            data = r.json()
+            self.strategy = data["message"]["content"].strip()
+            self._accum_ollama(data, "strategy_capture")
+            logger.info("Captured Ollama strategy for player %s: %.100s…", self.player_id, self.strategy)
+        except Exception as exc:
+            logger.warning("Strategy capture failed for player %s: %s", self.player_id, exc)
+        self.session.pop()           # remove strategy request
+        self.session.append(pending) # restore pending user msg
+
+    # ------------------------------------------------------------------
+    # Token accounting
+    # ------------------------------------------------------------------
+
+    def _accum_openrouter(self, response) -> None:
+        usage = getattr(response, "usage", None)
+        in_tok  = int(getattr(usage, "prompt_tokens",     0) or 0)
+        out_tok = int(getattr(usage, "completion_tokens", 0) or 0)
+        # Anthropic-style cache fields (OpenRouter passes them through)
+        details = getattr(usage, "prompt_tokens_details", None)
+        cache_read  = int(getattr(details, "cached_tokens", 0) or 0) if details else 0
+        if not cache_read:
+            cache_read  = int(getattr(usage, "cache_read_input_tokens",     0) or 0)
+        cache_write = int(getattr(usage, "cache_creation_input_tokens",     0) or 0)
+
+        self.token_usage["calls"]      += 1
+        self.token_usage["input"]      += in_tok
+        self.token_usage["output"]     += out_tok
+        self.token_usage["cache_read"] += cache_read
+        self.token_usage["cache_write"]+= cache_write
+
+        in_p, out_p = _get_openrouter_pricing(self.model)
+        billed_in = in_tok - cache_read
+        cost = (billed_in * in_p + cache_read * in_p * 0.1 + out_tok * out_p)
+        running_cost = self._running_cost()
+        logger.info(
+            "tokens player=%s model=%s  in=%d out=%d cache_read=%d cache_write=%d"
+            "  |  total calls=%d in=%d out=%d est_cost=$%.4f",
+            self.player_id, self.model, in_tok, out_tok, cache_read, cache_write,
+            self.token_usage["calls"], self.token_usage["input"],
+            self.token_usage["output"], running_cost,
+        )
+
+    def _accum_ollama(self, data: dict, call_type: str) -> None:
+        in_tok  = data.get("prompt_eval_count", 0) or 0
+        out_tok = data.get("eval_count",         0) or 0
+        self.token_usage["calls"]  += 1
+        self.token_usage["input"]  += in_tok
+        self.token_usage["output"] += out_tok
+        logger.info(
+            "tokens[%s] player=%s model=%s  in=%d out=%d  |  total calls=%d in=%d out=%d",
+            call_type, self.player_id, self.model, in_tok, out_tok,
+            self.token_usage["calls"], self.token_usage["input"], self.token_usage["output"],
+        )
+
+    def _running_cost(self) -> float:
+        in_p, out_p = _get_openrouter_pricing(self.model)
+        u = self.token_usage
+        billed_in = u["input"] - u["cache_read"]
+        return billed_in * in_p + u["cache_read"] * in_p * 0.1 + u["output"] * out_p
+
+    def log_token_summary(self) -> None:
+        if self.summary_logged:
+            return
+        self.summary_logged = True
+        u = self.token_usage
+        if self.provider == "openrouter":
+            in_p, out_p = _get_openrouter_pricing(self.model)
+            billed_in   = u["input"] - u["cache_read"]
+            cost_in     = billed_in            * in_p
+            cost_cached = u["cache_read"]      * in_p * 0.1
+            cost_out    = u["output"]          * out_p
+            total_cost  = cost_in + cost_cached + cost_out
+            logger.info(
+                "TOKEN SUMMARY player=%s | game=%s | model=%s | calls=%d"
+                " | input=%d (billed=%d cached_read=%d cached_write=%d) | output=%d"
+                " | cost: in=$%.4f cached=$%.4f out=$%.4f | TOTAL=$%.4f",
+                self.player_id, self.game_id, self.model, u["calls"],
+                u["input"], billed_in, u["cache_read"], u["cache_write"],
+                u["output"], cost_in, cost_cached, cost_out, total_cost,
+            )
+        else:
+            logger.info(
+                "TOKEN SUMMARY player=%s | game=%s | model=%s | calls=%d | input=%d | output=%d",
+                self.player_id, self.game_id, self.model,
+                u["calls"], u["input"], u["output"],
+            )
+
+
+# ---------------------------------------------------------------------------
+# Text extraction (strips thinking blocks from Anthropic extended-thinking responses)
+# ---------------------------------------------------------------------------
+
+def _extract_text(response) -> str:
+    choice = response.choices[0]
+    msg = choice.message
+    if isinstance(msg.content, str):
+        return msg.content or ""
+    if isinstance(msg.content, list):
+        parts = []
+        for block in msg.content:
+            btype = getattr(block, "type", None)
+            if btype == "text" and hasattr(block, "text"):
+                parts.append(block.text)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+        return "\n".join(parts)
+    return str(msg.content or "")
+
+
+def _strip_cache_control(messages: list[dict]) -> list[dict]:
+    """Return messages with cache_control removed from system content blocks."""
+    result = []
+    for msg in messages:
+        if msg.get("role") == "system" and isinstance(msg.get("content"), list):
+            plain = " ".join(
+                b.get("text", "") for b in msg["content"]
+                if isinstance(b, dict)
+            )
+            result.append({"role": "system", "content": plain})
+        else:
+            result.append(msg)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
+
+def _log_prompt(header: str, text: str) -> None:
+    prefixed = "\n".join(f"> {line}" for line in text.splitlines())
+    logger.info("%s\n%s", header, prefixed)
+
+
+def _log_response(header: str, text: str | None) -> None:
+    if text is None:
+        logger.info("%s\n< (empty/None response)", header)
+        return
+    prefixed = "\n".join(f"< {line}" for line in text.splitlines())
+    logger.info("%s\n%s", header, prefixed)
+
+
+# ---------------------------------------------------------------------------
+# Player registry
+# ---------------------------------------------------------------------------
+
+def register_player(player_id: str, game_id: str, model: str | None = None) -> "LLMPlayer":
+    """Register an AI player with a specific model. Overwrites any existing registration."""
+    if model is None:
+        model = _OPENROUTER_MODEL if _OPENROUTER_API_KEY else _OLLAMA_MODEL
+    player = LLMPlayer(player_id=player_id, game_id=game_id, model=model)
+    _player_registry[player_id] = player
+    _game_players.setdefault(game_id, [])
+    if player_id not in _game_players[game_id]:
+        _game_players[game_id].append(player_id)
+    logger.info("Registered player %s (game=%s model=%s provider=%s)",
+                player_id, game_id, model, player.provider)
+    return player
+
+
+def get_or_create_player(player_id: str, game_id: str) -> "LLMPlayer":
+    """Return existing player or auto-create with default model (warn if auto-created)."""
+    if player_id not in _player_registry:
+        logger.warning("Player %s not pre-registered — auto-creating with default model", player_id)
+        register_player(player_id, game_id)
+    return _player_registry[player_id]
 
 
 def log_game_token_summary(game_id: str) -> None:
-    """Log final token usage and cost for a completed game. Safe to call multiple times."""
+    """Log per-player token summary for all AI players in a game."""
     if game_id in _game_summary_logged:
         return
     _game_summary_logged.add(game_id)
-    usage = _game_token_usage.get(game_id)
-    if not usage:
-        logger.info("TOKEN SUMMARY game=%s  (no data)", game_id)
+    player_ids = _game_players.get(game_id, [])
+    if not player_ids:
+        logger.info("TOKEN SUMMARY game=%s  (no registered players)", game_id)
         return
+    totals: dict = {"calls": 0, "input": 0, "output": 0}
+    for pid in player_ids:
+        player = _player_registry.get(pid)
+        if player:
+            player.log_token_summary()
+            totals["calls"]  += player.token_usage["calls"]
+            totals["input"]  += player.token_usage["input"]
+            totals["output"] += player.token_usage["output"]
+    logger.info(
+        "TOKEN SUMMARY game=%s | players=%d | total calls=%d in=%d out=%d",
+        game_id, len(player_ids), totals["calls"], totals["input"], totals["output"],
+    )
 
-    if _LLM_PROVIDER == "gemini":
-        in_p, out_p, cac_p, thk_p = _get_gemini_prices()
-        billed_in   = usage["input"]   - usage["cached"]
-        billed_out  = usage["output"]  - usage["thinking"]
-        cost_in     = billed_in        * in_p  / 1_000_000
-        cost_cac    = usage["cached"]  * cac_p / 1_000_000
-        cost_out    = billed_out       * out_p / 1_000_000
-        cost_thk    = usage["thinking"] * thk_p / 1_000_000
-        total_cost  = cost_in + cost_cac + cost_out + cost_thk
-        logger.info(
-            "TOKEN SUMMARY game=%s | model=%s | calls=%d"
-            " | input=%d (billed=%d cached=%d) | output=%d (thinking=%d)"
-            " | cost: input=$%.4f cached=$%.4f output=$%.4f thinking=$%.4f | TOTAL=$%.4f",
-            game_id, _GEMINI_MODEL, usage["calls"],
-            usage["input"], billed_in, usage["cached"],
-            usage["output"], usage["thinking"],
-            cost_in, cost_cac, cost_out, cost_thk, total_cost,
-        )
+
+# ---------------------------------------------------------------------------
+# Startup validation
+# ---------------------------------------------------------------------------
+
+def validate_llm_config() -> None:
+    """Called at server startup. Warns if LLM is enabled but credentials are missing."""
+    if os.getenv("USE_LLM", "false").lower() != "true":
+        return
+    if _OPENROUTER_API_KEY:
+        _ensure_openrouter_client()
+        logger.info("OpenRouter client ready (default model: %s)", _OPENROUTER_MODEL)
     else:
-        logger.info(
-            "TOKEN SUMMARY game=%s | model=%s | calls=%d | input=%d | output=%d",
-            game_id, _OLLAMA_MODEL, usage["calls"], usage["input"], usage["output"],
-        )
+        # Check Ollama reachability
+        try:
+            r = requests.get(f"{_OLLAMA_URL}/api/tags", timeout=5)
+            r.raise_for_status()
+            names = [m["name"] for m in r.json().get("models", [])]
+            if _OLLAMA_MODEL not in names:
+                logger.warning("OLLAMA_MODEL=%r not found in Ollama. Available: %s",
+                               _OLLAMA_MODEL, names)
+            else:
+                logger.info("Ollama model validated: %s", _OLLAMA_MODEL)
+        except Exception as exc:
+            logger.warning("Cannot reach Ollama at %s: %s", _OLLAMA_URL, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -457,423 +982,34 @@ DRAFTING (when research phase offers card selection):
 
 
 # ---------------------------------------------------------------------------
-# Public entry point
+# Public entry points
 # ---------------------------------------------------------------------------
 
-def select_action_llm(state: dict, waiting_for: dict, last_error: str | None = None) -> tuple[dict, dict]:
-    """Return (input_response, debug) using the configured LLM provider."""
-    game_id = state.get("game", {}).get("id", "unknown")
-    wf_type  = waiting_for.get("type", "")
+def select_action_llm(
+    state: dict,
+    waiting_for: dict,
+    game_id: str,
+    player_id: str,
+    last_error: str | None = None,
+) -> tuple[dict, dict]:
+    """Return (input_response, debug) using the registered LLM player."""
+    player = get_or_create_player(player_id, game_id)
+    wf_type = waiting_for.get("type", "")
 
     try:
         if wf_type in SETUP_TYPES:
-            return _select_setup(state, waiting_for, game_id)
+            return _select_setup(state, waiting_for, player)
         else:
-            return _select_action(state, waiting_for, game_id, last_error=last_error)
+            return _select_action(state, waiting_for, player, last_error=last_error)
     except Exception as exc:
-        logger.error("LLM selection failed (game=%s type=%s): %s — using default",
-                     game_id, wf_type, exc, exc_info=True)
+        logger.error("LLM selection failed (player=%s type=%s): %s — using default",
+                     player_id, wf_type, exc, exc_info=True)
         return _default_response(waiting_for), {"llm_error": str(exc)}
 
 
 # ---------------------------------------------------------------------------
-# LLM provider helpers — session-per-game
+# Per-generation strategy update
 # ---------------------------------------------------------------------------
-
-def _ensure_gemini_client() -> None:
-    global _gemini_client
-    if not _GEMINI_API_KEY:
-        raise RuntimeError("GEMINI_API_KEY is not set")
-    if _gemini_client is None:
-        from google import genai
-        _gemini_client = genai.Client(api_key=_GEMINI_API_KEY)
-
-
-def validate_llm_config() -> None:
-    """Called at server startup. Raises RuntimeError if the configured LLM is unreachable or invalid."""
-    if os.getenv("USE_LLM", "false").lower() != "true":
-        return
-    if _LLM_PROVIDER == "gemini":
-        if not _GEMINI_API_KEY:
-            raise RuntimeError("USE_LLM=true with LLM_PROVIDER=gemini but GEMINI_API_KEY is not set")
-        _ensure_gemini_client()
-        try:
-            available = [m.name for m in _gemini_client.models.list()]  # type: ignore[union-attr]
-        except Exception as exc:
-            raise RuntimeError(f"Cannot reach Gemini API: {exc}") from exc
-        # Model names come back as "models/gemini-..." — check both bare and prefixed forms
-        bare = _GEMINI_MODEL.removeprefix("models/")
-        if not any(m.removeprefix("models/") == bare for m in available):
-            flash_models = [m.removeprefix("models/") for m in available if "flash" in m.lower()]
-            raise RuntimeError(
-                f"GEMINI_MODEL={_GEMINI_MODEL!r} is not available via this API key.\n"
-                f"Available flash models: {flash_models}\n"
-                f"All models: {[m.removeprefix('models/') for m in available]}"
-            )
-        logger.info("Gemini model validated: %s", _GEMINI_MODEL)
-    elif _LLM_PROVIDER == "ollama":
-        import requests as _req
-        try:
-            r = _req.get(f"{_OLLAMA_URL}/api/tags", timeout=5)
-            r.raise_for_status()
-            names = [m["name"] for m in r.json().get("models", [])]
-        except Exception as exc:
-            raise RuntimeError(f"Cannot reach Ollama at {_OLLAMA_URL}: {exc}") from exc
-        if _OLLAMA_MODEL not in names:
-            raise RuntimeError(
-                f"OLLAMA_MODEL={_OLLAMA_MODEL!r} not found in Ollama. Available: {names}"
-            )
-
-
-def _log_prompt(header: str, text: str) -> None:
-    prefixed = '\n'.join(f'> {line}' for line in text.splitlines())
-    logger.info("%s\n%s", header, prefixed)
-
-
-def _log_response(header: str, text: str | None) -> None:
-    if text is None:
-        logger.info("%s\n< (empty/None response)", header)
-        return
-    prefixed = '\n'.join(f'< {line}' for line in text.splitlines())
-    logger.info("%s\n%s", header, prefixed)
-
-
-def _call_llm_init(game_id: str, system: str, user: str, think: bool = False) -> str:
-    """Start a new session for game_id and return the first response.
-
-    Sends the full system prompt (TM rules + board context) once. All subsequent
-    calls via _call_llm_continue omit the system and rely on session memory.
-    """
-    _session_base_system[game_id] = system
-    if _LLM_DEBUG:
-        _log_prompt(f"=== INIT system (provider={_LLM_PROVIDER} game={game_id}) ===", system)
-        _log_prompt(f"=== INIT user (game={game_id}) ===", user)
-
-    if _LLM_PROVIDER == "gemini":
-        text = _init_gemini_session(game_id, system, user, think)
-    else:
-        text = _init_ollama_session(game_id, system, user, think)
-
-    if _LLM_DEBUG:
-        _log_response(f"=== INIT response (game={game_id}) ===", text)
-    return text
-
-
-def _call_llm_continue(game_id: str, user: str, max_output_tokens: int | None = None) -> str:
-    """Continue the existing session for game_id (no system re-sent).
-
-    Falls back to a session-recovery call with rules + strategy if the session
-    was lost (e.g. server restart mid-game or 503 exhausted on setup).
-    max_output_tokens caps Gemini response length (Ollama: ignored).
-    """
-    if _LLM_DEBUG:
-        _log_prompt(f"=== CONTINUE user (provider={_LLM_PROVIDER} game={game_id}) ===", user)
-
-    if _LLM_PROVIDER == "gemini":
-        chat = _game_chat_sessions.get(game_id)
-        if chat is None:
-            logger.warning("No Gemini session for game %s — recovering session", game_id)
-            text = _session_recovery(game_id, user)
-        else:
-            text = _continue_gemini_session(game_id, user, chat, max_output_tokens=max_output_tokens)
-    else:
-        session = _game_sessions.get(game_id)
-        if session is None:
-            logger.warning("No Ollama session for game %s — recovering session", game_id)
-            text = _session_recovery(game_id, user)
-        else:
-            text = _continue_ollama_session(game_id, user, session)
-
-    if _LLM_DEBUG:
-        _log_response(f"=== CONTINUE response (game={game_id}) ===", text)
-    return text
-
-
-def _session_recovery(game_id: str, user: str) -> str:
-    """Re-initialise a session when none exists (setup 503 exhausted or server restart).
-
-    Creates a proper chat session as a side-effect so all subsequent turns continue it.
-    """
-    strategy = _game_strategies.get(game_id, "Play a balanced game — maximise TR and card synergies.")
-    system = (
-        TM_RULES + "\n\n"
-        "You are a Terraforming Mars player. Your current strategy:\n"
-        f"{strategy}\n\n"
-        "Pick the single best action. Respond ONLY:\n"
-        "CHOICE: <number>"
-    )
-    logger.info("Session recovery for game %s (strategy: %.80s…)", game_id, strategy)
-    # Initialise a proper session — future turns will use _continue_*
-    if _LLM_PROVIDER == "gemini":
-        return _init_gemini_session(game_id, system, user, think=False)
-    else:
-        return _init_ollama_session(game_id, system, user, think=False)
-
-
-# ---------------------------------------------------------------------------
-# Ollama session management
-# ---------------------------------------------------------------------------
-
-def _init_ollama_session(game_id: str, system: str, user: str, think: bool) -> str:
-    session: list[dict] = [
-        {"role": "system", "content": system},
-        {"role": "user",   "content": user},
-    ]
-    payload: dict = {"model": _OLLAMA_MODEL, "stream": False, "messages": session}
-    if _OLLAMA_MODEL.startswith("qwen3"):
-        payload["think"] = think
-    r = requests.post(f"{_OLLAMA_URL}/api/chat", json=payload, timeout=_OLLAMA_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-    text: str = data["message"]["content"]
-    session.append({"role": "assistant", "content": text})
-    _game_sessions[game_id] = session
-    _accum_tokens(game_id, "init",
-                  data.get("prompt_eval_count", 0),
-                  data.get("eval_count", 0))
-    return text
-
-
-def _continue_ollama_session(game_id: str, user: str, session: list[dict]) -> str:
-    session.append({"role": "user", "content": user})
-    if len(session) > _MAX_SESSION_MESSAGES:
-        _capture_strategy_then_trim(game_id, session)
-    payload: dict = {"model": _OLLAMA_MODEL, "stream": False, "messages": session}
-    if _OLLAMA_MODEL.startswith("qwen3"):
-        payload["think"] = True  # think on every turn (was False — caused shallow choices)
-    r = requests.post(f"{_OLLAMA_URL}/api/chat", json=payload, timeout=_OLLAMA_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-    text: str = data["message"]["content"]
-    session.append({"role": "assistant", "content": text})
-    _accum_tokens(game_id, "continue",
-                  data.get("prompt_eval_count", 0),
-                  data.get("eval_count", 0))
-    return text
-
-
-def _capture_strategy_then_trim(game_id: str, session: list[dict]) -> None:
-    """Ask the model for its current strategy, save it, then rebuild the session."""
-    # Temporarily swap in the strategy-capture request (keep the pending user msg aside)
-    pending_user = session.pop()
-    session.append({
-        "role": "user",
-        "content": (
-            "Before we continue: write out your current strategy in 150-200 words — "
-            "engine type, priority tags, milestone/award targets, pace plan, key watch-outs. "
-            "Include a TABLEAU section listing every card you have played and its key ongoing effect."
-        ),
-    })
-    payload: dict = {"model": _OLLAMA_MODEL, "stream": False, "messages": session}
-    if _OLLAMA_MODEL.startswith("qwen3"):
-        payload["think"] = False
-    try:
-        r = requests.post(f"{_OLLAMA_URL}/api/chat", json=payload, timeout=_OLLAMA_TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
-        strategy = data["message"]["content"].strip()
-        _game_strategies[game_id] = strategy
-        _accum_tokens(game_id, "strategy_capture",
-                      data.get("prompt_eval_count", 0),
-                      data.get("eval_count", 0))
-        logger.info("Captured strategy before Ollama trim (game=%s): %.100s…", game_id, strategy)
-    except Exception as exc:
-        logger.warning("Strategy capture before trim failed (game=%s): %s", game_id, exc)
-
-    # Restore the pending user message and rebuild the trimmed session
-    session.pop()  # remove strategy_request
-    session.append(pending_user)
-
-    strategy = _game_strategies.get(game_id, "")
-    base = _session_base_system.get(game_id, session[0]["content"])
-    system_with_reminder = (
-        base + f"\n\n[CONTEXT TRIM — current strategy:\n{strategy}]" if strategy else base
-    )
-    tail = session[-40:]
-    session.clear()
-    session.append({"role": "system", "content": system_with_reminder})
-    session.extend(tail)
-    logger.info("Ollama session trimmed for game %s — kept last 40 messages + strategy", game_id)
-
-
-# ---------------------------------------------------------------------------
-# Gemini session management
-# ---------------------------------------------------------------------------
-
-_GEMINI_RETRY_ATTEMPTS = 3
-_GEMINI_RETRY_DELAY    = 5  # seconds for 503 back-off (doubles: 5, 10)
-
-# Token cap for action-turn responses — keeps context history from growing unboundedly.
-# Strategy updates and setup phases are left uncapped (they need full reasoning).
-_GEMINI_ACTION_MAX_OUTPUT_TOKENS: int = int(os.getenv("GEMINI_ACTION_MAX_OUTPUT_TOKENS", "350"))
-
-# Trim Gemini chat history when the session exceeds this many turns (user+model pairs).
-# At ~1938 tokens/turn of context growth, 80 turns ≈ 155K tokens of history per call —
-# a safe headroom under the 1M/min quota with two concurrent players.
-_MAX_GEMINI_TURNS: int = int(os.getenv("GEMINI_MAX_TURNS", "80"))
-
-# Per-game turn counter for Gemini sessions (for history trimming)
-_gemini_turn_count: dict[str, int] = {}
-
-
-def _is_transient_gemini_error(exc: Exception) -> bool:
-    msg = str(exc).lower()
-    return any(k in msg for k in ("503", "unavailable", "429", "rate limit", "overloaded", "resource exhausted"))
-
-
-def _parse_api_retry_delay(exc: Exception) -> float | None:
-    """Extract retryDelay seconds from a Google API error response, or return None."""
-    m = re.search(r"retryDelay.*?(\d+\.?\d*)s", str(exc))
-    return float(m.group(1)) if m else None
-
-
-def _gemini_with_retry(fn):
-    """Call fn() with back-off on transient Gemini errors.
-
-    429 quota errors: waits the exact retryDelay from the API response (+ 2s buffer) so
-    the minute-window quota resets before retrying. This avoids the old 5s/10s pattern
-    which retried inside the same quota window and tripled token consumption per failure.
-    503/overloaded: standard exponential back-off (5s, 10s).
-    """
-    last_exc: Exception | None = None
-    for attempt in range(_GEMINI_RETRY_ATTEMPTS):
-        try:
-            return fn()
-        except Exception as exc:
-            if attempt < _GEMINI_RETRY_ATTEMPTS - 1 and _is_transient_gemini_error(exc):
-                msg = str(exc)
-                if "429" in msg or "resource exhausted" in msg.lower():
-                    api_delay = _parse_api_retry_delay(exc)
-                    wait = (api_delay + 2.0) if api_delay else 62.0  # default: full minute + buffer
-                    logger.warning(
-                        "Gemini 429 quota (attempt %d/%d) — waiting %.0fs (API retryDelay=%.0fs)",
-                        attempt + 1, _GEMINI_RETRY_ATTEMPTS, wait, api_delay or 0,
-                    )
-                else:
-                    wait = _GEMINI_RETRY_DELAY * (2 ** attempt)
-                    logger.warning(
-                        "Gemini transient error (attempt %d/%d): %s — retrying in %ds",
-                        attempt + 1, _GEMINI_RETRY_ATTEMPTS, exc, int(wait),
-                    )
-                time.sleep(wait)
-                last_exc = exc
-            else:
-                raise
-    raise last_exc  # type: ignore[misc]
-
-
-def _create_gemini_cache(system: str) -> str | None:
-    """Create a Gemini context cache for `system`. Returns cache name or None on failure."""
-    from google.genai import types
-    try:
-        cache = _gemini_client.caches.create(  # type: ignore[union-attr]
-            model=_GEMINI_MODEL,
-            config=types.CreateCachedContentConfig(
-                system_instruction=system,
-                ttl="3600s",
-            ),
-        )
-        logger.info("Created Gemini context cache: %s", cache.name)
-        return cache.name
-    except Exception as exc:
-        logger.warning("Gemini cache creation failed (falling back to inline system): %s", exc)
-        return None
-
-
-def _maybe_refresh_gemini_cache(game_id: str) -> None:
-    """Refresh the cache TTL after 50 min; rebuild chat without cache if refresh fails."""
-    info = _game_cache_info.get(game_id)
-    if not info or time.time() - info["created_at"] < _CACHE_REFRESH_AFTER:
-        return
-    from google.genai import types
-    try:
-        _gemini_client.caches.update(  # type: ignore[union-attr]
-            name=info["name"],
-            config=types.UpdateCachedContentConfig(ttl="3600s"),
-        )
-        info["created_at"] = time.time()
-        logger.info("Refreshed Gemini cache TTL for game %s", game_id)
-    except Exception as exc:
-        logger.warning("Gemini cache TTL refresh failed (game=%s): %s — rebuilding chat without cache", game_id, exc)
-        _rebuild_gemini_chat_without_cache(game_id, info["system"])
-        del _game_cache_info[game_id]
-
-
-def _rebuild_gemini_chat_without_cache(game_id: str, system: str) -> None:
-    """Reconstruct the chat session using inline system_instruction after cache expiry."""
-    from google.genai import types
-    old_chat = _game_chat_sessions.get(game_id)
-    history = old_chat.get_history() if old_chat else []  # type: ignore[attr-defined]
-    chat = _gemini_client.chats.create(  # type: ignore[union-attr]
-        model=_GEMINI_MODEL,
-        config=types.GenerateContentConfig(
-            system_instruction=system,
-            thinking_config=types.ThinkingConfig(thinking_budget=_GEMINI_THINKING_BUDGET),
-        ),
-        history=history,
-    )
-    _game_chat_sessions[game_id] = chat
-    logger.info("Rebuilt Gemini chat without cache for game %s (cache expired)", game_id)
-
-
-def _init_gemini_session(game_id: str, system: str, user: str, think: bool) -> str:
-    """Setup via generate_content (supports think=True), then create Chat with history."""
-    _ensure_gemini_client()
-    from google.genai import types
-
-    thinking_budget = 1024 if think else 0
-
-    # Attempt to create a context cache for the system prompt (saves per-turn token cost).
-    # Include a hash of the system in the display name so stale caches are detectable.
-    sys_hash = hashlib.sha256(system.encode()).hexdigest()[:12]
-    cache_name = _create_gemini_cache(system)
-    if cache_name:
-        _game_cache_info[game_id] = {"name": cache_name, "created_at": time.time(), "system": system}
-        logger.debug("Using cached content %s for game %s (hash=%s)", cache_name, game_id, sys_hash)
-        init_config = types.GenerateContentConfig(
-            cached_content=cache_name,
-            thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget),
-        )
-        chat_config = types.GenerateContentConfig(
-            cached_content=cache_name,
-            thinking_config=types.ThinkingConfig(thinking_budget=_GEMINI_THINKING_BUDGET),
-        )
-    else:
-        init_config = types.GenerateContentConfig(
-            system_instruction=system,
-            thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget),
-        )
-        chat_config = types.GenerateContentConfig(
-            system_instruction=system,
-            thinking_config=types.ThinkingConfig(thinking_budget=_GEMINI_THINKING_BUDGET),
-        )
-
-    def _call_init():
-        return _gemini_client.models.generate_content(  # type: ignore[union-attr]
-            model=_GEMINI_MODEL,
-            contents=user,
-            config=init_config,
-        )
-
-    response = _gemini_with_retry(_call_init)
-    text: str = response.text
-    in_tok, out_tok, cac_tok, thk_tok = _extract_gemini_usage(response)
-    _accum_tokens(game_id, "init", in_tok, out_tok, cac_tok, thk_tok)
-
-    # Create chat with the setup exchange as initial history.
-    # Action calls use _GEMINI_THINKING_BUDGET (default 1024) — think on every turn.
-    history = [
-        types.Content(role="user",  parts=[types.Part.from_text(text=user)]),
-        types.Content(role="model", parts=[types.Part.from_text(text=text)]),
-    ]
-    chat = _gemini_client.chats.create(  # type: ignore[union-attr]
-        model=_GEMINI_MODEL,
-        config=chat_config,
-        history=history,
-    )
-    _game_chat_sessions[game_id] = chat
-    return text
-
 
 _PER_GEN_STRATEGY_PROMPT = (
     "=== End of Generation {prev_gen}, start of Generation {gen} ===\n"
@@ -914,21 +1050,13 @@ _PER_GEN_STRATEGY_PROMPT = (
 )
 
 
-def _per_generation_strategy_update(game_id: str, chat: object, generation: int, state: dict) -> None:
-    """Ask the LLM to restate its strategy at each generation boundary.
-
-    The response becomes natural chat history (no destructive rebuild) and is stored in
-    _game_strategies for debugging + session recovery. Replaces the old _trim_gemini_session,
-    which re-injected stale strategy via a fake user/model pair at chat[0] and caused the
-    model to paraphrase that stale anchor every subsequent generation.
-    """
+def _per_generation_strategy_update(player: LLMPlayer, generation: int, state: dict) -> None:
     g = state.get("game", {})
     p = state.get("player", {})
-
-    # Warn about any already-maxed global parameters so the AI doesn't waste actions.
-    temp = g.get("temperature", -30)
+    temp   = g.get("temperature", -30)
     oxygen = g.get("oxygen", 0)
     oceans = g.get("oceanCount", 0)
+
     maxed_warnings: list[str] = []
     if temp >= 8:
         maxed_warnings.append("temperature is at maximum (8°C) — DO NOT use Convert Heat")
@@ -938,10 +1066,9 @@ def _per_generation_strategy_update(game_id: str, chat: object, generation: int,
         maxed_warnings.append("all 9 oceans are placed")
     global_status = ("⚠ Global parameters: " + "; ".join(maxed_warnings) + "\n") if maxed_warnings else ""
 
-    # Inform the AI of its production income for this generation so it can plan accurately.
     prod = p.get("production", {})
-    mc_prod = prod.get("megacredits", 0)
-    tr = p.get("terraformRating", 20)
+    mc_prod  = prod.get("megacredits", 0)
+    tr       = p.get("terraformRating", 20)
     mc_income = tr + mc_prod
     income_parts = [f"MC:{mc_income} (TR:{tr} + prod:{mc_prod:+d})"]
     for res_label, key in [("steel", "steel"), ("titanium", "titanium"),
@@ -951,8 +1078,7 @@ def _per_generation_strategy_update(game_id: str, chat: object, generation: int,
             income_parts.append(f"{res_label}:{v}")
     income_note = "Your production income this generation: " + ", ".join(income_parts) + "\n"
 
-    # Alert on immediately actionable stockpiles (≥8 ready to convert right now).
-    current_heat = p.get("heat", 0)
+    current_heat   = p.get("heat", 0)
     current_plants = p.get("plants", 0)
     if current_heat >= 8 and temp < 8:
         income_note += (
@@ -972,137 +1098,44 @@ def _per_generation_strategy_update(game_id: str, chat: object, generation: int,
         income_note=income_note,
     )
     if _LLM_DEBUG:
-        _log_prompt(f"=== PER-GEN STRATEGY UPDATE (game={game_id} gen={generation}) ===", prompt)
+        _log_prompt(f"=== PER-GEN STRATEGY UPDATE (player={player.player_id} gen={generation}) ===", prompt)
     try:
-        response = _gemini_with_retry(lambda: chat.send_message(prompt))  # type: ignore[attr-defined]
-        in_tok, out_tok, cac_tok, thk_tok = _extract_gemini_usage(response)
-        _accum_tokens(game_id, f"strategy_gen{generation}", in_tok, out_tok, cac_tok, thk_tok)
-        strategy = response.text.strip()
-        _game_strategies[game_id] = strategy
-        logger.info("Per-gen strategy update (game=%s gen=%d):\n%s", game_id, generation, strategy)
+        strategy = player.continue_session(prompt)
+        player.strategy = strategy.strip()
+        logger.info("Per-gen strategy update (player=%s gen=%d):\n%s",
+                    player.player_id, generation, player.strategy)
         if _LLM_DEBUG:
-            _log_response(f"=== PER-GEN STRATEGY UPDATE response (game={game_id} gen={generation}) ===", strategy)
+            _log_response(f"=== PER-GEN STRATEGY response (player={player.player_id} gen={generation}) ===",
+                          player.strategy)
     except Exception as exc:
-        logger.warning("Per-gen strategy update failed (game=%s gen=%d): %s", game_id, generation, exc)
+        logger.warning("Per-gen strategy update failed (player=%s gen=%d): %s",
+                       player.player_id, generation, exc)
 
 
-def _maybe_per_generation_update(game_id: str, generation: int, state: dict) -> None:
-    """When generation number increases, run a per-generation strategy update.
-
-    Fires at the first action call of generation N+1. The Gemini chat retains full history
-    (1M-token context window — no trim needed for a typical 15-gen game).
-    """
-    last_gen = _gemini_last_generation.get(game_id)
-    if last_gen is not None and generation > last_gen:
-        chat = _game_chat_sessions.get(game_id)
-        if chat is not None:
-            logger.info("Generation bump %d→%d for game %s — running strategy update",
-                        last_gen, generation, game_id)
-            _per_generation_strategy_update(game_id, chat, generation, state)
-    _gemini_last_generation[game_id] = generation
-
-
-def _trim_gemini_session(game_id: str) -> None:
-    """Trim old Gemini chat history to prevent unbounded context growth.
-
-    Keeps the strategy (from _game_strategies) plus the last 40 message pairs
-    (20 user + 20 model) so the per-request token count stays bounded regardless
-    of game length. The per-gen strategy updates ensure recent intent is preserved.
-    """
-    from google.genai import types
-    chat = _game_chat_sessions.get(game_id)
-    if chat is None:
-        return
-    history: list = chat.get_history()  # type: ignore[attr-defined]
-    keep = 40  # user+model messages to retain
-    if len(history) <= keep:
-        return
-
-    strategy = _game_strategies.get(game_id, "Play a balanced game — maximise TR and card synergies.")
-    cache_info = _game_cache_info.get(game_id)
-    system = cache_info["system"] if cache_info else _session_base_system.get(game_id, TM_RULES)
-
-    # Inject strategy as the first kept message pair (synthetic, not sent to API)
-    strategy_summary = f"[Session trimmed to last {keep//2} turns. Your current strategy: {strategy}]"
-    trimmed_history = [
-        types.Content(role="user",  parts=[types.Part(text=strategy_summary)]),
-        types.Content(role="model", parts=[types.Part(text="Understood. Continuing.")]),
-    ] + history[-keep:]
-
-    if cache_info:
-        new_chat = _gemini_client.chats.create(  # type: ignore[union-attr]
-            model=_GEMINI_MODEL,
-            config=types.GenerateContentConfig(
-                cached_content=cache_info["name"],
-                thinking_config=types.ThinkingConfig(thinking_budget=_GEMINI_THINKING_BUDGET),
-            ),
-            history=trimmed_history,
-        )
-    else:
-        new_chat = _gemini_client.chats.create(  # type: ignore[union-attr]
-            model=_GEMINI_MODEL,
-            config=types.GenerateContentConfig(
-                system_instruction=system,
-                thinking_config=types.ThinkingConfig(thinking_budget=_GEMINI_THINKING_BUDGET),
-            ),
-            history=trimmed_history,
-        )
-    _game_chat_sessions[game_id] = new_chat
-    _gemini_turn_count[game_id] = 0
-    logger.info("Trimmed Gemini session for game %s — kept last %d messages", game_id, keep)
-
-
-def _continue_gemini_session(game_id: str, user: str, chat: object,
-                              max_output_tokens: int | None = None) -> str:
-    _maybe_refresh_gemini_cache(game_id)
-    # Re-fetch chat: _maybe_refresh_gemini_cache may have rebuilt it into _game_chat_sessions.
-    # Using the stale reference causes a 403 because the old chat object still references
-    # the expired cache.
-    chat = _game_chat_sessions.get(game_id) or chat
-
-    # Trim history if session has grown too long (prevents unbounded input token growth).
-    turn = _gemini_turn_count.get(game_id, 0)
-    if turn >= _MAX_GEMINI_TURNS:
-        _trim_gemini_session(game_id)
-        chat = _game_chat_sessions.get(game_id) or chat
-    _gemini_turn_count[game_id] = turn + 1
-
-    if max_output_tokens:
-        from google.genai import types
-        cfg = types.GenerateContentConfig(max_output_tokens=max_output_tokens)
-        response = _gemini_with_retry(lambda: chat.send_message(user, config=cfg))  # type: ignore[attr-defined]
-    else:
-        response = _gemini_with_retry(lambda: chat.send_message(user))  # type: ignore[attr-defined]
-    in_tok, out_tok, cac_tok, thk_tok = _extract_gemini_usage(response)
-    _accum_tokens(game_id, "continue", in_tok, out_tok, cac_tok, thk_tok)
-    text: str | None = response.text
-    if not text:
-        logger.warning("Gemini returned empty/None text for game %s", game_id)
-        return ""
-    return text
+def _maybe_per_generation_update(player: LLMPlayer, generation: int, state: dict) -> None:
+    if player.last_generation >= 0 and generation > player.last_generation:
+        logger.info("Generation bump %d→%d for player %s — running strategy update",
+                    player.last_generation, generation, player.player_id)
+        _per_generation_strategy_update(player, generation, state)
+    player.last_generation = generation
 
 
 # ---------------------------------------------------------------------------
 # Setup phase (initialCards / prelude)
 # ---------------------------------------------------------------------------
 
-def _select_setup(state: dict, waiting_for: dict, game_id: str) -> tuple[dict, dict]:
+def _select_setup(state: dict, waiting_for: dict, player: LLMPlayer) -> tuple[dict, dict]:
     g = state.get("game", {})
     wf_type = waiting_for.get("type", "")
-    has_session = game_id in (
-        _game_chat_sessions if _LLM_PROVIDER == "gemini" else _game_sessions
-    )
+    has_session = bool(player.session)
 
-    logger.info("LLM setup call (game=%s type=%s board=%s exps=%s session=%s)",
-                game_id, wf_type, g.get("boardName", "?"), g.get("expansions", []), has_session)
+    logger.info("LLM setup call (player=%s type=%s board=%s exps=%s session=%s)",
+                player.player_id, wf_type, g.get("boardName", "?"), g.get("expansions", []), has_session)
 
-    user = _build_setup_prompt(state, waiting_for, game_id)
+    user = _build_setup_prompt(state, waiting_for)
 
     if wf_type == "initialCards" or not has_session:
-        # First call of the game: send full system prompt and start a new session.
-        # format_config_context includes board, expansions, variants, AND the actual
-        # milestones/awards for this specific game (even if randomised).
-        game_ctx = format_config_context(g)
+        game_ctx  = format_config_context(g)
         board_spaces = state.get("boardSpaces") or []
         board_layout = format_board_layout(board_spaces)
         system = (
@@ -1118,26 +1151,24 @@ def _select_setup(state: dict, waiting_for: dict, game_id: str) -> tuple[dict, d
             "Your strategy should always include a TABLEAU section listing what you have in play. "
             "Follow the EXACT output format requested — no extra text before or after."
         )
-        text = _call_llm_init(game_id, system, user, think=True)
+        text = player.init_session(system, user, think=True)
     else:
-        # Prelude comes after initialCards in the same game — continue the session.
-        text = _call_llm_continue(game_id, user)
+        text = player.continue_session(user)
 
-    logger.info("Setup LLM response (game=%s):\n%s", game_id, text[:1000])
+    logger.info("Setup LLM response (player=%s):\n%s", player.player_id, text[:1000])
 
-    input_response, strategy = _parse_setup_response(text, waiting_for, game_id)
-    _game_strategies[game_id] = strategy
-    logger.info("Game %s strategy stored:\n%s", game_id, strategy)
+    input_response, strategy = _parse_setup_response(text, waiting_for, player)
+    player.strategy = strategy
+    logger.info("Player %s strategy stored:\n%s", player.player_id, strategy)
     return input_response, {"llm_phase": "setup", "strategy": strategy[:300]}
 
 
-def _build_setup_prompt(state: dict, waiting_for: dict, game_id: str) -> str:
+def _build_setup_prompt(state: dict, waiting_for: dict) -> str:
     wf_type = waiting_for.get("type", "")
     options = waiting_for.get("options", [])
     lines: list[str] = []
 
     if wf_type == "initialCards":
-        # Identify sub-options by title
         corp_opt    = _find_option(options, ("corporation",))
         prelude_opt = _find_option(options, ("prelude",))
         ceo_opt     = _find_option(options, ("ceo",))
@@ -1256,7 +1287,7 @@ def _find_option(options: list, keywords: tuple) -> dict | None:
 
 
 def _parse_setup_response(
-    text: str, waiting_for: dict, game_id: str
+    text: str, waiting_for: dict, player: LLMPlayer
 ) -> tuple[dict, str]:
     wf_type = waiting_for.get("type", "")
     options = waiting_for.get("options", [])
@@ -1270,7 +1301,6 @@ def _parse_setup_response(
         corps   = [c.get("name","") for c in (corp_opt or {}).get("cards", [])]
         buyable = [c.get("name","") for c in (project_opt or {}).get("cards", [])]
 
-        # --- Parse CORPORATION ---
         chosen_corp = corps[0] if corps else ""
         m = re.search(r"CORPORATION:\s*(.+)", text)
         if m:
@@ -1280,7 +1310,6 @@ def _parse_setup_response(
                     chosen_corp = c
                     break
 
-        # --- Parse BUY_CARDS ---
         bought: list[str] = []
         m = re.search(r"BUY_CARDS:\s*(.+?)(?:\nPRELUDE|\nCEO|\nSTRATEGY|\Z)",
                       text, re.DOTALL | re.IGNORECASE)
@@ -1297,7 +1326,6 @@ def _parse_setup_response(
                                 bought.append(b)
                             break
 
-        # --- Parse PRELUDE_CARDS ---
         prelude_chosen: list[str] = []
         if prelude_opt:
             preludes = [c.get("name","") for c in prelude_opt.get("cards", [])]
@@ -1311,11 +1339,9 @@ def _parse_setup_response(
                             if p not in prelude_chosen:
                                 prelude_chosen.append(p)
                             break
-            # Fallback: first 2
             if len(prelude_chosen) < 2:
                 prelude_chosen = preludes[:2]
 
-        # --- Parse CEO_CARD ---
         ceo_chosen: str = ""
         if ceo_opt:
             ceos = [c.get("name","") for c in ceo_opt.get("cards", [])]
@@ -1330,14 +1356,12 @@ def _parse_setup_response(
             if not ceo_chosen and ceos:
                 ceo_chosen = ceos[0]
 
-        # --- Parse STRATEGY ---
         m4 = re.search(r"STRATEGY:\s*(.*)", text, re.DOTALL)
         strategy = m4.group(1).strip() if m4 else text.strip()
 
         logger.info("Setup parsed: corp=%r buy=%r prelude=%r ceo=%r",
                     chosen_corp, bought, prelude_chosen, ceo_chosen)
 
-        # Build exactly len(options) responses, one per sub-option
         responses = []
         for opt in options:
             t = _node_title(opt, 0).lower()
@@ -1359,7 +1383,7 @@ def _parse_setup_response(
         idx = int(m.group(1)) - 1 if m else 0
         idx = max(0, min(idx, len(options) - 1))
         m2 = re.search(r"STRATEGY_UPDATE:\s*(.*)", text, re.DOTALL)
-        old = _game_strategies.get(game_id, "Play balanced.")
+        old = player.strategy or "Play balanced."
         strategy = old
         if m2:
             upd = m2.group(1).strip()
@@ -1374,37 +1398,35 @@ def _parse_setup_response(
 # Action phase
 # ---------------------------------------------------------------------------
 
-def _select_action(state: dict, waiting_for: dict, game_id: str, last_error: str | None = None) -> tuple[dict, dict]:
+def _select_action(
+    state: dict, waiting_for: dict, player: LLMPlayer, last_error: str | None = None
+) -> tuple[dict, dict]:
     options = flatten_options(waiting_for)
     if not options:
         return _default_response(waiting_for), {}
 
-    # At each generation boundary, ask the Gemini session to restate its strategy.
-    if _LLM_PROVIDER == "gemini":
-        generation = state.get("game", {}).get("generation", 1)
-        _maybe_per_generation_update(game_id, generation, state)
+    generation = state.get("game", {}).get("generation", 1)
+    _maybe_per_generation_update(player, generation, state)
 
-    user = _build_action_prompt(state, waiting_for, options, last_error=last_error, game_id=game_id)
-    # Append a brevity instruction so the model doesn't produce multi-paragraph reasoning
-    # that accumulates in the chat history and inflates future input-token counts.
+    user = _build_action_prompt(state, waiting_for, options, last_error=last_error, player=player)
     user += (
         "\n\nBefore choosing, check: does this action advance my engine, milestone/award targets, and pace plan?"
         " 1-2 sentences explaining how your choice fits your strategy, then CHOICE: N on its own line. No text after CHOICE."
     )
-    logger.debug("LLM action (game=%s type=%s options=%d)",
-                 game_id, waiting_for.get("type"), len(options))
-    text = _call_llm_continue(game_id, user,
-                              max_output_tokens=_GEMINI_ACTION_MAX_OUTPUT_TOKENS if _LLM_PROVIDER == "gemini" else None)
-    logger.debug("Action response (game=%s): %s", game_id, text[:300])
+    logger.debug("LLM action (player=%s type=%s options=%d)",
+                 player.player_id, waiting_for.get("type"), len(options))
+    text = player.continue_session(user, max_output_tokens=_OPENROUTER_MAX_OUTPUT_TOKENS
+                                   if player.provider == "openrouter" else None)
+    logger.debug("Action response (player=%s): %s", player.player_id, text[:300])
 
-    result = _parse_action_response(text, options, waiting_for, game_id, player=state.get("player"))
+    result = _parse_action_response(text, options, waiting_for, player.player_id,
+                                    player=state.get("player"))
 
-    # Auto-log the token summary when all global parameters are maxed (end of game).
     g = state.get("game", {})
     if (g.get("temperature", -30) >= 8
             and g.get("oxygen", 0) >= 14
             and g.get("oceanCount", 0) >= 9):
-        log_game_token_summary(game_id)
+        log_game_token_summary(player.game_id)
 
     return result
 
@@ -1436,10 +1458,8 @@ _TRAINER_SYSTEM_SUFFIX = (
 
 
 def _build_trainer_system(state: dict) -> str:
-    """Build the trainer system prompt: TM rules + game config + board + coaching persona."""
-    from .game_knowledge import format_config_context, format_board_layout
     g = state.get("game", {})
-    game_ctx = format_config_context(g)
+    game_ctx    = format_config_context(g)
     board_layout = format_board_layout(state.get("boardSpaces") or [])
     system = (
         TM_RULES + "\n\n" + game_ctx + "\n\n"
@@ -1448,16 +1468,23 @@ def _build_trainer_system(state: dict) -> str:
     return system + _TRAINER_SYSTEM_SUFFIX
 
 
+def _get_trainer_player(game_id: str, player_id: str, state: dict) -> LLMPlayer:
+    """Return (or create) the trainer session for a given player."""
+    trainer_id = f"trainer:{player_id}"
+    if trainer_id not in _player_registry:
+        base = _player_registry.get(player_id)
+        model = base.model if base else (_OPENROUTER_MODEL if _OPENROUTER_API_KEY else _OLLAMA_MODEL)
+        register_player(trainer_id, game_id, model)
+    return _player_registry[trainer_id]
+
+
 def _select_setup_advise(
     state: dict,
     waiting_for: dict,
-    trainer_game_id: str,
+    trainer: LLMPlayer,
     user_question: str | None,
 ) -> tuple[str, dict]:
-    """Coach a human through initialCards / prelude. Reuses the setup prompt builder."""
-    game_id_part = trainer_game_id.split(":", 2)[1] if trainer_game_id.startswith("trainer:") else trainer_game_id
-    setup_prompt = _build_setup_prompt(state, waiting_for, game_id_part)
-
+    setup_prompt = _build_setup_prompt(state, waiting_for)
     prompt_lines = [
         setup_prompt,
         "",
@@ -1470,24 +1497,22 @@ def _select_setup_advise(
         prompt_lines.append(f'\nUser\'s question: "{user_question}"')
     user = "\n".join(prompt_lines)
 
-    has_session = trainer_game_id in (
-        _game_chat_sessions if _LLM_PROVIDER == "gemini" else _game_sessions
-    )
-    if not has_session:
+    if not trainer.session:
         system = _build_trainer_system(state)
-        text = _call_llm_init(trainer_game_id, system, user, think=True)
+        text = trainer.init_session(system, user, think=True)
     else:
-        text = _call_llm_continue(trainer_game_id, user)
+        text = trainer.continue_session(user)
 
     rec_match = re.search(r"<recommendation>(.*?)</recommendation>", text, re.DOTALL | re.IGNORECASE)
     if rec_match:
-        rec_text = rec_match.group(1).strip()
+        rec_text   = rec_match.group(1).strip()
         advice_text = (text[:rec_match.start()] + text[rec_match.end():]).strip()
     else:
-        rec_text = text
+        rec_text   = text
         advice_text = text
 
-    recommendation, _ = _parse_setup_response(rec_text, waiting_for, game_id_part)
+    # Use a dummy player for the strategy store in _parse_setup_response
+    recommendation, _ = _parse_setup_response(rec_text, waiting_for, trainer)
     return advice_text or "(no advice text)", recommendation
 
 
@@ -1498,33 +1523,21 @@ def select_action_advise(
     player_id: str,
     user_question: str | None = None,
 ) -> tuple[str, dict]:
-    """Return (advice_text, recommendation_input_response) for the AI Trainer feature.
-
-    Each player gets an isolated session via the namespace 'trainer:<game_id>:<player_id>'
-    so the LLM never confuses the two players' tableaux or strategies.
-
-    Supports both setup phases (initialCards / prelude) and action turns.
-    """
+    """Return (advice_text, recommendation_input_response) for the AI Trainer feature."""
     wf_type = waiting_for.get("type", "")
-    trainer_game_id = f"trainer:{game_id}:{player_id}"
+    trainer = _get_trainer_player(game_id, player_id, state)
 
-    # ------------------------------------------------------------------
-    # Setup-phase coaching (initialCards / prelude) — the action-options
-    # flattener returns nothing for these, so they had no advice path before.
-    # ------------------------------------------------------------------
     if wf_type in SETUP_TYPES:
-        return _select_setup_advise(state, waiting_for, trainer_game_id, user_question)
+        return _select_setup_advise(state, waiting_for, trainer, user_question)
 
     options = flatten_options(waiting_for)
     if not options:
         return ("No actions available.", _default_response(waiting_for))
 
-    if _LLM_PROVIDER == "gemini":
-        generation = state.get("game", {}).get("generation", 1)
-        _maybe_per_generation_update(trainer_game_id, generation, state)
+    generation = state.get("game", {}).get("generation", 1)
+    _maybe_per_generation_update(trainer, generation, state)
 
-    prompt_lines: list[str] = []
-    prompt_lines.append(_build_action_prompt(state, waiting_for, options))
+    prompt_lines: list[str] = [_build_action_prompt(state, waiting_for, options)]
     if user_question:
         prompt_lines.append(f"\nUser's question: \"{user_question}\"")
     prompt_lines += [
@@ -1537,32 +1550,29 @@ def select_action_advise(
     ]
     user = "\n".join(prompt_lines)
 
-    # Use or initialise a per-player trainer session
-    if trainer_game_id not in (_game_chat_sessions if _LLM_PROVIDER == "gemini" else _game_sessions):
+    if not trainer.session:
         system = _build_trainer_system(state)
-        text = _call_llm_init(trainer_game_id, system, user, think=True)
+        text = trainer.init_session(system, user, think=True)
     else:
-        text = _call_llm_continue(trainer_game_id, user)
+        text = trainer.continue_session(user)
 
-    # Extract <recommendation>...</recommendation> block
     rec_match = re.search(r"<recommendation>(.*?)</recommendation>", text, re.DOTALL | re.IGNORECASE)
     if rec_match:
-        rec_text = rec_match.group(1).strip()
+        rec_text   = rec_match.group(1).strip()
         advice_text = text[:rec_match.start()].strip()
         if not advice_text:
             advice_text = text[rec_match.end():].strip()
     else:
-        rec_text = text
+        rec_text   = text
         advice_text = text
 
-    # Parse the recommendation using the same logic as action responses
     m = re.search(r"CHOICE:\s*(\d+)", rec_text)
     chosen = int(m.group(1)) - 1 if m else 0
     chosen = max(0, min(chosen, len(options) - 1))
     recommendation = index_to_response(waiting_for, options[chosen]["index"])
 
-    wf_type = waiting_for.get("type", "")
-    if wf_type in ("projectCard", "payment"):
+    wf_type2 = waiting_for.get("type", "")
+    if wf_type2 in ("projectCard", "payment"):
         payment = _parse_payment_line(rec_text)
         if payment:
             payment = _correct_payment(payment, waiting_for, state.get("player", {}))
@@ -1571,14 +1581,16 @@ def select_action_advise(
     return advice_text, recommendation
 
 
-# Payment resource values (MC equivalent per unit)
+# ---------------------------------------------------------------------------
+# Payment helpers
+# ---------------------------------------------------------------------------
+
 _PAYMENT_VALUES = {
     "steel": 2, "titanium": 3, "heat": 1, "plants": 3,
     "microbes": 2, "floaters": 3, "seeds": 5, "graphene": 4,
     "lunaArchivesScience": 1, "kuiperAsteroids": 1, "auroraiData": 3, "spireScience": 2,
 }
 
-# Mapping from prompt keyword to Payment field name
 _PAYMENT_KEYS = {
     "MC": "megacredits", "MEGACREDITS": "megacredits",
     "STEEL": "steel", "TITANIUM": "titanium", "HEAT": "heat", "PLANTS": "plants",
@@ -1589,6 +1601,7 @@ _PAYMENT_KEYS = {
     "AURORAIDATA": "auroraiData", "SPIRE": "spireScience", "SPIRESCIENCE": "spireScience",
 }
 
+
 def _empty_payment() -> dict:
     return {
         "megacredits": 0, "steel": 0, "titanium": 0, "heat": 0, "plants": 0,
@@ -1598,7 +1611,6 @@ def _empty_payment() -> dict:
 
 
 def _parse_payment_line(text: str) -> dict | None:
-    """Parse PAYMENT: MC=5, STEEL=2, TITANIUM=3 into a full Payment dict, or None if absent."""
     m = re.search(r"PAYMENT:\s*(.+?)(?:\n|$)", text, re.IGNORECASE)
     if not m:
         return None
@@ -1606,225 +1618,118 @@ def _parse_payment_line(text: str) -> dict | None:
     if not parts:
         return None
     payment = _empty_payment()
-    for k, v in parts:
-        field = _PAYMENT_KEYS.get(k.upper())
-        if field:
-            payment[field] = int(v)
+    for key, val in parts:
+        field = _PAYMENT_KEYS.get(key.upper())
+        if field and field in payment:
+            payment[field] = int(val)
     return payment
 
 
 def _correct_payment(payment: dict, waiting_for: dict, player: dict) -> dict:
-    """Clamp payment to available resources and ensure it covers the required cost.
-
-    Prevents "You do not have that many resources to spend" rejections by validating
-    the AI-specified payment before submitting it. If the payment exceeds available
-    resources, each component is clamped to what the player actually has, and MC is
-    topped up to cover any resulting shortfall.
-
-    Returns the corrected payment dict. Logs a warning if a correction was needed.
-    """
+    """Clamp payment fields to available resources and ensure the total covers the cost."""
     wf_type = waiting_for.get("type", "")
-    po = waiting_for.get("paymentOptions") or {}
+    payment = dict(payment)
 
-    # Required cost
-    if wf_type == "projectCard":
-        cost = waiting_for.get("card", {}).get("calculatedCost", 0) if isinstance(waiting_for.get("card"), dict) else 0
-        # Fallback: look inside the options list for calculatedCost
-        if not cost:
-            for opt in (waiting_for.get("options") or []):
-                c = opt.get("calculatedCost") or opt.get("card", {}).get("calculatedCost", 0)
-                if c:
-                    cost = c
-                    break
-    elif wf_type == "payment":
-        cost = waiting_for.get("amount", 0)
-    else:
-        return payment
+    mc_avail = player.get("megacredits", 0)
+    st_avail = player.get("steel",      0)
+    ti_avail = player.get("titanium",   0)
+    ht_avail = player.get("heat",       0)
+    pl_avail = player.get("plants",     0)
 
-    # Available player resources
-    avail: dict[str, int] = {
-        "megacredits": player.get("megacredits", 0),
-        "steel":       player.get("steel", 0)       if wf_type == "projectCard" else 0,
-        "titanium":    player.get("titanium", 0)     if wf_type == "projectCard" else 0,
-        "heat":        player.get("heat", 0)         if po.get("heat") else 0,
-        "plants":      player.get("plants", 0)       if po.get("plants") else 0,
-    }
-    for k in ("microbes", "floaters", "seeds", "graphene",
-              "lunaArchivesScience", "kuiperAsteroids", "auroraiData", "spireScience"):
-        avail[k] = waiting_for.get(k) or 0  # special resources tracked in waitingFor
+    # Only allow steel/titanium for project card payments
+    is_project = wf_type == "projectCard"
+    if not is_project:
+        payment["steel"]    = 0
+        payment["titanium"] = 0
 
-    # Clamp each component to available
-    corrected = dict(payment)
-    changed = False
-    for field, cap in avail.items():
-        if corrected.get(field, 0) > cap:
-            corrected[field] = cap
-            changed = True
-
-    # Zero out disallowed resources (steel/titanium only valid for projectCard)
-    if wf_type != "projectCard":
-        for field in ("steel", "titanium"):
-            if corrected.get(field, 0):
-                corrected[field] = 0
-                changed = True
-
-    # Compute total value after clamping
-    total_value = corrected.get("megacredits", 0)
-    for field, rate in _PAYMENT_VALUES.items():
-        total_value += corrected.get(field, 0) * rate
-
-    # If we still can't cover the cost (e.g. insufficient resources overall), top up MC
-    shortfall = cost - total_value
-    if shortfall > 0:
-        extra_mc = min(shortfall, avail["megacredits"] - corrected.get("megacredits", 0))
-        if extra_mc > 0:
-            corrected["megacredits"] = corrected.get("megacredits", 0) + extra_mc
-            changed = True
-
-    if changed:
-        logger.warning(
-            "Payment corrected: %s → %s (cost=%d avail=%s)",
-            {k: v for k, v in payment.items() if v},
-            {k: v for k, v in corrected.items() if v},
-            cost,
-            {k: v for k, v in avail.items() if v},
-        )
-
-    return corrected
-
-
-def _format_payment_section(waiting_for: dict, player: dict) -> str:
-    """Build the payment options block shown in the action prompt."""
-    wf_type = waiting_for.get("type", "")
-    po = waiting_for.get("paymentOptions") or {}
-
-    mc    = player.get("megacredits", 0)
-    steel = player.get("steel", 0)
-    ti    = player.get("titanium", 0)
-    heat  = player.get("heat", 0)
-
-    lines = ["", "Payment resources available:"]
-    lines.append(f"  MC: {mc} (always, 1:1)")
-
-    if wf_type == "projectCard":
-        if steel > 0:
-            lines.append(f"  STEEL: {steel} cubes @ 2 MC each  — only for cards with [building] tag")
-        if ti > 0:
-            if po.get("lunaTradeFederationTitanium"):
-                lines.append(f"  TITANIUM: {ti} cubes @ 3 MC each  — any card (Luna Trade Federation)")
-            else:
-                lines.append(f"  TITANIUM: {ti} cubes @ 3 MC each  — only for cards with [space] tag")
-
-    if po.get("heat") and heat > 0:
-        lines.append(f"  HEAT: {heat} cubes @ 1 MC each  — (corp special ability)")
-
-    # Show special resources that are available (non-zero in waitingFor model)
-    for wf_key, label, rate in [
-        ("microbes",            "MICROBES",      2),
-        ("floaters",            "FLOATERS",      3),
-        ("seeds",               "SEEDS",         5),
-        ("graphene",            "GRAPHENE",      4),
-        ("lunaArchivesScience", "LUNA_SCIENCE",  1),
-        ("kuiperAsteroids",     "KUIPER",        1),
-        ("auroraiData",         "AURORA_DATA",   3),
-        ("spireScience",        "SPIRE_SCIENCE", 2),
+    # Clamp all non-MC resources to available
+    for field, available in [
+        ("steel",    st_avail), ("titanium", ti_avail),
+        ("heat",     ht_avail), ("plants",   pl_avail),
     ]:
-        amt = waiting_for.get(wf_key) or 0
-        if amt > 0:
-            lines.append(f"  {label}: {amt} @ {rate} MC each")
+        if payment.get(field, 0) > available:
+            payment[field] = available
 
-    if wf_type == "projectCard":
-        # Show the exact cost so Gemini doesn't have to infer it from the card list
-        cost = 0
-        card = waiting_for.get("card")
-        if isinstance(card, dict):
-            cost = card.get("calculatedCost", 0)
-        cost_str = f" (must cover {cost} MC)" if cost else ""
-        lines += [
-            "",
-            f"After CHOICE, specify how you pay{cost_str}:",
-            "  PAYMENT: MC=<n>[, STEEL=<n>][, TITANIUM=<n>][, HEAT=<n>][, ...]",
-            "  RULE: MC ≤ your current MC. STEEL cubes × 2 + TITANIUM cubes × 3 count toward cost.",
-            "  You can overpay with non-MC resources (surplus discarded). You cannot overpay in MC.",
-        ]
-    else:  # payment type
-        amount = waiting_for.get("amount", 0)
-        lines[1] = f"Payment resources available (need {amount} MC total):"
-        lines += [
-            "",
-            f"Specify payment: PAYMENT: MC=<n>[, HEAT=<n>][, ...]",
-            f"  MC ≤ {mc}. Total value must equal (or exceed) {amount}.",
-        ]
-    return "\n".join(lines)
+    # Clamp MC
+    if payment.get("megacredits", 0) > mc_avail:
+        payment["megacredits"] = mc_avail
+
+    # Determine cost and compute what's already covered by non-MC resources
+    if is_project:
+        card_node = waiting_for.get("card", {})
+        cost = card_node.get("calculatedCost", 0) if card_node else waiting_for.get("amount", 0)
+    else:
+        cost = waiting_for.get("amount", 0)
+
+    covered = sum(
+        payment.get(field, 0) * _PAYMENT_VALUES.get(field, 0)
+        for field in _PAYMENT_VALUES
+    )
+    needed_mc = max(0, cost - covered)
+    if payment.get("megacredits", 0) < needed_mc:
+        payment["megacredits"] = min(needed_mc, mc_avail)
+
+    return payment
+
+
+# ---------------------------------------------------------------------------
+# Action prompt builder
+# ---------------------------------------------------------------------------
+
+# Track which generation the full hand was shown for each player (to elide repeats)
+_hand_shown_generation: dict[str, int] = {}
 
 
 def _get_card_desc_for_option(opt: dict) -> str:
-    """Return a short description if the option title references a played card action."""
-    title = opt.get("title", "")
-    if not isinstance(title, str):
+    """Return 'Use <CardName> action — <description>' for blue-card actions."""
+    card = opt.get("card") or {}
+    name = card.get("name", "")
+    if not name:
         return ""
-    m = re.match(r"Use (.+?)(?:'s)? action\b", title, re.IGNORECASE)
-    if m:
-        card_name = m.group(1).strip()
-        entry = CARD_DB.get(card_name)
-        if entry and entry.get("description"):
-            desc = entry["description"]
-            return desc[:100] if len(desc) > 100 else desc
-    return ""
+    info = CARD_DB.get(name, {})
+    desc = info.get("description", "")
+    return f"Use {name} action — {desc}" if desc else f"Use {name} action"
 
 
-_BONUS_ABBREV = {
-    "steel": "St", "titanium": "Ti", "plant": "Pl", "card": "Cd",
-    "heat": "He", "MC": "MC", "ocean": "Oc", "animal": "An",
-    "microbe": "Mi", "energy": "En", "data": "Da", "science": "Sc",
-    "energy production": "EP", "temperature": "Tp",
-}
+def _build_action_prompt(
+    state: dict,
+    waiting_for: dict,
+    options: list[dict],
+    last_error: str | None = None,
+    player: LLMPlayer | None = None,
+) -> str:
+    g  = state.get("game",   {})
+    p  = state.get("player", {})
+    ms = state.get("milestones", [])
+    aw = state.get("awards",     [])
 
-
-def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict], last_error: str | None = None,
-                          game_id: str = "") -> str:
-    g      = state.get("game", {})
-    p      = state.get("player", {})
-    prod   = {k: v for k, v in p.get("production", {}).items() if v}
-    tags   = {k: v for k, v in p.get("tags", {}).items() if v}
-    my_id  = p.get("id", "")
-    ms_raw = state.get("milestones", [])
-    aw_raw = state.get("awards", [])
-    wf_type = waiting_for.get("type", "")
-
-    # Build a spaceId → space_info lookup for annotating tile placement options
-    _space_index: dict[str, dict] = {}
-    for s in (state.get("boardSpaces") or []):
-        sid = s.get("id")
-        if sid:
-            _space_index[sid] = s
-    ms = [f"{m.get('name','?')} ({'you' if m.get('playerId')==my_id else 'opponent'})"
-          for m in ms_raw]
-    aw = [f"{a.get('name','?')} ({'you' if a.get('playerId')==my_id else 'opponent'})"
-          for a in aw_raw]
-
-    lines: list[str] = []
-    if last_error:
-        lines += [
-            f"⚠ Your previous response was rejected: \"{last_error}\"",
-            "Please choose a different option or correct your payment/selection.",
-            "",
-        ]
-
-    temp = g.get("temperature", -30)
+    game_id   = player.player_id if player else "unknown"
+    temp   = g.get("temperature", -30)
     oxygen = g.get("oxygen", 0)
     oceans = g.get("oceanCount", 0)
 
-    my_vp = p.get("victoryPoints")
-    vp_str = f"  VP:{my_vp}" if my_vp is not None else ""
+    prod = {k: v for k, v in p.get("production", {}).items() if v}
+    tags = {k: v for k, v in p.get("tags", {}).items() if v}
+
+    tr     = p.get("terraformRating", 20)
+    mc     = p.get("megacredits", 0)
+    mc_prod = p.get("production", {}).get("megacredits", 0)
+    mc_income = tr + mc_prod
+
+    lines: list[str] = []
+
+    if last_error:
+        lines.append(f'⚠ Your previous response was rejected: "{last_error}"')
+        lines.append("Please correct your choice based on the error above.")
+        lines.append("")
+
     lines += [
-        f"Gen {g.get('generation',1)} | Temp {temp}°C | O₂ {oxygen}% | Oceans {oceans}/9",
-        f"TR:{p.get('terraformRating',20)}{vp_str}  MC:{p.get('megacredits',0)}  "
-        f"St:{p.get('steel',0)}  Ti:{p.get('titanium',0)}  "
-        f"Pl:{p.get('plants',0)}  En:{p.get('energy',0)}  He:{p.get('heat',0)}",
+        f"Gen {g.get('generation',1)} | Temp:{temp}°C O₂:{oxygen}% Oceans:{oceans}/9",
+        f"You: TR:{tr} VP:{p.get('victoryPoints','?')}  MC:{mc}(income:{mc_income})  "
+        f"Steel:{p.get('steel',0)} Ti:{p.get('titanium',0)}  "
+        f"Plants:{p.get('plants',0)} Energy:{p.get('energy',0)} Heat:{p.get('heat',0)}",
     ]
 
-    # Warn when global params are maxed so the AI doesn't waste actions.
     if temp >= 8:
         lines.append("⚠ Temperature is at maximum (8°C). DO NOT use Convert Heat — it is a wasted action.")
     if oxygen >= 14:
@@ -1832,8 +1737,7 @@ def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict], la
     if oceans >= 9:
         lines.append("⚠ All 9 oceans are placed. No more ocean tiles can be placed.")
 
-    # Highlight free conversion opportunities — highest-value zero-MC actions.
-    heat_now = p.get("heat", 0)
+    heat_now   = p.get("heat", 0)
     plants_now = p.get("plants", 0)
     if heat_now >= 8 and temp < 8:
         lines.append(
@@ -1850,35 +1754,27 @@ def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict], la
         lines.append(f"Production: {prod}")
     if tags:
         lines.append(f"Tags: {tags}")
-    # Played cards are in session memory — not repeated each turn.
-    # Production floor rule: Steel/Titanium/Plants/Energy/Heat production cannot go below 0.
-    # Only MC production can be negative (minimum -5). Don't play cards that would reduce
-    # non-MC production below 0 — the game will reject those actions.
     lines.append("Note: Only MC production can go negative (min -5). Steel/Ti/Plants/Energy/Heat production CANNOT go below 0.")
 
-    # Cards in hand with descriptions — skip for tile/payment/numeric decisions
-    # where the hand plays no role (saves ~100–300 tokens per such turn).
-    # Within a generation, show full descriptions only on the FIRST action turn;
-    # subsequent turns in the same gen show names only to avoid re-sending ~500 tokens
-    # of card descriptions that are already in the model's session context.
+    # Cards in hand
     hand_cards = p.get("cardsInHand") or []
     generation = g.get("generation", 1)
+    wf_type    = waiting_for.get("type", "")
     _hand_irrelevant = wf_type in ("space", "payment", "amount")
     if hand_cards and not _hand_irrelevant:
-        last_shown_gen = _hand_shown_generation.get(game_id, -1) if game_id else -1
+        last_shown_gen = player.hand_shown_generation if player else -1
         if last_shown_gen == generation:
-            # Already shown with descriptions this gen — name-only to save tokens
             name_list = ", ".join(hand_cards[:30])
             lines += ["", f"Your hand ({len(hand_cards)} cards): {name_list}",
                       "  (Full descriptions shown earlier this generation — rely on your session memory.)"]
         else:
             ctx = format_card_context(hand_cards, header=f"Your hand ({len(hand_cards)} cards):", max_cards=30)
             lines += ["", ctx]
-            if game_id:
-                _hand_shown_generation[game_id] = generation
-            # Show effective cost for cards discounted by steel or titanium
+            if player:
+                player.hand_shown_generation = generation
+            # Effective cost annotations for steel/titanium discounts
             steel_now = p.get("steel", 0)
-            ti_now = p.get("titanium", 0)
+            ti_now    = p.get("titanium", 0)
             eff_notes: list[str] = []
             for card_name in hand_cards[:30]:
                 card_name_str = card_name if isinstance(card_name, str) else card_name.get("name", "")
@@ -1904,9 +1800,9 @@ def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict], la
         opp_prod = {k: v for k, v in opp.get("production", {}).items() if v}
         opp_tags = {k: v for k, v in opp.get("tags", {}).items() if v}
         opp_name = opp.get("name", f"Opponent{'' if len(opponents) == 1 else i}")
-        opp_vp = opp.get("victoryPoints")
+        opp_vp   = opp.get("victoryPoints")
         opp_vp_str = f" VP:{opp_vp}" if opp_vp is not None else ""
-        opp_hs = opp.get("handSize")
+        opp_hs   = opp.get("handSize")
         opp_hs_str = f"  hand:{opp_hs}cards" if opp_hs is not None else ""
         lines.append(
             f"{opp_name}: TR:{opp.get('terraformRating',20)}{opp_vp_str}  MC:{opp.get('megacredits',0)}"
@@ -1917,8 +1813,6 @@ def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict], la
     if aw:
         lines.append(f"Awards funded: {aw}")
 
-    # Recent game events (current generation log — OPPONENT moves and system messages only;
-    # your own moves are already in your session memory above).
     recent_log = g.get("recentLog") or []
     if recent_log:
         lines += ["", f"Recent opponent actions / events ({len(recent_log)}):"]
@@ -1930,61 +1824,16 @@ def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict], la
     if isinstance(title_raw, str):
         title = title_raw.strip()
     elif isinstance(title_raw, dict):
-        title = title_raw.get("message", "")
+        title = str(title_raw.get("message", "Select action"))
     else:
-        title = ""
-    if title:
-        lines += ["", f"Decision: {title}"]
+        title = "Select action"
 
-    # Tile placement tips: greenery adjacency to cities; city separation rule.
-    if wf_type == "space":
-        title_lower = title.lower()
-        if "greenery" in title_lower:
-            own_cities = sum(
-                1 for s in (state.get("boardSpaces") or [])
-                if s.get("tileType") == "city" and s.get("playerColor") == p.get("color")
-            )
-            if own_cities:
-                lines.append(
-                    f"Placement tip: place this greenery ADJACENT to one of your {own_cities} "
-                    f"city tile(s) — each adjacent greenery scores +1 VP for the city at game end "
-                    f"(2 VP total per greenery next to a city). Even better: a hex adjacent to 2 "
-                    f"of your cities = 3 VP from 1 greenery. Avoid placing greeneries next to "
-                    f"opponent cities."
-                )
-            else:
-                lines.append(
-                    "Placement tip: you have no cities yet. Place this greenery in a central area "
-                    "where a future city can sit next to it — plan ahead for the 3-city triangle "
-                    "pattern (see strategy memory)."
-                )
-        elif "city" in title_lower:
-            own_city_count = sum(
-                1 for s in (state.get("boardSpaces") or [])
-                if s.get("tileType") == "city" and s.get("playerColor") == p.get("color")
-            )
-            if own_city_count == 0:
-                lines.append(
-                    "Placement tip: place your FIRST city in a location where 4-5 adjacent hexes "
-                    "are free land (not ocean-reserved), so you can later surround it with greeneries. "
-                    "This city anchors your city-greenery VP engine. Plan for a 3-city triangle: "
-                    "3 cities sharing common adjacent hexes, with greeneries filling those shared "
-                    "hexes (1 central greenery adjacent to all 3 cities = 4 VP; greeneries between "
-                    "each pair = 3 VP each). Cities cannot be adjacent to other cities."
-                )
-            else:
-                lines.append(
-                    f"Placement tip: you have {own_city_count} city/cities. Place this new city "
-                    f"close enough to an existing one that they share an adjacent hex — that shared "
-                    f"hex will later hold a greenery worth 3 VP (adjacent to 2 cities). "
-                    f"Cities cannot be adjacent to other cities, but CAN share a common neighbor hex."
-                )
+    lines += ["", f"Decision: {title}", "Options:"]
 
-    # Card descriptions for explicit card-selection decisions (research, discard, etc.)
+    # Resource hint for card-selection decisions
     if wf_type == "card":
-        # Steer the AI toward cards that match its stockpiled resources.
         steel_now = p.get("steel", 0)
-        ti_now = p.get("titanium", 0)
+        ti_now    = p.get("titanium", 0)
         resource_hints = []
         if ti_now >= 3:
             resource_hints.append(f"you have {ti_now} titanium → favor SPACE-tag cards (titanium pays at 3 MC/cube)")
@@ -1992,57 +1841,123 @@ def _build_action_prompt(state: dict, waiting_for: dict, options: list[dict], la
             resource_hints.append(f"you have {steel_now} steel → favor BUILDING-tag cards (steel pays at 2 MC/cube)")
         if resource_hints:
             lines.append("Resource tip: " + "; ".join(resource_hints) + ".")
-        card_names_in_decision = _extract_card_names(waiting_for)
-        if card_names_in_decision:
-            if _is_card_decision_about_hand(card_names_in_decision, hand_cards):
-                lines += ["", "Cards to choose from: (see hand above)"]
+
+    # Tile placement tips
+    if wf_type == "space":
+        board = state.get("board") or []
+        own_color = p.get("color", "")
+        own_cities = [t for t in board if t.get("tileType") == "city" and t.get("playerColor") == own_color]
+        opp_cities = [t for t in board if t.get("tileType") == "city" and t.get("playerColor") != own_color]
+
+        tile_title = title.lower()
+        if "greenery" in tile_title:
+            lines += [
+                "PLACEMENT TIP — Greenery VP math:",
+                "  • Adjacent to 1 of your cities: +1 city VP + 1 greenery VP = 2 VP total",
+                "  • Adjacent to 2 of your cities: +2 city VP + 1 greenery VP = 3 VP total",
+                "  • Adjacent to 3 of your cities: +3 city VP + 1 greenery VP = 4 VP total",
+                "  • Maximize: pick the hex adjacent to the most of YOUR cities.",
+                "  ⚠ Never place adjacent to an opponent's city — you give them +1 VP for free.",
+            ]
+            if opp_cities:
+                lines.append(f"  (Opponent has {len(opp_cities)} cities — avoid their adjacency.)")
+
+        elif "city" in tile_title:
+            if not own_cities:
+                lines += [
+                    "PLACEMENT TIP — First city (critical decision):",
+                    "  • Choose a hex with 4-5 adjacent free LAND hexes (not ocean-reserved).",
+                    "  • This gives you room to place greeneries around it for 2 VP each.",
+                    "  • Aim for a spot where you can eventually build 2-3 cities and surround",
+                    "    them with shared greeneries (each shared greenery = 3-4 VP).",
+                    "  • Ideal: a position that lets you form a triangle of 3 cities later,",
+                    "    sharing central hexes worth 4 VP each.",
+                ]
             else:
-                ctx = format_card_context(card_names_in_decision, header="Cards to choose from:", max_cards=20)
-                if ctx:
-                    lines += ["", ctx]
+                lines += [
+                    "PLACEMENT TIP — Subsequent city:",
+                    f"  • You already have {len(own_cities)} city/cities. Place close to your existing city",
+                    "    so you can place greeneries adjacent to BOTH cities (3 VP per greenery).",
+                    "  • A greenery adjacent to 2 cities = 3 VP; adjacent to 3 cities = 4 VP.",
+                    "  • Forming a triangle with your 3rd city sets up the highest-value greenery layout.",
+                ]
+
+    # Options list
+    card_names_in_decision = _extract_card_names(waiting_for)
+    is_hand_decision = _is_card_decision_about_hand(card_names_in_decision, hand_cards)
+
+    for opt in options:
+        idx    = opt["index"] + 1
+        title2 = opt["title"]
+        desc   = _get_card_desc_for_option(opt)
+
+        if wf_type == "card" and is_hand_decision and card_names_in_decision:
+            title2_clean = str(title2)[:70]
+            lines.append(f"  {idx}. {title2_clean} (see hand above)")
+        elif desc:
+            lines.append(f"  {idx}. {desc}")
+        else:
+            title2_clean = str(title2)[:70]
+            lines.append(f"  {idx}. {title2_clean}")
 
     # Payment section
     if wf_type in ("projectCard", "payment"):
-        lines.append(_format_payment_section(waiting_for, p))
+        lines += _format_payment_section(waiting_for, p)
 
-    # Options list — annotate card-action and space options with inline info
-    lines.append("\nChoose from:")
-    for i, opt in enumerate(options, 1):
-        title = opt["title"]
-        card_desc = _get_card_desc_for_option(opt)
-        # Annotate space options with placement bonuses and type
-        if wf_type == "space" and _space_index:
-            space_info = _space_index.get(title, {})
-            bonuses: list[str] = space_info.get("b") or []
-            stype: str = space_info.get("t", "land")
-            x, y = space_info.get("x", "?"), space_info.get("y", "?")
-            bonus_str = "+".join(_BONUS_ABBREV.get(b, b) for b in bonuses) if bonuses else "no bonus"
-            volcanic_tag = " [volcanic]" if space_info.get("v") else ""
-            lines.append(f"  {i}. hex-{title} ({x},{y}) [{stype}]{volcanic_tag}  placement bonus: {bonus_str}")
-        elif card_desc:
-            lines.append(f"  {i}. {title}  — {card_desc}")
-        else:
-            lines.append(f"  {i}. {title}")
-
-    if wf_type in ("projectCard", "payment"):
-        lines += ["", "CHOICE: <number>", "PAYMENT: MC=<n>[, STEEL=<n>][, TITANIUM=<n>][, HEAT=<n>]..."]
-    else:
-        lines += ["", "CHOICE: <number>"]
     return "\n".join(lines)
 
 
+def _format_payment_section(waiting_for: dict, player: dict) -> list[str]:
+    lines: list[str] = ["", "Payment:"]
+    wf_type = waiting_for.get("type", "")
+    if wf_type == "projectCard":
+        card = waiting_for.get("card", {})
+        cost = card.get("calculatedCost", "?")
+        name = card.get("name", "?")
+        lines.append(f"  Card: {name}  Cost: {cost} MC")
+        st = player.get("steel",    0)
+        ti = player.get("titanium", 0)
+        mc = player.get("megacredits", 0)
+        card_tags = []
+        info = CARD_DB.get(name, {})
+        if info:
+            card_tags = info.get("tags") or []
+        can_use_steel = "building" in card_tags
+        can_use_ti    = "space"    in card_tags
+        lines.append(f"  Available: MC={mc}" +
+                     (f" Steel={st}(worth {st*2}MC)" if can_use_steel and st else "") +
+                     (f" Titanium={ti}(worth {ti*3}MC)" if can_use_ti and ti else ""))
+        lines += [
+            "  Reply with: PAYMENT: MC=<n>[, STEEL=<n>][, TITANIUM=<n>]...",
+            "  Rules: steel only for building-tag, titanium only for space-tag.",
+            "  You cannot overpay in MC; overpaying in steel/titanium is OK (surplus lost).",
+        ]
+    else:
+        amount = waiting_for.get("amount", 0)
+        mc = player.get("megacredits", 0)
+        lines.append(f"  Amount: {amount} MC  Available MC: {mc}")
+        lines += [
+            "  Reply with: PAYMENT: MC=<n>[, HEAT=<n>]...",
+            "  (No steel/titanium allowed for standard project payments.)",
+        ]
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Action response parser
+# ---------------------------------------------------------------------------
+
 def _parse_action_response(
-    text: str, options: list[dict], waiting_for: dict, game_id: str,
+    text: str, options: list[dict], waiting_for: dict, player_id: str,
     player: dict | None = None,
 ) -> tuple[dict, dict]:
     m = re.search(r"CHOICE:\s*(\d+)", text)
     chosen = int(m.group(1)) - 1 if m else 0
     chosen = max(0, min(chosen, len(options) - 1))
     option = options[chosen]
-    logger.info("Action choice game=%s: %d. %s", game_id, chosen + 1, option["title"])
+    logger.info("Action choice player=%s: %d. %s", player_id, chosen + 1, option["title"])
     response = index_to_response(waiting_for, option["index"])
 
-    # Override payment if AI provided PAYMENT: line; validate and clamp to available resources.
     wf_type = waiting_for.get("type", "")
     if wf_type in ("projectCard", "payment"):
         payment = _parse_payment_line(text)
@@ -2070,7 +1985,6 @@ def _node_title(node: dict, fallback: int) -> str:
 
 
 def _is_card_decision_about_hand(card_names: list[str], cards_in_hand: list) -> bool:
-    """Return True when all cards in the decision are already described in the hand block."""
     if not card_names or not cards_in_hand:
         return False
     hand_set = {c if isinstance(c, str) else c.get("name", "") for c in cards_in_hand}
@@ -2078,7 +1992,6 @@ def _is_card_decision_about_hand(card_names: list[str], cards_in_hand: list) -> 
 
 
 def _extract_card_names(waiting_for: dict, max_depth: int = 3) -> list[str]:
-    """Recursively collect card names from a waitingFor node (for card-selection decisions)."""
     if max_depth <= 0:
         return []
     names: list[str] = []

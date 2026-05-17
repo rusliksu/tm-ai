@@ -1,135 +1,172 @@
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 import pytest
 
 import tm_ai_server.llm_player as llm
 
 
 # ---------------------------------------------------------------------------
-# test_cached_content_used
+# Helpers
 # ---------------------------------------------------------------------------
 
-def test_cached_content_used():
-    """_init_gemini_session uses cached_content when cache creation succeeds."""
-    fake_cache = MagicMock()
-    fake_cache.name = "cachedContents/abc123"
-
-    fake_response = MagicMock()
-    fake_response.text = "CORPORATION: TestCorp\nBUY_CARDS: none\nSTRATEGY: Test strategy."
-
-    fake_client = MagicMock()
-    fake_client.caches.create.return_value = fake_cache
-    fake_client.models.generate_content.return_value = fake_response
-    fake_chat = MagicMock()
-    fake_client.chats.create.return_value = fake_chat
-
-    with patch.object(llm, '_gemini_client', fake_client), \
-         patch.object(llm, '_GEMINI_MODEL', 'gemini-2.5-flash-lite'), \
-         patch.object(llm, '_GEMINI_API_KEY', 'fake-key'), \
-         patch.object(llm, '_game_cache_info', {}), \
-         patch.object(llm, '_game_chat_sessions', {}):
-
-        llm._init_gemini_session("game1", "system prompt", "user message", think=False)
-
-        # Cache was created
-        fake_client.caches.create.assert_called_once()
-        create_kwargs = fake_client.caches.create.call_args[1]
-        assert create_kwargs['model'] == 'gemini-2.5-flash-lite'
-        assert create_kwargs['config'].system_instruction == "system prompt"
-
-        # generate_content used cached_content, not system_instruction
-        gen_cfg = fake_client.models.generate_content.call_args[1]['config']
-        assert gen_cfg.cached_content == "cachedContents/abc123"
-        assert not hasattr(gen_cfg, 'system_instruction') or gen_cfg.system_instruction is None
-
-        # Chat was also created with cached_content
-        chat_cfg = fake_client.chats.create.call_args[1]['config']
-        assert chat_cfg.cached_content == "cachedContents/abc123"
+def _make_player(player_id="p1", game_id="g1", model="qwen3:4b"):
+    """Return a fresh LLMPlayer without touching the global registry."""
+    return llm.LLMPlayer(player_id=player_id, game_id=game_id, model=model)
 
 
-def test_cached_content_falls_back_on_error():
-    """_init_gemini_session falls back to inline system_instruction when cache creation fails."""
-    fake_response = MagicMock()
-    fake_response.text = "CORPORATION: TestCorp\nBUY_CARDS: none\nSTRATEGY: Test."
+# ---------------------------------------------------------------------------
+# test_register_player
+# ---------------------------------------------------------------------------
 
-    fake_client = MagicMock()
-    fake_client.caches.create.side_effect = Exception("Cache not supported")
-    fake_client.models.generate_content.return_value = fake_response
-    fake_chat = MagicMock()
-    fake_client.chats.create.return_value = fake_chat
+def test_register_player_creates_correct_provider():
+    """register_player sets provider='openrouter' for slash-model, 'ollama' for bare model."""
+    registry: dict = {}
+    game_players: dict = {}
 
-    with patch.object(llm, '_gemini_client', fake_client), \
-         patch.object(llm, '_GEMINI_MODEL', 'gemini-2.5-flash-lite'), \
-         patch.object(llm, '_GEMINI_API_KEY', 'fake-key'), \
-         patch.object(llm, '_game_cache_info', {}), \
-         patch.object(llm, '_game_chat_sessions', {}):
+    with patch.object(llm, '_player_registry', registry), \
+         patch.object(llm, '_game_players', game_players):
 
-        llm._init_gemini_session("game2", "system prompt", "user message", think=False)
+        p_or = llm.register_player("p_or", "g1", "anthropic/claude-opus-4-7")
+        assert p_or.provider == "openrouter"
+        assert p_or.model    == "anthropic/claude-opus-4-7"
+        assert p_or.game_id  == "g1"
 
-        # Falls back: generate_content should use system_instruction, not cached_content
-        gen_cfg = fake_client.models.generate_content.call_args[1]['config']
-        assert gen_cfg.system_instruction == "system prompt"
-        assert not gen_cfg.cached_content
+        p_ol = llm.register_player("p_ol", "g1", "qwen3:4b")
+        assert p_ol.provider == "ollama"
+
+        assert "p_or" in registry
+        assert "p_ol" in registry
+        assert "p_or" in game_players["g1"]
+        assert "p_ol" in game_players["g1"]
+
+
+def test_register_player_default_model_uses_openrouter_key():
+    """When no model is given and OPENROUTER_API_KEY is set, default to OPENROUTER_MODEL."""
+    registry: dict = {}
+    game_players: dict = {}
+
+    with patch.object(llm, '_player_registry', registry), \
+         patch.object(llm, '_game_players', game_players), \
+         patch.object(llm, '_OPENROUTER_API_KEY', 'fake-key'), \
+         patch.object(llm, '_OPENROUTER_MODEL', 'anthropic/claude-sonnet-4-6'):
+
+        p = llm.register_player("p_default", "g2")
+        assert p.model    == "anthropic/claude-sonnet-4-6"
+        assert p.provider == "openrouter"
+
+
+def test_get_or_create_player_auto_creates_with_warning(caplog):
+    """get_or_create_player auto-creates and warns when player not pre-registered."""
+    registry: dict = {}
+    game_players: dict = {}
+
+    with patch.object(llm, '_player_registry', registry), \
+         patch.object(llm, '_game_players', game_players), \
+         patch.object(llm, '_OPENROUTER_API_KEY', ''), \
+         patch.object(llm, '_OLLAMA_MODEL', 'qwen3:4b'):
+
+        import logging
+        with caplog.at_level(logging.WARNING, logger="tm_ai_server.llm_player"):
+            p = llm.get_or_create_player("p_new", "g1")
+
+        assert p.player_id == "p_new"
+        assert any("not pre-registered" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# test_capability_resolution
+# ---------------------------------------------------------------------------
+
+def test_known_capabilities_returned_without_probing():
+    """Models in _KNOWN_CAPABILITIES are returned directly (no HTTP probe)."""
+    caps_cache: dict = {}
+
+    with patch.object(llm, '_model_capabilities', caps_cache):
+        caps = llm._get_model_capabilities("anthropic/claude-opus-4-7")
+
+    assert caps["caching"] is True
+    assert caps["thinking"] is True
+    # Should be stored in cache now
+    assert "anthropic/claude-opus-4-7" in caps_cache
+
+
+def test_known_caps_for_openai_model():
+    caps_cache: dict = {}
+    with patch.object(llm, '_model_capabilities', caps_cache):
+        caps = llm._get_model_capabilities("openai/gpt-4o")
+    assert caps["caching"] is False
+    assert caps["thinking"] is False
+
+
+def test_provider_for_slash_model():
+    assert llm._provider_for("anthropic/claude-opus-4-7") == "openrouter"
+    assert llm._provider_for("openai/gpt-4o") == "openrouter"
+
+
+def test_provider_for_bare_model():
+    assert llm._provider_for("qwen3:4b") == "ollama"
+    assert llm._provider_for("llama3.2:3b") == "ollama"
 
 
 # ---------------------------------------------------------------------------
 # test_per_generation_strategy_update
 # ---------------------------------------------------------------------------
 
-def test_per_generation_strategy_update_captures_and_preserves_chat():
-    """_maybe_per_generation_update sends a restate prompt to the existing chat and
-    captures the response — without rebuilding the chat session."""
-    fake_strategy_response = MagicMock()
-    fake_strategy_response.text = "1. STANDING: ahead by 6 VP. 2. ENGINE: Jovian. 3. MILESTONE: Rim Settler."
+def test_per_generation_strategy_update_sends_prompt_and_stores():
+    """_maybe_per_generation_update sends a restate prompt and stores the response."""
+    player = _make_player()
+    player.last_generation = 3
 
-    fake_chat = MagicMock()
-    fake_chat.send_message.return_value = fake_strategy_response
+    captured_prompt: list[str] = []
 
-    game_id = "game_pergen_test"
-    game_sessions = {game_id: fake_chat}
-    strategies = {}
-    last_gen = {game_id: 3}
+    def fake_continue(user, max_output_tokens=None):
+        captured_prompt.append(user)
+        return "1. STANDING: ahead. 2. ENGINE: Jovian. 3. MILESTONE: Rim Settler."
 
-    with patch.object(llm, '_game_chat_sessions', game_sessions), \
-         patch.object(llm, '_game_strategies', strategies), \
-         patch.object(llm, '_gemini_last_generation', last_gen):
+    player.continue_session = fake_continue
 
-        # Generation bumps from 3 → 4
-        llm._maybe_per_generation_update(game_id, 4, {})
+    llm._maybe_per_generation_update(player, 4, {
+        "game": {"generation": 4, "temperature": -20, "oxygen": 0, "oceanCount": 0},
+        "player": {"terraformRating": 22, "heat": 0, "plants": 0,
+                   "production": {"megacredits": 2, "steel": 0, "titanium": 0,
+                                  "plants": 0, "energy": 0, "heat": 0}},
+    })
 
-        # Strategy was captured and stored
-        assert strategies[game_id] == fake_strategy_response.text
-
-        # The existing chat was used (no rebuild)
-        assert game_sessions[game_id] is fake_chat
-        fake_chat.send_message.assert_called_once()
-
-        # The restate prompt was sent
-        sent_prompt = fake_chat.send_message.call_args[0][0]
-        assert "Generation 3" in sent_prompt and "Generation 4" in sent_prompt
-        assert "MILESTONE" in sent_prompt
-
-        # Last generation was updated
-        assert last_gen[game_id] == 4
+    assert player.strategy.startswith("1. STANDING")
+    assert player.last_generation == 4
+    assert captured_prompt, "continue_session was never called"
+    assert "Generation 4" in captured_prompt[0]
+    assert "MILESTONE" in captured_prompt[0]
 
 
 def test_per_generation_update_not_triggered_same_generation():
     """_maybe_per_generation_update does nothing when generation is unchanged."""
-    fake_chat = MagicMock()
-    game_id = "game_no_update"
-    game_sessions = {game_id: fake_chat}
-    last_gen = {game_id: 5}
+    player = _make_player()
+    player.last_generation = 5
+    player.strategy = "original"
 
-    with patch.object(llm, '_game_chat_sessions', game_sessions), \
-         patch.object(llm, '_gemini_last_generation', last_gen):
+    calls: list = []
+    player.continue_session = lambda u, **kw: calls.append(u) or "new strategy"
 
-        llm._maybe_per_generation_update(game_id, 5, {})  # Same generation
+    llm._maybe_per_generation_update(player, 5, {})
 
-        # Chat untouched
-        assert game_sessions[game_id] is fake_chat
-        fake_chat.send_message.assert_not_called()
+    assert not calls, "continue_session should not have been called"
+    assert player.strategy == "original"
+
+
+def test_per_generation_update_skipped_before_first_action():
+    """No update fires if last_generation == -1 (player never had a turn yet)."""
+    player = _make_player()
+    player.last_generation = -1
+    calls: list = []
+    player.continue_session = lambda u, **kw: calls.append(u) or ""
+
+    llm._maybe_per_generation_update(player, 1, {})
+
+    assert not calls
+    assert player.last_generation == 1
 
 
 # ---------------------------------------------------------------------------
@@ -139,9 +176,7 @@ def test_per_generation_update_not_triggered_same_generation():
 def test_hand_card_descriptions_skipped():
     """`_is_card_decision_about_hand` returns True when all decision cards are in hand."""
     hand = ["Tardigrades", "Ants", "Search for Life"]
-    # All decision cards are in hand
     assert llm._is_card_decision_about_hand(["Tardigrades", "Ants"], hand) is True
-    # A card not in hand → False
     assert llm._is_card_decision_about_hand(["Tardigrades", "Unknown Card"], hand) is False
 
 
@@ -175,12 +210,11 @@ def test_correct_payment_clamps_steel_and_tops_up_mc():
     payment = {"megacredits": 0, "steel": 10, "titanium": 0, "heat": 0, "plants": 0,
                "microbes": 0, "floaters": 0, "lunaArchivesScience": 0, "spireScience": 0,
                "seeds": 0, "auroraiData": 0, "graphene": 0, "kuiperAsteroids": 0}
-    # Card costs 14 MC, player has 3 steel (=6 MC value) and 10 MC
     wf = {"type": "projectCard", "card": {"calculatedCost": 14}}
     player = {"megacredits": 10, "steel": 3, "titanium": 0, "heat": 0, "plants": 0}
     result = llm._correct_payment(payment, wf, player)
-    assert result["steel"] == 3           # clamped from 10 to 3
-    assert result["steel"] * 2 + result["megacredits"] >= 14  # covers cost
+    assert result["steel"] == 3                                  # clamped from 10 to 3
+    assert result["steel"] * 2 + result["megacredits"] >= 14    # covers cost
 
 
 def test_correct_payment_no_change_when_valid():
@@ -208,7 +242,7 @@ def test_correct_payment_blocks_steel_on_non_project_card():
 
 
 # ---------------------------------------------------------------------------
-# test_select_action_advise_dual_format
+# test_select_action_advise
 # ---------------------------------------------------------------------------
 
 _MINIMAL_STATE = {
@@ -219,7 +253,9 @@ _MINIMAL_STATE = {
                "heat": 0, "megacreditProduction": 0, "steelProduction": 0,
                "titaniumProduction": 0, "plantsProduction": 0, "energyProduction": 0,
                "heatProduction": 0, "tags": {}, "cardsInHand": [], "playedCards": [],
-               "cardResources": {}, "corporations": [], "victoryPoints": 0},
+               "cardResources": {}, "corporations": [], "victoryPoints": 0,
+               "production": {"megacredits": 0, "steel": 0, "titanium": 0,
+                              "plants": 0, "energy": 0, "heat": 0}},
     "opponents": [],
     "board": [],
     "milestones": [],
@@ -236,22 +272,32 @@ _MINIMAL_WAITING_FOR = {
 }
 
 
+def _make_trainer_player(trainer_id="trainer:p1", game_id="g1"):
+    """Make a trainer LLMPlayer whose session is pre-seeded so continue_session is called."""
+    p = _make_player(player_id=trainer_id, game_id=game_id, model="qwen3:4b")
+    p.session = [{"role": "system", "content": "rules"}]
+    p.last_generation = 2  # same as minimal state gen → no per-gen update
+    return p
+
+
 def test_select_action_advise_dual_format():
     """select_action_advise splits LLM response into advice text + parsed recommendation dict."""
+    trainer = _make_trainer_player()
     llm_response = (
         "You should pass this turn to conserve resources.\n"
         "<recommendation>\n"
         "CHOICE: 1\n"
         "</recommendation>"
     )
+    trainer.continue_session = lambda u, **kw: llm_response
 
-    with patch.object(llm, '_LLM_PROVIDER', 'ollama'), \
-         patch.object(llm, '_game_sessions', {}), \
-         patch.object(llm, '_session_base_system', {}), \
-         patch.object(llm, '_call_llm_init', return_value=llm_response) as mock_init:
+    registry = {"trainer:p1": trainer}
+
+    with patch.object(llm, '_player_registry', registry), \
+         patch.object(llm, '_game_players', {}):
 
         advice, recommendation = llm.select_action_advise(
-            _MINIMAL_STATE, _MINIMAL_WAITING_FOR, "game_advise_test", "pdummy123",
+            _MINIMAL_STATE, _MINIMAL_WAITING_FOR, "g1", "p1",
         )
 
     assert "conserve resources" in advice
@@ -262,46 +308,169 @@ def test_select_action_advise_dual_format():
 
 
 def test_advice_session_isolated_per_player():
-    """select_action_advise uses 'trainer:<game_id>:<player_id>' namespace."""
+    """select_action_advise uses 'trainer:<player_id>' as session key."""
     llm_response = "Short coaching.\n<recommendation>\nCHOICE: 2\n</recommendation>"
 
-    game_id = "g_iso_test"
-    player_id = "pAAA"
-    expected_session = f"trainer:{game_id}:{player_id}"
+    player_id  = "pAAA"
+    trainer_id = f"trainer:{player_id}"
+    trainer    = _make_trainer_player(trainer_id=trainer_id, game_id="g_iso_test")
+    trainer.continue_session = lambda u, **kw: llm_response
 
-    with patch.object(llm, '_LLM_PROVIDER', 'ollama'), \
-         patch.object(llm, '_game_sessions', {}), \
-         patch.object(llm, '_session_base_system', {}), \
-         patch.object(llm, '_call_llm_init', return_value=llm_response) as mock_init:
+    registry = {trainer_id: trainer}
 
-        llm.select_action_advise(_MINIMAL_STATE, _MINIMAL_WAITING_FOR, game_id, player_id)
+    with patch.object(llm, '_player_registry', registry), \
+         patch.object(llm, '_game_players', {}):
 
-        # _call_llm_init was called with the per-player trainer namespace
-        called_session = mock_init.call_args[0][0]
-        assert called_session == expected_session
-        assert called_session != game_id
-        assert called_session != f"trainer:{game_id}"
+        llm.select_action_advise(_MINIMAL_STATE, _MINIMAL_WAITING_FOR, "g_iso_test", player_id)
+
+    # Registry key is trainer:<player_id> only — NOT trainer:<game_id>:<player_id>
+    assert trainer_id in registry
+    assert f"trainer:g_iso_test:{player_id}" not in registry
 
 
 def test_advice_sessions_separate_for_two_players():
     """Two players in the same game produce two distinct trainer sessions."""
     llm_response = "Short.\n<recommendation>\nCHOICE: 1\n</recommendation>"
 
-    sessions: dict = {}
+    registry: dict = {}
+    game_players: dict = {}
 
-    with patch.object(llm, '_LLM_PROVIDER', 'ollama'), \
-         patch.object(llm, '_game_sessions', sessions), \
-         patch.object(llm, '_session_base_system', {}), \
-         patch.object(llm, '_call_llm_init', return_value=llm_response) as mock_init:
+    def fake_init_session(self, system, user, think=True):
+        self.session = [{"role": "system", "content": system}]
+        return llm_response
 
-        def fake_init(game_id, system, user, think=False):
-            sessions[game_id] = [{"role": "system", "content": system}]
-            return llm_response
+    def fake_continue_session(self, user, max_output_tokens=None):
+        return llm_response
 
-        mock_init.side_effect = fake_init
+    with patch.object(llm, '_player_registry', registry), \
+         patch.object(llm, '_game_players', game_players), \
+         patch.object(llm, '_OPENROUTER_API_KEY', ''), \
+         patch.object(llm, '_OLLAMA_MODEL', 'qwen3:4b'), \
+         patch.object(llm.LLMPlayer, 'init_session', fake_init_session), \
+         patch.object(llm.LLMPlayer, 'continue_session', fake_continue_session):
 
         llm.select_action_advise(_MINIMAL_STATE, _MINIMAL_WAITING_FOR, "g1", "pSandra")
         llm.select_action_advise(_MINIMAL_STATE, _MINIMAL_WAITING_FOR, "g1", "pPeter")
 
-    assert "trainer:g1:pSandra" in sessions
-    assert "trainer:g1:pPeter" in sessions
+    assert "trainer:pSandra" in registry
+    assert "trainer:pPeter" in registry
+
+
+# ---------------------------------------------------------------------------
+# test_log_game_token_summary
+# ---------------------------------------------------------------------------
+
+def test_log_game_token_summary_aggregates_players():
+    """log_game_token_summary calls log_token_summary on each player in the game."""
+    p1 = _make_player("p1", "g_sum")
+    p1.token_usage = {"calls": 3, "input": 100, "output": 50,
+                      "cache_read": 0, "cache_write": 0, "thinking": 0}
+    p2 = _make_player("p2", "g_sum")
+    p2.token_usage = {"calls": 5, "input": 200, "output": 80,
+                      "cache_read": 0, "cache_write": 0, "thinking": 0}
+
+    logged: list[str] = []
+    original_log = llm.LLMPlayer.log_token_summary
+
+    def capture_log(self):
+        logged.append(self.player_id)
+        self.summary_logged = True
+
+    registry    = {"p1": p1, "p2": p2}
+    game_players = {"g_sum": ["p1", "p2"]}
+    already_logged: set = set()
+
+    with patch.object(llm, '_player_registry', registry), \
+         patch.object(llm, '_game_players', game_players), \
+         patch.object(llm, '_game_summary_logged', already_logged), \
+         patch.object(llm.LLMPlayer, 'log_token_summary', capture_log):
+
+        llm.log_game_token_summary("g_sum")
+
+    assert set(logged) == {"p1", "p2"}
+
+
+def test_log_game_token_summary_not_called_twice():
+    """log_game_token_summary is idempotent — second call for same game is skipped."""
+    logged: list[str] = []
+
+    def capture_log(self):
+        logged.append(self.player_id)
+
+    p1 = _make_player("p1", "g_dup")
+    registry    = {"p1": p1}
+    game_players = {"g_dup": ["p1"]}
+    already_logged: set = {"g_dup"}  # already in the set
+
+    with patch.object(llm, '_player_registry', registry), \
+         patch.object(llm, '_game_players', game_players), \
+         patch.object(llm, '_game_summary_logged', already_logged), \
+         patch.object(llm.LLMPlayer, 'log_token_summary', capture_log):
+
+        llm.log_game_token_summary("g_dup")
+
+    assert not logged, "log_token_summary should not be called for an already-logged game"
+
+
+# ---------------------------------------------------------------------------
+# test_extract_text
+# ---------------------------------------------------------------------------
+
+def test_extract_text_plain_string():
+    """_extract_text handles a plain string content response."""
+    choice = MagicMock()
+    choice.message.content = "Hello, world!"
+    response = MagicMock()
+    response.choices = [choice]
+    assert llm._extract_text(response) == "Hello, world!"
+
+
+def test_extract_text_filters_thinking_blocks():
+    """_extract_text strips thinking blocks and returns only text blocks."""
+    text_block   = MagicMock(type="text",     text="The answer is 42.")
+    think_block  = MagicMock(type="thinking", thinking="Internal reasoning…")
+
+    choice = MagicMock()
+    choice.message.content = [think_block, text_block]
+    response = MagicMock()
+    response.choices = [choice]
+
+    result = llm._extract_text(response)
+    assert result == "The answer is 42."
+    assert "Internal reasoning" not in result
+
+
+def test_extract_text_multiple_text_blocks():
+    """_extract_text joins multiple text blocks."""
+    b1 = MagicMock(type="text", text="Part A.")
+    b2 = MagicMock(type="text", text="Part B.")
+    choice = MagicMock()
+    choice.message.content = [b1, b2]
+    response = MagicMock()
+    response.choices = [choice]
+    assert llm._extract_text(response) == "Part A.\nPart B."
+
+
+# ---------------------------------------------------------------------------
+# test_strip_cache_control
+# ---------------------------------------------------------------------------
+
+def test_strip_cache_control_removes_blocks():
+    """_strip_cache_control converts system cache_control list to plain string."""
+    messages = [
+        {
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "Rule A.", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "Rule B."},
+            ],
+        },
+        {"role": "user", "content": "What to do?"},
+    ]
+    result = llm._strip_cache_control(messages)
+    assert result[0]["role"] == "system"
+    assert isinstance(result[0]["content"], str)
+    assert "cache_control" not in str(result[0]["content"])
+    assert "Rule A." in result[0]["content"]
+    # User message unchanged
+    assert result[1] == messages[1]

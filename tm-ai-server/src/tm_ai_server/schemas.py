@@ -101,6 +101,18 @@ class AdviceResponse(BaseModel):
     debug: Optional[MoveDebug] = None
 
 
+class PlayerRegisterRequest(BaseModel):
+    player_id: str
+    game_id: str
+    model: Optional[str] = None  # None → use OPENROUTER_MODEL / OLLAMA_MODEL default
+
+
+class PlayerRegisterResponse(BaseModel):
+    ok: bool
+    player_id: str
+    model: str
+
+
 class HealthResponse(BaseModel):
     status: str = "ok"
 

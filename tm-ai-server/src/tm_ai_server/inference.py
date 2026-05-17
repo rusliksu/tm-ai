@@ -63,6 +63,8 @@ def select_action(
     game_spec: dict | None = None,
     model: PolicyValueNet | None = None,
     last_error: str | None = None,
+    game_id: str | None = None,
+    player_id: str | None = None,
 ) -> tuple[dict, dict]:
     """
     Given the game state and the current decision node, return:
@@ -71,7 +73,12 @@ def select_action(
     """
     if os.getenv("USE_LLM", "false").lower() == "true":
         from .llm_player import select_action_llm
-        return select_action_llm(state, waiting_for, last_error=last_error)
+        return select_action_llm(
+            state, waiting_for,
+            game_id=game_id or state.get("game", {}).get("id", "unknown"),
+            player_id=player_id or state.get("player", {}).get("id", "unknown"),
+            last_error=last_error,
+        )
 
     options = flatten_options(waiting_for)
     if not options:

@@ -16,7 +16,7 @@ Requires-Dist: requests>=2.34.0
 Requires-Dist: tensorboard>=2.20.0
 Requires-Dist: tqdm>=4.67.3
 Requires-Dist: rich>=15.0.0
-Requires-Dist: google-genai>=2.2.0
+Requires-Dist: openai>=2.37.0
 Provides-Extra: dev
 Requires-Dist: pytest>=7.0; extra == "dev"
 Requires-Dist: pytest-asyncio>=0.21; extra == "dev"

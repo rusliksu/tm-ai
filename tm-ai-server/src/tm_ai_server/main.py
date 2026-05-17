@@ -13,10 +13,10 @@ if not _app_logger.handlers:
 
 from .config import STATE_DIM, HIDDEN_SIZES, ACTION_SPACE_SIZE, PORT
 from .inference import select_action, select_advice
-from .llm_player import validate_llm_config, log_game_token_summary
+from .llm_player import validate_llm_config, log_game_token_summary, register_player
 from .schemas import (
     AdviceRequest, AdviceResponse, HealthResponse, MoveDebug,
-    MoveRequest, MoveResponse, VersionResponse,
+    MoveRequest, MoveResponse, PlayerRegisterRequest, PlayerRegisterResponse, VersionResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -64,8 +64,12 @@ async def move(request: MoveRequest):
 
     state = request.state.model_dump()
 
-    input_response, debug_info = select_action(state, waiting_for, game_spec,
-                                               last_error=request.last_error)
+    input_response, debug_info = select_action(
+        state, waiting_for, game_spec,
+        game_id=request.game_id,
+        player_id=request.player_id,
+        last_error=request.last_error,
+    )
     debug = MoveDebug(**debug_info) if debug_info else None
     return MoveResponse(input_response=input_response, debug=debug)
 
@@ -82,6 +86,19 @@ async def advise(request: AdviceRequest):
         user_question=request.user_question,
     )
     return AdviceResponse(advice_text=advice_text, recommendation=recommendation)
+
+
+@app.post("/player/register", response_model=PlayerRegisterResponse)
+async def player_register(body: PlayerRegisterRequest):
+    """Register an AI player with a specific model before the game starts.
+
+    Called by the TM server or play script at game creation, once per AI player:
+      curl -X POST http://localhost:8000/player/register \\
+        -H 'Content-Type: application/json' \\
+        -d '{"player_id":"p1abc","game_id":"g123","model":"anthropic/claude-opus-4-7"}'
+    """
+    player = register_player(body.player_id, body.game_id, body.model)
+    return PlayerRegisterResponse(ok=True, player_id=player.player_id, model=player.model)
 
 
 @app.post("/game-done")

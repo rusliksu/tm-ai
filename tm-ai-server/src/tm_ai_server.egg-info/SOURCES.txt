@@ -2,6 +2,7 @@ pyproject.toml
 src/tm_ai_server/__init__.py
 src/tm_ai_server/config.py
 src/tm_ai_server/encoding.py
+src/tm_ai_server/game_knowledge.py
 src/tm_ai_server/inference.py
 src/tm_ai_server/llm_player.py
 src/tm_ai_server/main.py
@@ -18,4 +19,5 @@ src/tm_ai_server/training/env_tm.py
 src/tm_ai_server/training/train_ppo.py
 src/tm_ai_server/training/train_supervised.py
 tests/test_encoding.py
+tests/test_llm_player.py
 tests/test_schemas.py
