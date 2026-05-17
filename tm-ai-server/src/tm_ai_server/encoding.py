@@ -13,6 +13,7 @@ InputResponse wire format (from TM server InputResponse.ts):
   SelectColony: {type:'colony', colonyName:<ColonyName>}
   SelectDelegate: {type:'delegate', player:<Color>}
   SelectParty:  {type:'party',  partyName:<PartyName>}
+  SelectResource: {type:'resource', resourceType:<ResourceType>}
 """
 
 from __future__ import annotations
@@ -233,6 +234,12 @@ def flatten_options(waiting_for: dict, max_actions: int = ACTION_SPACE_SIZE) -> 
                 break
             options.append({"title": str(party), "index": i, "node": {"partyName": party}})
 
+    elif node_type == "resource":
+        for i, res in enumerate(waiting_for.get("resources", [])):
+            if len(options) >= max_actions:
+                break
+            options.append({"title": str(res), "index": i, "node": {"resourceType": res}})
+
     else:
         # Leaf node (option, payment, etc.) — single choice
         options.append({"title": _node_title(waiting_for, 0), "index": 0, "node": waiting_for})
@@ -304,6 +311,11 @@ def index_to_response(waiting_for: dict, index: int) -> dict:
     elif node_type == "party":
         parties = waiting_for.get("parties", [])
         return {"type": "party", "partyName": parties[index] if index < len(parties) else ""}
+
+    elif node_type == "resource":
+        resources = waiting_for.get("resources", ["megacredits"])
+        res = resources[index] if index < len(resources) else resources[0]
+        return {"type": "resource", "resourceType": res}
 
     else:
         return _default_response(waiting_for)
@@ -442,6 +454,9 @@ def _default_response(node: dict) -> dict:
         return {"type": "globalEvent", "globalEventName": events[0] if events else ""}
     elif t == "policy":
         return {"type": "policy", "policyId": node.get("policyId", "")}
+    elif t == "resource":
+        resources = node.get("resources", ["megacredits"])
+        return {"type": "resource", "resourceType": resources[0] if resources else "megacredits"}
     else:
         return {"type": t}
 

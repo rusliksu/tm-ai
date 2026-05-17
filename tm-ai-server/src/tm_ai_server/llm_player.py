@@ -217,13 +217,21 @@ def _probe_caching(model: str) -> bool:
 
 def _probe_thinking(model: str) -> bool:
     try:
-        _openrouter_client.chat.completions.create(  # type: ignore[union-attr]
+        if model.startswith("anthropic/"):
+            extra_body = {"thinking": {"type": "enabled", "budget_tokens": 256}}
+            extra_headers = {"anthropic-beta": "interleaved-thinking-2025-05-14"}
+        else:
+            extra_body = {"reasoning": {"max_tokens": 256}}
+            extra_headers = {}
+        kwargs: dict = dict(
             model=model,
             messages=[{"role": "user", "content": "ping"}],
-            max_tokens=1,
-            extra_body={"thinking": {"type": "enabled", "budget_tokens": 256}},
-            extra_headers={"anthropic-beta": "interleaved-thinking-2025-05-14"},
+            max_tokens=10,
+            extra_body=extra_body,
         )
+        if extra_headers:
+            kwargs["extra_headers"] = extra_headers
+        _openrouter_client.chat.completions.create(**kwargs)  # type: ignore[union-attr]
         return True
     except Exception as e:
         logger.debug("Thinking probe for %s failed: %s", model, e)
@@ -474,8 +482,12 @@ class LLMPlayer:
 
         if think and caps.get("thinking"):
             budget = _OPENROUTER_THINKING_BUDGET
-            extra_body["thinking"] = {"type": "enabled", "budget_tokens": budget}
-            extra_headers["anthropic-beta"] = "interleaved-thinking-2025-05-14"
+            if self.model.startswith("anthropic/"):
+                extra_body["thinking"] = {"type": "enabled", "budget_tokens": budget}
+                extra_headers["anthropic-beta"] = "interleaved-thinking-2025-05-14"
+            else:
+                # OpenRouter unified reasoning parameter for non-Anthropic models
+                extra_body["reasoning"] = {"max_tokens": budget}
 
         if caps.get("caching"):
             # Ensure the anthropic-beta header covers caching too
@@ -508,10 +520,11 @@ class LLMPlayer:
                     kwargs.pop("extra_headers", None)
                     logger.info("Disabled caching for %s after error", self.model)
                     continue
-                if ("thinking" in err or "budget" in err) and caps.get("thinking"):
+                if ("thinking" in err or "budget" in err or "reasoning" in err) and caps.get("thinking"):
                     caps["thinking"] = False
                     _model_capabilities[self.model]["thinking"] = False
                     extra_body.pop("thinking", None)
+                    extra_body.pop("reasoning", None)
                     if extra_body:
                         kwargs["extra_body"] = extra_body
                     else:
