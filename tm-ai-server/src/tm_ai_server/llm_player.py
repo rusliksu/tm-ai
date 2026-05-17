@@ -1447,7 +1447,8 @@ def _select_action(
     user = _build_action_prompt(state, waiting_for, options, last_error=last_error, player=player)
     user += (
         "\n\nBefore choosing, check: does this action advance my engine, milestone/award targets, and pace plan?"
-        " 1-2 sentences explaining how your choice fits your strategy, then CHOICE: N on its own line. No text after CHOICE."
+        " 1-2 sentences explaining how your choice fits your strategy, then CHOICE: N on its own line."
+        " If playing a project card, add PAYMENT: MC=<n>[, STEEL=<n>][, TITANIUM=<n>] on the next line."
     )
     logger.debug("LLM action (player=%s type=%s options=%d)",
                  player.player_id, waiting_for.get("type"), len(options))
@@ -1983,6 +1984,30 @@ def _format_payment_section(waiting_for: dict, player: dict) -> list[str]:
 # Action response parser
 # ---------------------------------------------------------------------------
 
+def _auto_payment_for_card(card_name: str, sub_node: dict, player: dict) -> dict:
+    """Generate optimal steel/titanium payment for a project card using CARD_DB tags."""
+    cards = sub_node.get("cards", []) if isinstance(sub_node, dict) else []
+    card_info = next((c for c in cards if c.get("name") == card_name), {})
+    cost = card_info.get("calculatedCost", 0)
+    entry = CARD_DB.get(card_name, {})
+    tags = entry.get("tags", []) if entry else []
+
+    ti_avail = player.get("titanium", 0) if "space" in tags else 0
+    st_avail = player.get("steel",    0) if "building" in tags else 0
+
+    ti_used = min(ti_avail, (cost + 2) // 3)
+    remaining = max(0, cost - ti_used * 3)
+    st_used = min(st_avail, (remaining + 1) // 2)
+    remaining = max(0, remaining - st_used * 2)
+    mc_used = min(remaining, player.get("megacredits", 0))
+
+    payment = _empty_payment()
+    payment["megacredits"] = mc_used
+    payment["steel"]       = st_used
+    payment["titanium"]    = ti_used
+    return payment
+
+
 def _parse_action_response(
     text: str, options: list[dict], waiting_for: dict, player_id: str,
     player: dict | None = None,
@@ -1995,11 +2020,23 @@ def _parse_action_response(
     response = index_to_response(waiting_for, option["index"])
 
     wf_type = waiting_for.get("type", "")
+    p = player or {}
+
     if wf_type in ("projectCard", "payment"):
         payment = _parse_payment_line(text)
         if payment:
-            payment = _correct_payment(payment, waiting_for, player or {})
+            payment = _correct_payment(payment, waiting_for, p)
             response = {**response, "payment": payment}
+    elif response.get("type") == "or":
+        # or-option that resolves to a project card play — extract/auto-generate payment
+        inner = response.get("response", {})
+        if inner.get("type") == "projectCard":
+            payment = _parse_payment_line(text)
+            if payment:
+                payment = _correct_payment(payment, {"type": "projectCard"}, p)
+            else:
+                payment = _auto_payment_for_card(inner.get("card", ""), option.get("node", {}), p)
+            response = {**response, "response": {**inner, "payment": payment}}
 
     return response, {
         "llm_choice": chosen + 1,
