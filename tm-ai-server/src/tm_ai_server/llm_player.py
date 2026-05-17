@@ -2055,9 +2055,12 @@ def _parse_action_response(
                 cname = c.get("name", "")
                 if cname and cname.lower() in text_lower:
                     card_name = cname
+            card_info = next((c for c in available_cards if c.get("name") == card_name), {})
             payment = _parse_payment_line(text)
             if payment:
-                payment = _correct_payment(payment, {"type": "projectCard"}, p)
+                # Pass actual cost so _correct_payment can top up MC if AI underpaid
+                stub_wf = {"type": "projectCard", "amount": card_info.get("calculatedCost", 0)}
+                payment = _correct_payment(payment, stub_wf, p)
             else:
                 payment = _auto_payment_for_card(card_name, sub_node, p)
             inner = {"type": "projectCard", "card": card_name, "payment": payment}
