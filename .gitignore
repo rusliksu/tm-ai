@@ -1,5 +1,5 @@
 logs/
-.claude/settings.local.json
+.claude/
 tm-ai-server/.venv/
 tm-ai-server/__pycache__/
 tm-ai-server/src/**/__pycache__/

@@ -281,7 +281,7 @@ def gemini_move_with_error(gs: dict, last_error: str | None = None) -> dict:
     }
     if last_error:
         payload["last_error"] = last_error
-    data = post_json(f"{gs['ai_url']}/move", payload, timeout=300)
+    data = post_json(f"{gs['ai_url']}/move", payload, timeout=600)
     return data["input_response"]
 
 

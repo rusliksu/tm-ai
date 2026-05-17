@@ -1,5 +1,11 @@
 # Gemini LLM Performance Analysis — Terraforming Mars
 
+> Two sessions logged here. Game 1–2 (gemini-2.5-flash, session 1). Game 3 (gemini-3.1-flash-lite, session 2).
+
+---
+
+## Session 1 — `gemini-2.5-flash`
+
 **Date:** 2026-05-16  
 **Board:** Tharsis  
 **Expansions:** Prelude  
@@ -251,3 +257,181 @@ Cards shown during research phase are re-sent with full descriptions every subse
 - **Session recovery** triggered once at start (server restarted between sessions); strategy was preserved and reinjected — recovered correctly.
 - **Per-gen strategy updates** reached gen 20 without drift issues.
 - **Cloud Monitoring API** (`monitoring.googleapis.com`) returns 401 with an AI Studio key — requires OAuth2 service account. No GCP project is configured. Actual quota consumption can only be checked at `console.cloud.google.com` or `ai.dev/rate-limit`.
+
+---
+
+---
+
+## Session 2 — `gemini-3.1-flash-lite` (Claude vs Gemini)
+
+**Date:** 2026-05-16  
+**Board:** Tharsis  
+**Expansions:** Prelude  
+**Model:** `gemini-3.1-flash-lite`  
+**Matchup:** Claude (Viron, AI-Blue, manual) vs Gemini (Point Luna, AI-Red, automated)  
+**Game ID:** `gb7c71d0fad4b`  
+**Outcome:** Claude **87 VP** (TR 62) vs Gemini **58 VP** (TR 33) — Claude wins by 29 VP  
+**Generations:** 14 (all 3 global parameters maxed)
+
+### Purpose
+
+Re-run after implementing all Session 1 fixes (retry delay, output cap, session trim, thinking budget restored, per-gen strategy, description elision). Switch to the lighter/cheaper gemini-3.1-flash-lite to reduce quota pressure and measure whether the fixes actually changed Gemini's behaviour.
+
+---
+
+### Quantitative Summary
+
+| Metric | Session 1 (2.5-flash) | Session 2 (3.1-flash-lite) |
+|--------|----------------------|---------------------------|
+| Total Gemini API calls | ~377 | **104** (90 action + 13 strategy + 1 init) |
+| Move rejections (HTTP 400) | 60 (16%) | **1** (<1%) |
+| 429 RESOURCE_EXHAUSTED | 817 | **0** |
+| 503 transient errors | — | 6 (all recovered) |
+| Timeouts | 1 | **0** |
+| Session trim events | 0 | **10–15** (trim at 80 turns, keep 40) |
+| Context cache created | Yes (refreshed 2×) | Yes (1 fail → 1 success; refreshed 1×) |
+| Per-gen strategy updates | Gen 2–20 | Gen 2–14 (13 total) |
+| Fallback pass events | 184 | **0** |
+| Total generations | 20 | **14** |
+
+### Response Timing
+
+Response times observed during interactive play (captured from `play_interactive.py` output):
+
+| Turn type | Observed time |
+|-----------|--------------|
+| Normal action turns | 0.8–7.8 s |
+| First turn after per-gen strategy update | 35–39 s |
+| Card buying decisions | ~35 s |
+| Pass / trivial decisions | < 2 s |
+
+No turn exceeded the 600 s script timeout (previously at 300 s, which caused 1 timeout in Session 1). The longest delays were strategy update generation, not action reasoning.
+
+### Token Usage
+
+Context caching for the main game worked on second attempt (first attempt failed: system prompt was 3,840 tokens, below Gemini's 4,096-token minimum for caching). After the init prompt completed with the strategy, caching succeeded.
+
+Estimated per-request input sizes with session trim (keep last 40 messages + strategy at front):
+
+| Turn | Estimated cumulative input tokens |
+|------|----------------------------------|
+| Turn 10 | ~12,000 |
+| Turn 40 | ~30,000 |
+| Turn 80 (trim triggered) | ≤ 44,000 (post-trim floor) |
+| Turn 90 (final) | ~45,000 (steady-state after trim) |
+
+Contrast with Session 1 (no trim, no output cap): turn 193 estimated at **375,000 tokens** per call. Session 2 stays bounded at ~45K indefinitely — an **8× reduction** in worst-case per-request size.
+
+Estimated total session token cost:
+- Input: ~104 calls × ~30K avg tokens = **3.1M input tokens**
+- Output: ~104 calls × 350 cap = **~36K output tokens**
+- gemini-3.1-flash-lite pricing is significantly lower than 2.5-flash; exact cost not measured (AI Studio key lacks Cloud Billing API access)
+
+### Fix Effectiveness
+
+**Fix A — 429 retryDelay (5s/10s → API-specified delay):**  
+Session 2: **0 rate-limit hits**. Impossible to isolate this fix's contribution — the switch to a lighter model with smaller prompts likely eliminated quota pressure independently. The fix remains important for heavier models.
+
+**Fix B — 350-token output cap on action turns:**  
+10 session trims occurred, meaning the session grew to 80+ messages repeatedly. Without the cap, session growth would have been ~1938 tokens/turn (Session 1 average) instead of ~1100 tokens/turn. The trim kept context bounded regardless. No evidence of truncated reasoning in action choices.
+
+**Fix C — Session trim at GEMINI_MAX_TURNS=80:**  
+Triggered 10–15 times across 14 generations. This is the primary mechanism that prevented context explosion. Working correctly.
+
+**Thinking budget (`GEMINI_THINKING_BUDGET=512` on all turns):**  
+No "one-line CHOICE: N" responses observed (a symptom of think=False in earlier builds). Gemini appeared to reason about cards and resources before choosing. The 1 rejection seen was resolved without a fallback.
+
+**Per-gen strategy update:**  
+Running correctly gens 2–14. The gen-14 update fired before Gemini's final buy decision (35 s delay). Gemini's final card buy (Magnetic Field Generators) and actions (2 Asteroid SPs, 1 greenery) are reasonable choices — no strategic derailment.
+
+**Fallback pass fix (search for "pass" by title):**  
+No fallback passes triggered — 0 fallback events vs 184 in Session 1.
+
+### Game Quality Observations
+
+**Gemini (Point Luna) played:**
+- 24 cards total (same number as Claude)
+- Built strong economy: MC production 23/gen, Ti production 4/gen (leveraging Point Luna's titanium draws)
+- Funded 2 awards (Magnate, Benefactor) — strategic use of economy advantage
+- Placed greenery in final generation to convert plants (O₂ raise to 14% that ended the game)
+- No multi-step resource tracking failures — the 1 rejection was a single correctable error
+
+**Score breakdown context:**
+- Claude's advantage came from a huge terraforming engine (Aquifer Pumping + Arctic Algae + Kelp Farming combo: placed all 9 oceans by gen 9, +12 plants/gen, then 10 Asteroid SPs in Gen 12 to max temperature)
+- Gemini's TR 33 (vs Claude's TR 62) reflects a reasonable automated-player score — comparable to moderate human play
+- Claude was played with strategic human-level decisions, not automated, making the score gap expected
+
+**Key improvements over Session 1:**
+1. No resource overspend rejections (0 vs 60) — thinking budget allows proper arithmetic
+2. No timeout — responsive throughout all 14 gens
+3. No rate limiting — model + trim kept quota well under limit
+4. Strategic coherence maintained across 14 generations (per-gen strategy updates working)
+
+### Remaining Issues
+
+**Payment section comprehension** — Gemini still occasionally confuses `PAYMENT:` format (the 1 rejection was payment-related). The prompt shows payment instructions clearly, but the model sometimes picks resource amounts that exceed balance. Low frequency now (1 in 90 turns = 1.1%).
+
+**Session trim side effect** — Trimming to last 40 messages drops early-game context. Gemini cannot recall what cards it played in Gen 1–6 after the trim. The per-gen strategy update mitigates this (strategy stored separately), but detailed reasoning about specific card synergies from early game is lost.
+
+**gemini-3.1-flash-lite reasoning depth** — The lighter model makes faster, cheaper decisions. It appears to handle basic game logic correctly, but complex multi-card synergy evaluation (e.g., recognising when Viron + Aquifer Pumping + Arctic Algae creates an ocean-placing engine) is less certain than with 2.5-flash. This is difficult to measure without a controlled experiment.
+
+### Conclusion
+
+The fixes collectively transformed Gemini from a crash-prone, quota-exploding player (Session 1: 817 quota hits, 60 rejections, 1 timeout, 184 fallbacks) into a reliable automated opponent (Session 2: 0 quota hits, 1 rejection, 0 timeouts, 0 fallbacks). The switch to gemini-3.1-flash-lite independently reduced per-request token cost 8×, making quota pressure a non-issue.
+
+The remaining gap is game quality, not infrastructure: Gemini plays reasonable moves but cannot match strategic play optimizing for synergistic combos. This is expected for a chat-prompted LLM without a trained value function.
+
+---
+
+## Deep Dive — The Gen 9 Stall: Strategy vs. Execution
+
+Gemini led the game on VP from gen 4 through gen 8. It held a **+6 VP lead entering gen 9**, then gained exactly 0 VP for three consecutive generations while TR sat frozen at 27. This section traces exactly what happened.
+
+### VP/TR progression per generation
+
+| Gen | Gem VP | Gem TR | Cla VP | Cla TR | Lead (G−C) | Gem VP gain | Cla VP gain |
+|-----|--------|--------|--------|--------|------------|-------------|-------------|
+| 1   | 20     | 21     | 21     | 21     | −1         | —           | —           |
+| 2   | 20     | 22     | 24     | 24     | −4         | +0          | +3          |
+| 3   | 23     | 23     | 26     | 26     | −3         | +3          | +2          |
+| 4   | 29     | 23     | 29     | 29     | 0          | +6          | +3          |
+| 5   | 31     | 25     | 31     | 29     | 0          | +2          | +2          |
+| 6   | 32     | 25     | 32     | 30     | 0          | +1          | +1          |
+| 7   | 37     | 25     | 34     | 32     | **+3**     | +5          | +2          |
+| 8   | 44     | 27     | 38     | 35     | **+6**     | +7          | +4          |
+| 9   | 44     | 27     | 50     | 37     | −6         | **0**       | **+12**     |
+| 10  | 44     | 27     | 53     | 39     | −9         | **0**       | +3          |
+| 11  | 44     | 27     | 60     | 44     | −16        | **0**       | +7          |
+| 12  | 45     | 28     | 66     | 47     | −21        | +1          | +6          |
+| 13  | 49     | 29     | 81     | 60     | −32        | +4          | +15         |
+| end | 58     | 33     | 87     | 62     | −29        | +7          | +3          |
+
+The reversal is sharp: Claude's gen 9 was +12 VP (Aquifer Pumping + Arctic Algae ocean chain, all 9 oceans placed in one burst), and Gemini's was +0.
+
+### Not forgetting — a strategy/execution disconnect
+
+Gemini's per-gen strategy updates show it remembered the objectives throughout. Gen 7 literally says: *"I am utilizing the Space Elevator for liquidity and the Equatorial Magnetizer to convert my energy production into direct TR gains."* Gen 9: *"I must maintain my VP lead while preventing AI-Blue from closing the gap through excessive terraforming."* Gen 10: *"my path to victory requires focusing on high-value card plays… to pick up incremental points that AI-Blue's engine might miss."* The analysis is correct. The execution was not.
+
+### Structural failure 1 — Magnetizer abandoned for Space Elevator (gens 9–12)
+
+Gemini had two repeatable blue-card actions: **Space Elevator** (gain 3 MC) and **Equatorial Magnetizer** (spend 1 energy → raise O₂ = +1 TR). Strip Mine had already drained energy production to **1 energy/gen** — exactly enough for one Magnetizer use per gen.
+
+The action log shows Gemini chose Space Elevator + Forced Precipitation instead, every gen. The Magnetizer raises TR permanently (+1 MC income/gen compounding + 1 VP), while Space Elevator is just 3 MC once. Magnetizer clearly has higher EV, but Gemini kept picking the more visible immediate number.
+
+Three missed Magnetizer uses = −3 TR ≈ −6 VP by game end, plus the compounding income loss.
+
+### Structural failure 2 — The Farming trap (gens 5–12)
+
+Gemini held Farming in hand for ~8 gens, waiting for +4°C. The strategy from gen 7 onward repeats *"holding Farming, waiting for temperature to reach +4°C."* But Gemini was not raising temperature — so it was waiting on a condition its own inaction was preventing.
+
+The card finally became playable in gen 12 when Claude's Asteroid standard-project blitz pushed temperature to +6°C. Farming (+2 MC prod, +2 plant prod) is a good card, but holding it for 8 gens while it shapes the stated strategy around an unachievable condition is a self-reinforcing trap. The model had no mechanism to notice the contradiction.
+
+### Structural failure 3 — Forced Precipitation is far too slow
+
+Starting gen 10, Gemini spent one action per gen on *"Pay 2 MC to add 1 floater to Forced Precipitation."* The card places an ocean tile when it accumulates 8 floaters. At one floater per gen with ~4 gens remaining at gen 10, it would never fire — and the 16 MC total cost nearly matches Aquifer:SP (18 MC, instant ocean). Gemini was spending actions and MC on a card that couldn't pay off, while the surface activity (*adding floaters*) created the appearance of terraforming progress without generating any TR.
+
+### Why the strategy/execution gap happens
+
+The per-gen strategy update is injected once as a block of text into the chat history. By the time the next action decision arrives, the model re-reads all context and makes a **greedy local choice**. The Magnetizer vs. Space Elevator decision gets resolved in favour of whichever option produces immediately visible output: MC is concrete and now; TR compounds invisibly across future generations. The model isn't ignoring its strategy — it just doesn't enforce it when facing the actual numbered options.
+
+This is a known LLM planning failure: the strategic reasoning layer and the in-turn execution layer aren't coupled. Writing *"I will use Magnetizer"* in a strategy paragraph doesn't constrain the next action choice. A fix would require explicit in-prompt reinforcement at decision time — something like surfacing the stated plan alongside the options: *"Your plan was to use Magnetizer this turn — is that still the right call?"* — rather than relying on passive context influence.
