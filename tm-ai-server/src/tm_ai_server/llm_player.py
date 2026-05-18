@@ -22,9 +22,11 @@ Env vars:
   USE_LLM                     Enable LLM player (default: false)
   OPENROUTER_API_KEY          Required for OpenRouter models
   OPENROUTER_MODEL            Default model (default: anthropic/claude-opus-4-7)
-  OPENROUTER_THINKING_BUDGET  Thinking tokens for capable models (default: 512;
+  OPENROUTER_THINKING_BUDGET  Thinking tokens for capable models (default: 1024;
                               setup/prelude always use 1024)
-  OPENROUTER_MAX_OUTPUT_TOKENS Cap on action response length (default: 350)
+  OPENROUTER_MAX_OUTPUT_TOKENS Cap on action response length (default: 2048;
+                              must exceed OPENROUTER_THINKING_BUDGET or the
+                              model gets truncated before writing CHOICE)
   OPENROUTER_MAX_TURNS        Trim session after this many turns (default: 80)
   OLLAMA_URL                  Ollama base URL (default: http://localhost:11434)
   OLLAMA_MODEL                Default Ollama model (default: qwen3:4b)
@@ -50,8 +52,8 @@ _LLM_DEBUG = os.getenv("LLM_DEBUG", "false").lower() == "true"
 # OpenRouter settings
 _OPENROUTER_API_KEY         = os.getenv("OPENROUTER_API_KEY", "")
 _OPENROUTER_MODEL           = os.getenv("OPENROUTER_MODEL", "anthropic/claude-opus-4-7")
-_OPENROUTER_THINKING_BUDGET = int(os.getenv("OPENROUTER_THINKING_BUDGET", "512"))
-_OPENROUTER_MAX_OUTPUT_TOKENS = int(os.getenv("OPENROUTER_MAX_OUTPUT_TOKENS", "350"))
+_OPENROUTER_THINKING_BUDGET = int(os.getenv("OPENROUTER_THINKING_BUDGET", "1024"))
+_OPENROUTER_MAX_OUTPUT_TOKENS = int(os.getenv("OPENROUTER_MAX_OUTPUT_TOKENS", "2048"))
 _OPENROUTER_MAX_TURNS       = int(os.getenv("OPENROUTER_MAX_TURNS", "80"))
 
 # Ollama settings
@@ -292,11 +294,32 @@ def _prefetch_pricing() -> None:
             logger.warning("OpenRouter pricing fetch failed: %s", e)
 
 
+_KNOWN_PRICING: dict[str, tuple[float, float]] = {
+    # (input $/token, output $/token) — used as fallback when live fetch misses
+    "anthropic/claude-opus-4-7":      (15e-6, 75e-6),
+    "anthropic/claude-sonnet-4-6":    (3e-6,  15e-6),
+    "anthropic/claude-haiku-4-5":     (0.8e-6, 4e-6),
+    "openai/gpt-4o":                  (2.5e-6, 10e-6),
+    "openai/gpt-4o-mini":             (0.15e-6, 0.6e-6),
+    "google/gemini-2.5-flash":        (0.3e-6, 1.2e-6),
+    "google/gemini-2.5-pro":          (1.25e-6, 10e-6),
+    "deepseek/deepseek-chat":         (0.27e-6, 1.1e-6),
+    "deepseek/deepseek-r1":           (0.55e-6, 2.19e-6),
+}
+
+
 def _get_openrouter_pricing(model: str) -> tuple[float, float]:
     """Return (input_usd_per_token, output_usd_per_token) from the pre-fetched cache."""
     if not _pricing_fetched:
         _prefetch_pricing()
-    return _pricing_cache.get(model, (0.0, 0.0))
+    result = _pricing_cache.get(model)
+    if result and result != (0.0, 0.0):
+        return result
+    # Fall back to known pricing (handles ID format mismatches between API and our usage)
+    for known_id, known_price in _KNOWN_PRICING.items():
+        if model.startswith(known_id) or known_id.startswith(model):
+            return known_price
+    return (0.0, 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -1029,6 +1052,20 @@ DRAFTING (when research phase offers card selection):
     withhold Jupiter-tag cards even at personal cost).
   • In late game, pass weak cards freely; in early game, card denial matters more.
 
+RESPONSE FORMAT — MANDATORY:
+  • Always end with CHOICE: N on its own line (N = the option number shown in the prompt).
+  • If playing a project card, follow immediately with PAYMENT: MC=<n>[, STEEL=<n>][, TITANIUM=<n>].
+  • Steel ONLY counts for BUILDING-tagged cards (×2 MC). Titanium ONLY counts for SPACE-tagged
+    cards (×3 MC). Using the wrong resource is an invalid payment — the server will reject it.
+  • PAYMENT must total AT LEAST the card's displayed cost. Underpaying is an error.
+
+SERVER AUTHORITY:
+  The game server enforces all rules and is ALWAYS CORRECT. If it rejects your move:
+  • Read the error message exactly — it tells you what was wrong.
+  • You MUST provide a different, valid response. Repeating the same invalid action is not allowed.
+  • You cannot argue with the server. Adapt your choice to what the server will accept.
+  • When in doubt, choose Pass or a low-risk action you can definitely afford.
+
 === END RULES REFERENCE ===
 """
 
@@ -1050,7 +1087,7 @@ def select_action_llm(
 
     try:
         if wf_type in SETUP_TYPES:
-            return _select_setup(state, waiting_for, player)
+            return _select_setup(state, waiting_for, player, last_error=last_error)
         else:
             return _select_action(state, waiting_for, player, last_error=last_error)
     except Exception as exc:
@@ -1081,8 +1118,10 @@ _PER_GEN_STRATEGY_PROMPT = (
     "If you have >=8 plants and O₂ < 14%, 'Convert 8 plants' MUST be a first action (free +1 TR). "
     "These are your highest-value zero-cost actions — never skip them. "
     "Also identify which cards in your hand you plan to play and why they fit your strategy. "
-    "Reminder: DO NOT use Convert Heat if temperature is already 8°C, and DO NOT place "
-    "greenery tiles if O₂ is already 14% (both are wasted actions at max).\n\n"
+    "Reminder: DO NOT use Convert Heat if temperature is already 8°C. "
+    "If O₂ is already 14%, placing greenery tiles gives no TR/O₂ bonus — but each tile still "
+    "scores +1 VP (plus +1 VP per adjacent city tile). Do NOT skip end-game greeneries just "
+    "because oxygen is maxed; they still count for VP.\n\n"
     "!! MANDATORY DEFERRAL LOOP CHECK !!\n"
     "Scroll back through your last 2-3 strategy updates visible in this conversation. "
     "For every goal you listed in previous NEXT-GEN PRIORITY sections: has the relevant "
@@ -1113,7 +1152,7 @@ def _per_generation_strategy_update(player: LLMPlayer, generation: int, state: d
     if temp >= 8:
         maxed_warnings.append("temperature is at maximum (8°C) — DO NOT use Convert Heat")
     if oxygen >= 14:
-        maxed_warnings.append("O₂ is at maximum (14%) — DO NOT place greenery tiles")
+        maxed_warnings.append("O₂ is at maximum (14%) — placing greenery tiles gives no TR/O₂ bonus, but still awards +1 VP per tile")
     if oceans >= 9:
         maxed_warnings.append("all 9 oceans are placed")
     global_status = ("⚠ Global parameters: " + "; ".join(maxed_warnings) + "\n") if maxed_warnings else ""
@@ -1176,7 +1215,7 @@ def _maybe_per_generation_update(player: LLMPlayer, generation: int, state: dict
 # Setup phase (initialCards / prelude)
 # ---------------------------------------------------------------------------
 
-def _select_setup(state: dict, waiting_for: dict, player: LLMPlayer) -> tuple[dict, dict]:
+def _select_setup(state: dict, waiting_for: dict, player: LLMPlayer, last_error: str | None = None) -> tuple[dict, dict]:
     g = state.get("game", {})
     wf_type = waiting_for.get("type", "")
     has_session = bool(player.session)
@@ -1185,6 +1224,12 @@ def _select_setup(state: dict, waiting_for: dict, player: LLMPlayer) -> tuple[di
                 player.player_id, wf_type, g.get("boardName", "?"), g.get("expansions", []), has_session)
 
     user = _build_setup_prompt(state, waiting_for)
+    if last_error:
+        user = (
+            f"⚠ THE GAME SERVER REJECTED YOUR PREVIOUS RESPONSE:\n"
+            f'  Error: "{last_error}"\n'
+            f"The server is always correct. Adapt your answer accordingly.\n\n"
+        ) + user
 
     if wf_type == "initialCards" or not has_session:
         game_ctx  = format_config_context(g)
@@ -1510,10 +1555,26 @@ def _select_action(
             )
             text = player.continue_session(combined, max_output_tokens=_max_out)
         else:
-            logger.error(
-                "Action still invalid after %d retries (player=%s):\n%s — sending best-effort",
-                _MAX_ACTION_RETRIES, player.player_id, combined,
-            )
+            # All retries exhausted — if the only problem is a missing CHOICE
+            # (no payment error), default to Pass rather than option 1, since a
+            # broken truncated response almost always means the model intended to pass.
+            only_choice_error = all("CHOICE" in e for e in errors)
+            pass_opt = next(
+                (o for o in options if "pass" in o.get("title", "").lower()),
+                None,
+            ) if only_choice_error else None
+            if pass_opt is not None:
+                response = index_to_response(waiting_for, pass_opt["index"])
+                debug = {"fallback": "pass"}
+                logger.warning(
+                    "Action still invalid after %d retries (player=%s) — best-effort is Pass (%r)",
+                    _MAX_ACTION_RETRIES, player.player_id, pass_opt["title"],
+                )
+            else:
+                logger.error(
+                    "Action still invalid after %d retries (player=%s):\n%s — sending best-effort",
+                    _MAX_ACTION_RETRIES, player.player_id, combined,
+                )
 
     g = state.get("game", {})
     if (g.get("temperature", -30) >= 8
@@ -1695,6 +1756,19 @@ _PAYMENT_KEYS = {
 }
 
 
+def _card_resource_values(card_name: str) -> tuple[int, int]:
+    """Return (steel_value, titanium_value) for a card based on its tags.
+    Steel is worth 2 MC only for building-tagged cards; titanium 3 MC only for space-tagged.
+    Unknown cards are treated permissively (both enabled) to avoid false rejections."""
+    if not card_name:
+        return 2, 3
+    info = CARD_DB.get(card_name, {})
+    if not info:
+        return 2, 3
+    tags = info.get("tags", [])
+    return (2 if "building" in tags else 0), (3 if "space" in tags else 0)
+
+
 def _empty_payment() -> dict:
     return {
         "megacredits": 0, "steel": 0, "titanium": 0, "heat": 0, "plants": 0,
@@ -1718,7 +1792,7 @@ def _parse_payment_line(text: str) -> dict | None:
     return payment
 
 
-def _correct_payment(payment: dict, waiting_for: dict, player: dict) -> dict:
+def _correct_payment(payment: dict, waiting_for: dict, player: dict, card_name: str = "") -> dict:
     """Clamp payment fields to available resources and ensure the total covers the cost."""
     wf_type = waiting_for.get("type", "")
     payment = dict(payment)
@@ -1729,11 +1803,17 @@ def _correct_payment(payment: dict, waiting_for: dict, player: dict) -> dict:
     ht_avail = player.get("heat",       0)
     pl_avail = player.get("plants",     0)
 
-    # Only allow steel/titanium for project card payments
     is_project = wf_type == "projectCard"
     if not is_project:
         payment["steel"]    = 0
         payment["titanium"] = 0
+    else:
+        # Zero out steel/titanium if the card's tags don't support them
+        st_val, ti_val = _card_resource_values(card_name)
+        if st_val == 0:
+            payment["steel"] = 0
+        if ti_val == 0:
+            payment["titanium"] = 0
 
     # Clamp all non-MC resources to available
     for field, available in [
@@ -1754,9 +1834,12 @@ def _correct_payment(payment: dict, waiting_for: dict, player: dict) -> dict:
     else:
         cost = waiting_for.get("amount", 0)
 
-    covered = sum(
-        payment.get(field, 0) * _PAYMENT_VALUES.get(field, 0)
-        for field in _PAYMENT_VALUES
+    st_val, ti_val = _card_resource_values(card_name) if is_project else (0, 0)
+    covered = (
+        payment.get("steel",    0) * st_val +
+        payment.get("titanium", 0) * ti_val +
+        sum(payment.get(f, 0) * _PAYMENT_VALUES.get(f, 0)
+            for f in _PAYMENT_VALUES if f not in ("steel", "titanium"))
     )
     needed_mc = max(0, cost - covered)
     if payment.get("megacredits", 0) < needed_mc:
@@ -1782,22 +1865,29 @@ def _check_payment_valid(
     st  = player.get("steel",       0)
     ti  = player.get("titanium",    0)
 
-    def _total(payment: dict) -> int:
-        return payment.get("megacredits", 0) + sum(
-            payment.get(f, 0) * _PAYMENT_VALUES[f] for f in _PAYMENT_VALUES if f in payment
+    def _total(payment: dict, card_name: str = "") -> int:
+        st_val, ti_val = _card_resource_values(card_name)
+        return (
+            payment.get("megacredits", 0) +
+            payment.get("steel",    0) * st_val +
+            payment.get("titanium", 0) * ti_val +
+            sum(payment.get(f, 0) * _PAYMENT_VALUES[f]
+                for f in _PAYMENT_VALUES if f not in ("steel", "titanium") and f in payment)
         )
 
     def _msg(card_name: str, payment: dict, cost: int) -> str | None:
         if cost <= 0:
             return None
-        total = _total(payment)
+        st_val, ti_val = _card_resource_values(card_name)
+        total = _total(payment, card_name)
         if total >= cost:
             return None
+        st_note = f"Steel={st} (×{st_val}={st*st_val} MC, building-tag only)" if st_val else f"Steel={st} (not applicable — no building tag)"
+        ti_note = f"Titanium={ti} (×{ti_val}={ti*ti_val} MC, space-tag only)" if ti_val else f"Titanium={ti} (not applicable — no space tag)"
         return (
             f"Your payment for {card_name!r} is insufficient: "
             f"total {total} MC but card costs {cost} MC. "
-            f"Available resources: MC={mc}, Steel={st} (×2={st*2} MC for building-tag), "
-            f"Titanium={ti} (×3={ti*3} MC for space-tag). "
+            f"Available resources: MC={mc}, {st_note}, {ti_note}. "
             f"Reply with PAYMENT totalling ≥{cost} MC, or choose a different option."
         )
 
@@ -1806,7 +1896,8 @@ def _check_payment_valid(
     if wf_type == "projectCard":
         card_node = waiting_for.get("card", {})
         cost = card_node.get("calculatedCost", 0) if card_node else waiting_for.get("amount", 0)
-        return _msg(response.get("card", "card"), response.get("payment", {}), cost)
+        cname = response.get("card", "card")
+        return _msg(cname, response.get("payment", {}), cost)
 
     if wf_type == "payment":
         cost = waiting_for.get("amount", 0)
@@ -1875,8 +1966,10 @@ def _build_action_prompt(
     lines: list[str] = []
 
     if last_error:
-        lines.append(f'⚠ Your previous response was rejected: "{last_error}"')
-        lines.append("Please correct your choice based on the error above.")
+        lines.append("⚠ THE GAME SERVER REJECTED YOUR PREVIOUS MOVE:")
+        lines.append(f'  Error: "{last_error}"')
+        lines.append("The server is always correct. You MUST choose a different, valid action.")
+        lines.append("Do NOT repeat the same choice. Adapt based on the error above.")
         lines.append("")
 
     lines += [
@@ -1889,7 +1982,11 @@ def _build_action_prompt(
     if temp >= 8:
         lines.append("⚠ Temperature is at maximum (8°C). DO NOT use Convert Heat — it is a wasted action.")
     if oxygen >= 14:
-        lines.append("⚠ O₂ is at maximum (14%). DO NOT place greenery tiles — they give no benefit.")
+        lines.append(
+            "⚠ O₂ is at maximum (14%). Placing greenery tiles gives no TR/O₂ bonus — "
+            "but each tile still awards +1 VP (plus +1 VP per adjacent city tile). "
+            "If you have >=8 plants and available land, placing greeneries is worthwhile for VP."
+        )
     if oceans >= 9:
         lines.append("⚠ All 9 oceans are placed. No more ocean tiles can be placed.")
 
@@ -1905,6 +2002,13 @@ def _build_action_prompt(
         lines.append(
             f">> ACTION AVAILABLE: you have {plants_now} plants (>=8) and O2 is not maxed."
             f" 'Convert 8 plants' places a greenery tile (+1 O2, +1 TR, +1 VP). Do this BEFORE passing."
+        )
+    elif plants_now >= 8 and oxygen >= 14:
+        tiles_possible = plants_now // 8
+        lines.append(
+            f">> GREENERY OPPORTUNITY: you have {plants_now} plants — could place {tiles_possible} greenery tile(s)."
+            f" O₂ is maxed so no TR bonus, but each tile scores +1 VP (plus +1 VP per adjacent city)."
+            f" Worth doing if land is available."
         )
     if prod:
         lines.append(f"Production: {prod}")
@@ -2149,7 +2253,8 @@ def _parse_action_response(
     if wf_type in ("projectCard", "payment"):
         payment = _parse_payment_line(text)
         if payment:
-            payment = _correct_payment(payment, waiting_for, p)
+            wf_card_name = waiting_for.get("card", {}).get("name", "") if wf_type == "projectCard" else ""
+            payment = _correct_payment(payment, waiting_for, p, card_name=wf_card_name)
             response = {**response, "payment": payment}
         else:
             logger.warning(
@@ -2188,7 +2293,7 @@ def _parse_action_response(
             if payment:
                 card_info = next((c for c in available_cards if c.get("name") == card_name), {})
                 stub_wf = {"type": "projectCard", "amount": card_info.get("calculatedCost", 0)}
-                payment = _correct_payment(payment, stub_wf, p)
+                payment = _correct_payment(payment, stub_wf, p, card_name=card_name)
             else:
                 payment = _auto_payment_for_card(card_name, sub_node, p)
                 logger.info(

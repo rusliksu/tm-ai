@@ -293,7 +293,7 @@ Converts the JSON state from the TM server into a fixed-size float32 feature vec
 | Milestones/Awards | 4 | ms_self, ms_total, aw_self, aw_total |
 | Config | 19 | player_count + 5 board one-hot + 13 expansion flags (zeroed when game_spec=None to keep train/inference consistent) |
 
-`flatten_options()` walks the `waitingFor` decision tree depth-first into a list of leaf choices. Padded to `MAX_ACTIONS = 128`; the policy emits 128 logits, mask is applied before softmax.
+`flatten_options()` walks the `waitingFor` decision tree depth-first into a list of leaf choices. Padded to `MAX_ACTIONS = 128`; the policy emits 128 logits, mask is applied before softmax. Handles all `PlayerInput` subtypes including `SelectResource` (added when Nirgal Enterprises / resource-selection cards are played).
 
 ### Planned architecture — Option C (card embeddings + spatial board + per-option scoring)
 
@@ -631,9 +631,21 @@ Per-generation boundary
 
 **Description elision**: for `wf_type == "card"` (discard/keep/draft) where all candidate cards are already shown in the hand block, descriptions are replaced with `"(see hand above)"` — saves ~50–200 tokens per such turn.
 
-**Error feedback**: when `last_error` is set, the action prompt prepends `⚠ Your previous response was rejected: "..."`.
+**Error feedback**: when `last_error` is set (external rejection from TM server), both `_select_action` and `_select_setup` prepend `⚠ THE GAME SERVER REJECTED YOUR PREVIOUS MOVE: "..."` plus a server-authority reminder. TM_RULES also contains a `RESPONSE FORMAT — MANDATORY` section (CHOICE + PAYMENT format) and `SERVER AUTHORITY` section (read the error, never repeat invalid moves, server is always correct).
 
-**Payment**: for `projectCard` and `payment` decisions, the prompt shows available resources and asks for `PAYMENT: MC=N[, STEEL=N][, TITANIUM=N]...`. `_correct_payment` validates and clamps the parsed payment before submitting.
+**Internal retry loop**: `_select_action` retries LLM calls up to `_MAX_ACTION_RETRIES=2` times within a single `/move` request:
+1. Checks CHOICE line present — feeds back list of valid options if missing
+2. Calls `_check_payment_valid()` — feeds back available resources and required total if underfunded
+On exhaustion falls back to "Pass" option (if only error was missing CHOICE), else sends best-effort.
+
+**Payment validation** (`_check_payment_valid`, `_card_resource_values`, `_auto_payment_for_card`):
+- `_card_resource_values(card_name)` looks up CARD_DB tags: steel (×2 MC) applies only to building-tagged cards; titanium (×3 MC) only to space-tagged. Inapplicable resources zeroed by `_correct_payment()`.
+- `_check_payment_valid()` checks all payment paths: direct `projectCard`, direct `payment`, nested `or→projectCard`.
+- `_auto_payment_for_card()` generates optimal steel/titanium payment when the AI omits the PAYMENT line.
+
+**Pricing** (`_prefetch_pricing`, `_KNOWN_PRICING`): model prices fetched from OpenRouter `/api/v1/models` once at startup (thread-safe). `_KNOWN_PRICING` dict provides fallback rates for 9 common models when the live API response ID doesn't match (prevents $0 cost tracking for e.g. `anthropic/claude-sonnet-4-6`).
+
+**Payment**: for `projectCard` and `payment` decisions, the prompt shows available resources and asks for `PAYMENT: MC=N[, STEEL=N][, TITANIUM=N]...`. `_correct_payment(payment, wf, player, card_name)` validates and clamps the parsed payment; `card_name` param enables tag-aware steel/titanium zeroing.
 
 **Effective card cost**: hand display shows cost after steel/titanium discounts: e.g. `Nuclear Power [cost: 10 MC, effective: 4 MC with 3 steel]`.
 
@@ -649,8 +661,8 @@ Per-generation boundary
 | `LLM_DEBUG` | `false` | Log prompts (`>` prefix) and responses (`<` prefix) |
 | `OPENROUTER_API_KEY` | _(required for OpenRouter)_ | API key from openrouter.ai |
 | `OPENROUTER_MODEL` | `anthropic/claude-opus-4-7` | Default model for new players |
-| `OPENROUTER_THINKING_BUDGET` | `512` | Thinking tokens for capable models (setup/prelude always use 1024) |
-| `OPENROUTER_MAX_OUTPUT_TOKENS` | `350` | Cap on action response length |
+| `OPENROUTER_THINKING_BUDGET` | `1024` | Thinking tokens for capable models (setup/prelude always use 1024) |
+| `OPENROUTER_MAX_OUTPUT_TOKENS` | `2048` | Cap on action response length (must exceed THINKING_BUDGET or response truncates before CHOICE) |
 | `OPENROUTER_MAX_TURNS` | `80` | Trim session after this many turns |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama server base URL |
 | `OLLAMA_MODEL` | `qwen3:4b` | Default Ollama model |
@@ -694,7 +706,11 @@ The AI Trainer is a coaching sidebar that advises a **human** player. It is **op
 - `_build_setup_prompt(state, waiting_for)` — corp/card/prelude/CEO options with descriptions
 - `_parse_setup_response(text, waiting_for, player)` — extract CORPORATION/BUY_CARDS/PRELUDE_CARDS/CEO_CARD/STRATEGY
 - `_parse_action_response(text, options, waiting_for, player_id, player)` — extract CHOICE + PAYMENT
-- `_correct_payment(payment, wf, player)` — clamp/validate payment against available resources
+- `_correct_payment(payment, wf, player, card_name)` — clamp/validate payment; card_name enables tag-aware steel/titanium zeroing
+- `_check_payment_valid(response, options, wf, player)` → `str | None` — check payment coverage; returns error string or None
+- `_card_resource_values(card_name)` → `(steel_val, ti_val)` — 0 or 2/3 from CARD_DB tags; unknown cards return (2,3) permissively
+- `_auto_payment_for_card(card_name, sub_node, player)` — generate optimal steel/titanium/MC payment from available resources
+- `_prefetch_pricing()` — fetch all OpenRouter model prices at startup (once, thread-safe); `_KNOWN_PRICING` fallback covers 9 common models
 - `_get_trainer_player(game_id, player_id, state)` — return or create trainer session (`trainer:<player_id>`)
 - `select_action_advise(state, waiting_for, game_id, player_id, user_question)` — AI Trainer entry point
 

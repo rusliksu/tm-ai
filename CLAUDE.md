@@ -111,9 +111,10 @@ Two new TM server endpoints for PPO training:
 
 **`POST /api/ai/new-game`** — creates a self-play game (both AI, `isSelfPlay=true` suppresses auto `requestAiMove()` AND skips JSONL logging — game persists to DB only):
 ```json
-{"boardName":"tharsis", "playerCount":2}
-→ {"game_id":"g...", "player_id":"p...", "state":{...}, "waitingFor":{...}, "game_spec":{...}}
+{"boardName":"tharsis", "playerCount":2, "playerNames":["Claude","GPT"]}
+→ {"game_id":"g...", "player_id":"p...", "spectator_id":"s...", "state":{...}, "waitingFor":{...}, "game_spec":{...}}
 ```
+`spectator_id` allows constructing `http://localhost:8080/spectator?id=<spectator_id>` to watch the game in a browser.
 
 **`POST /api/ai/step`** — applies one player's decision, returns next state:
 ```json
@@ -189,6 +190,10 @@ cd tm-ai-server && USE_LLM=true LLM_PROVIDER=ollama OLLAMA_MODEL=qwen3:4b LLM_DE
 cd tm-ai-server && USE_LLM=true LLM_PROVIDER=gemini GEMINI_API_KEY=$GEMINI_API_KEY LLM_DEBUG=true \
   uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000 >> /tmp/ai-server.log 2>&1 &
 
+# 1. Start AI server — OpenRouter mode (multi-model, cloud — requires OPENROUTER_API_KEY in .env)
+cd tm-ai-server && USE_LLM=true LLM_PROVIDER=openrouter LLM_DEBUG=true \
+  uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000 >> /tmp/ai-server.log 2>&1 &
+
 # 2. Build and start TM server (from terraforming-mars/)
 npm run build:server
 node build/src/server/server.js >> /tmp/tm-server.log 2>&1 &
@@ -197,52 +202,93 @@ node build/src/server/server.js >> /tmp/tm-server.log 2>&1 &
 # — or run PPO self-play training (see Commands above)
 ```
 
+### Quick-start scripts (recommended)
+
+```bash
+# Start everything + run a 4-LLM death match (AI server on OpenRouter, TM server, play_game.py)
+./start.sh --death-match
+
+# Start AI server (Gemini flash-lite) + TM server only
+./start.sh
+
+# Override default death-match lineup
+DEATH_MATCH_MODELS="anthropic/claude-sonnet-4-6,openai/gpt-4o-mini,google/gemini-2.5-flash,deepseek/deepseek-chat" \
+  ./start.sh --death-match
+
+# Stop everything (kills PIDs tracked in /tmp/tm-ai.pids and /tmp/death-match.pids)
+./stop.sh
+./stop.sh --clean-db   # also removes all self-play games from the TM SQLite DB
+
+# Run a multi-LLM game manually (both servers must be up)
+uv run python scripts/play_game.py \
+  --players 4 \
+  --models "anthropic/claude-sonnet-4-6,openai/gpt-4o-mini,google/gemini-2.5-flash,deepseek/deepseek-chat"
+# --board tharsis|hellas|elysium   (default: random)
+# --verbose                         (print full state JSON each turn)
+```
+
+`start.sh` writes `PID` files to `/tmp/tm-ai.pids` (servers) and `/tmp/death-match.pids` (game loop). The game's spectator URL is written to `/tmp/current-game.url` once the game is created, and the script attempts to open it in Chrome/Chromium automatically.
+
 ## LLM Player (llm_player.py)
 
-Supports Ollama (local, free) and Gemini (cloud, fast). Select via `LLM_PROVIDER`. Env vars:
+Supports three providers: **Ollama** (local, free), **Gemini** (cloud, fast), and **OpenRouter** (cloud, multi-model — one player per model). Select via `LLM_PROVIDER`. Env vars:
 
 | Var | Default | Description |
 |-----|---------|-------------|
 | `USE_LLM` | `false` | Enable LLM player |
-| `LLM_PROVIDER` | `ollama` | `ollama` or `gemini` |
+| `LLM_PROVIDER` | `ollama` | `ollama`, `gemini`, or `openrouter` |
 | `LLM_DEBUG` | `false` | Log prompts (`>` prefix) and responses (`<` prefix) |
 | `OLLAMA_MODEL` | `qwen3:4b` | Ollama model tag |
 | `OLLAMA_TIMEOUT` | `600` | Ollama timeout (s) |
 | `GEMINI_API_KEY` | — | Google AI Studio key (required for Gemini) |
-| `GEMINI_MODEL` | `gemini-2.5-flash-lite` | Gemini model — supported: `gemini-3-pro`, `gemini-3-flash`, `gemini-3-flash-lite`, `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite` (any Google AI Studio name accepted) |
-| `GEMINI_THINKING_BUDGET` | `512` | Thinking tokens per turn (setup/prelude always use 1024) |
-| `GEMINI_ACTION_MAX_OUTPUT_TOKENS` | `350` | Max output tokens for action turns (caps verbose responses, reduces context growth) |
-| `GEMINI_MAX_TURNS` | `80` | Trim Gemini chat history after this many turns (keeps cumulative input under quota) |
+| `GEMINI_MODEL` | `gemini-2.5-flash-lite` | Gemini model (any Google AI Studio name) |
+| `OPENROUTER_API_KEY` | — | OpenRouter API key (required for OpenRouter) |
+| `OPENROUTER_MODEL` | `anthropic/claude-opus-4-7` | Default model for OpenRouter (per-player override via `POST /player/register`) |
+| `OPENROUTER_THINKING_BUDGET` | `1024` | Thinking tokens for capable models (setup/prelude always use 1024) |
+| `OPENROUTER_MAX_OUTPUT_TOKENS` | `2048` | Max output tokens per action (must exceed THINKING_BUDGET or response is truncated before CHOICE) |
+| `OPENROUTER_MAX_TURNS` | `80` | Trim session history after this many turns |
+| `GEMINI_THINKING_BUDGET` | `512` | Thinking tokens per turn for Gemini (setup/prelude always use 1024) |
+| `GEMINI_MAX_TURNS` | `80` | Trim Gemini chat history after this many turns |
 
-**Session-per-game architecture**: TM rules + board/expansion context sent once at game start (`_call_llm_init`); all subsequent turns continue the same session (`_call_llm_continue`) — no rules repetition.
+**Session-per-game architecture**: TM rules + board/expansion context sent once at game start; all subsequent turns continue the same session — no rules repetition.
 
 **Setup phase** (`initialCards`/`prelude`): `think=True` → chain-of-thought corp + card selection, writes a 100–200 word strategy document including a TABLEAU section (played cards + effects). Strategy stored per `game_id` in `_game_strategies`.
 
-**Action phase**: `think=False` → fast direct answer. Strategy NOT re-requested each turn (saves tokens). Prompt shows:
+**Action phase prompt** shows:
 - Current resources/production/tags
 - `Your hand (N cards):` with cost, tags, description for each card
-- Opponent resources/production/tags
+- Opponent resources/production/tags (incl. VP standing)
 - `Recent events:` from serialized game log (current generation)
 - Numbered options with blue-card-action options annotated: `Use Soletta action — <desc>`
 - Payment section for `projectCard`/`payment` decisions: AI specifies `PAYMENT: MC=N[, STEEL=N][, TITANIUM=N]...`
+- `⚠ GREENERY OPPORTUNITY` reminder when plants ≥ 8 and O₂ is maxed (tiles still give +1 VP each)
 
-**Error feedback**: when `last_error` is set in the request, it is prepended as `⚠ Your previous response was rejected: "..."` so the AI can correct its choice or payment.
+**Internal retry loop** (`_select_action`): up to `_MAX_ACTION_RETRIES=2` LLM retries within a single `/move` call. Before submitting, the server validates:
+1. CHOICE line is present — error fed back if missing
+2. Payment is sufficient (`_check_payment_valid()`) — feeds back exact resources available and required total
+On exhaustion, falls back to the "Pass" option if the only error is a missing CHOICE line; otherwise sends best-effort.
 
-**Session recovery**: if a Gemini session is lost (503 exhausted, server restart), `_session_recovery` re-initialises a chat session using the stored strategy as context. Future turns continue it normally.
+**Payment validation**: `_check_payment_valid()` checks if the AI's PAYMENT covers `calculatedCost`. `_card_resource_values(card_name)` looks up CARD_DB tags to determine whether steel (building-tagged cards, ×2 MC) or titanium (space-tagged, ×3 MC) apply — inapplicable resources are zeroed by `_correct_payment()`. `_auto_payment_for_card()` generates an optimal steel/titanium payment when no PAYMENT line is present.
 
-**Ollama context trim**: when Ollama session exceeds `MAX_SESSION_MESSAGES` (~30 turns), strategy (including TABLEAU) is captured via an extra API call, then the session is rebuilt as: original system + strategy reminder + last 40 messages.
+**External error feedback** (`last_error`): when the TM server rejects an `input_response` (returned as HTTP 400), `play_game.py` re-calls `/move` with `last_error` set. The AI server prepends `⚠ THE GAME SERVER REJECTED YOUR PREVIOUS MOVE: "..."` plus a server-authority reminder to the next LLM turn — applies to both action and setup phases.
 
-**Gemini context caching**: system prompt is cached once per game via `client.caches.create` (TTL 3600s). All turns use `cached_content=name` — billed once, not per turn. TTL refreshed every 50 min; on refresh failure the chat is rebuilt with inline `system_instruction`.
+**TM_RULES additions**: `RESPONSE FORMAT` section mandates ending with `CHOICE: N` + `PAYMENT: MC=N[, ...]`; `SERVER AUTHORITY` section instructs the model to read rejection errors and never repeat an invalid move.
 
-**Gemini per-generation strategy update**: at each generation bump, `_per_generation_strategy_update` sends a structured restate prompt to the existing chat (standing, engine, milestone target with "claim it if you already qualify" reminder, award target, next-gen priority). The response becomes natural chat history and is stored in `_game_strategies`. Chat is **not** rebuilt — Gemini's 1M-token context handles full sessions. Replaces an earlier `_trim_gemini_session` that re-injected a fake user/model summary pair at chat[0] and caused the model to re-paraphrase that stale anchor every generation (observed in game `ga097581101aa`: identical opening-strategy stub re-emitted from gen 2 through gen 13).
+**Session recovery**: if an OpenRouter/Gemini session is lost (503 exhausted, server restart), `_session_recovery` re-initialises a chat session using the stored strategy as context.
 
-**Think on every turn**: `GEMINI_THINKING_BUDGET` (default 512; setup/prelude always use 1024) applies to every action and the per-gen reflection. Ollama `_continue_ollama_session` also uses `think=True`. Earlier `think=False` on action turns caused the AI to emit one-line `CHOICE: N` responses without considering milestones it already qualified for.
+**Per-generation strategy update**: at each generation bump, `_maybe_per_generation_update` sends a structured restate prompt (standing, engine, milestone/award targets, next-gen priority). Response is stored in `_game_strategies`.
+
+**Think on every turn**: thinking budget applies to every action and per-gen reflection. `thinking` vs `reasoning` params are branched by provider: Anthropic uses `extra_body["thinking"]`; all other OpenRouter models use `extra_body["reasoning"]["max_tokens"]`.
+
+**Capability fallback**: if a model rejects caching or thinking headers, the capability is permanently disabled for that model within the session and the call is retried. Transient 429/503 errors do NOT disable capabilities — they are re-raised for the retry wrapper.
+
+**Pricing**: `_prefetch_pricing()` fetches all OpenRouter model prices at startup (once, thread-safe). `_KNOWN_PRICING` dict provides fallback rates for 9 common models when the API response ID doesn't match exactly (prevents $0 cost tracking for e.g. `anthropic/claude-sonnet-4-6`).
 
 **Description elision**: for discard/keep/draft decisions (`wf_type == "card"`) where all cards are already in the hand block, descriptions are replaced with `"(see hand above)"` — saves ~50–200 tokens per such turn.
 
-**Gemini transient errors**: `_gemini_with_retry` retries on 503/429 with exponential backoff (5s, 10s, 3 attempts).
+**AI Trainer** (`select_action_advise`): per-player coaching via `POST /advise`. Opt-in per player from the UI toggle — no game-wide flag. Session namespace `trainer:<game_id>:<player_id>` isolates each player's session. Setup phases (`initialCards`, `prelude`) handled by `_select_setup_advise`. System prompt requires plain-text 1-3 sentence coaching plus a `<recommendation>` block; markdown is forbidden. Requires `USE_LLM=true`. Play Recommendation in `AiTrainerChat.vue` reloads the page on success.
 
-**AI Trainer** (`select_action_advise`): per-player coaching via `POST /advise`. Opt-in per player from the UI toggle — no game-wide flag. Session namespace `trainer:<game_id>:<player_id>` isolates each player's session. Setup phases (`initialCards`, `prelude`) handled by `_select_setup_advise` so the trainer can recommend opening corp + cards, not just action turns. System prompt (`_TRAINER_SYSTEM_SUFFIX`) requires plain-text 1-3 sentence coaching plus a `<recommendation>` block; markdown is forbidden. Think enabled (`GEMINI_THINKING_BUDGET`). Requires `USE_LLM=true`. Play Recommendation in `AiTrainerChat.vue` reloads the page on success.
+**Multi-LLM death match**: `POST /player/register` assigns a model to a player before game start. `play_game.py --models "a/m1,b/m2,..."` registers one model per seat and runs a full game. `POST /game-done` flushes the per-player token/cost summary.
 
 ## Remaining Work
 

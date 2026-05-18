@@ -70,6 +70,26 @@ node build/src/server/server.js
 
 Open `http://localhost:8080`, create a game, tick "AI player?" for the bot. The TM server calls `POST /move` for every decision.
 
+### D. Run a multi-LLM death match (4 models, OpenRouter)
+
+```bash
+source ~/workspace/tm-ai/.env   # must have OPENROUTER_API_KEY
+
+cd ~/workspace/tm-ai
+./start.sh --death-match        # starts AI server (OpenRouter) + TM server + 4-player game
+# Opens the spectator URL in Chrome; follow the game in real time.
+# Logs: /tmp/ai-server.log, /tmp/tm-server.log, /tmp/death-match.log
+
+# Override the default lineup
+DEATH_MATCH_MODELS="anthropic/claude-sonnet-4-6,openai/gpt-4o-mini,google/gemini-2.5-flash,deepseek/deepseek-chat" \
+  ./start.sh --death-match
+
+# Stop everything when done
+./stop.sh
+```
+
+Default lineup: Claude Sonnet 4-6, GPT-4o-mini, Gemini 2.5 Flash, DeepSeek Chat. See `logs/llm-test/` for archived game logs and analysis.
+
 ### B. Play vs. an LLM (Ollama or Gemini)
 
 ```bash
@@ -127,7 +147,7 @@ The tool skips any game whose JSONL already exists in the output dir, so re-runs
 ```bash
 # AI server
 cd ~/workspace/tm-ai/tm-ai-server
-uv run pytest tests/                                         # 30 tests
+uv run pytest tests/                                         # 46 tests
 uv run pytest tests/test_encoding.py::test_flatten_or_options -v
 
 # TM server
@@ -154,7 +174,7 @@ A fork of `bafolts/terraforming-mars` on branch `feat/ai-player`. Adds the AI-in
 | `server/ai/stateMapping.ts` | `buildAiRequestState()` — full state payload incl. cardsInHand, recentLog (opponents-only filter), boardSpaces, milestones/awards, gameVariants |
 | `server/ai/TrainingLogger.ts` | writeMeta / appendTurn / writeResult; per-game JSONL into `AI_TRAINING_LOG_DIR` |
 | `server/ai/AiClient.ts` | HTTP client to AI server (`/move`, `/advise`); `MoveRequestPayload` includes optional `last_error` |
-| `server/routes/ApiAiSelfPlay.ts` | `POST /api/ai/new-game` + `/api/ai/step` for PPO self-play |
+| `server/routes/ApiAiSelfPlay.ts` | `POST /api/ai/new-game` + `/api/ai/step` for PPO self-play; response includes `spectator_id` |
 | `server/routes/ApiAiAdvice.ts` | `POST /api/ai/advice` + `/api/ai/play-recommendation` for the AI Trainer; per-player, no game-wide gate |
 | `server/tools/export_training_data.ts` | Replays the engine on DB saves to produce Plan-B-format JSONLs; skip-if-exists for idempotent re-runs |
 | `server/tools/extract_card_db.ts` | Walks the card renderer to extract all 970 cards into `tm-ai/data/card_db.json` |

@@ -172,7 +172,7 @@ Creates a 2-player self-play game (both players have `isAI=true`, `game.isSelfPl
 
 Request body (all optional):
 ```json
-{"boardName": "tharsis", "playerCount": 2}
+{"boardName": "tharsis", "playerCount": 2, "playerNames": ["Claude", "GPT"]}
 ```
 
 Response:
@@ -180,10 +180,13 @@ Response:
 {
   "game_id": "g...",
   "player_id": "p...",
+  "spectator_id": "s...",
   "state": {...},
   "waitingFor": {...},
   "game_spec": {...}
 }
+```
+`spectator_id` can be used to construct a browser-viewable URL: `http://localhost:8080/spectator?id=<spectator_id>`. `play_game.py` writes this URL to `/tmp/current-game.url` once the game is created; `start.sh` polls that file and opens it in Chrome.
 ```
 
 ### `POST /api/ai/step`
@@ -208,6 +211,14 @@ Response (game over):
 ```
 
 The Python env (`env_tm.py`) calls these endpoints sequentially; the model plays both AI players.
+
+### `scripts/play_game.py` — multi-LLM driver
+
+`play_game.py` drives a full game using the AI server for every move. Key behaviours:
+- Calls `POST /player/register` before the game starts to assign one LLM per player seat (`--models "a/m1,b/m2,..."`)
+- Writes the spectator URL to `/tmp/current-game.url` immediately after `POST /api/ai/new-game`
+- On TM server `POST /api/ai/step` rejection (HTTP 400): re-calls `POST /move` with `last_error` and retries `/step` up to `_MAX_STEP_RETRIES=2` times before aborting
+- Calls `POST /game-done` at game end to flush per-player token/cost logs
 
 ---
 

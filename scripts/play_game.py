@@ -45,6 +45,21 @@ def post_json(url: str, payload: dict, timeout: int = 300) -> dict:
         raise RuntimeError(f"HTTP {e.code} from {url}: {body}") from e
 
 
+def _extract_server_error(raw: str) -> str:
+    """Pull the error string out of 'HTTP 400 from <url>: {"error":"..."}'."""
+    try:
+        idx = raw.find(": {")
+        if idx >= 0:
+            body = json.loads(raw[idx + 2:])
+            return body.get("error", raw)
+    except Exception:
+        pass
+    return raw
+
+
+_MAX_STEP_RETRIES = 2
+
+
 def build_move_request(game_id: str, player_id: str, state: dict, waiting_for: dict) -> dict:
     return {
         "game_id": game_id,
@@ -135,10 +150,19 @@ def play_game(
     print(f"Creating game (board={board or 'random'}, players={player_count}) ...", flush=True)
     data = post_json(f"{tm_url}/api/ai/new-game", new_game_payload, timeout=30)
 
-    game_id   = data["game_id"]
-    player_id = data["player_id"]
-    state     = data["state"]
-    wf        = data["waitingFor"]
+    game_id      = data["game_id"]
+    player_id    = data["player_id"]
+    spectator_id = data.get("spectator_id")
+    state        = data["state"]
+    wf           = data["waitingFor"]
+
+    # Write spectator URL to a temp file so start.sh can open it in a browser
+    spectator_url = f"{tm_url}/spectator?id={spectator_id}" if spectator_id else f"{tm_url}"
+    try:
+        with open("/tmp/current-game.url", "w") as _f:
+            _f.write(spectator_url + "\n")
+    except OSError:
+        pass
 
     # Collect all player IDs in seat order: active player first, then opponents
     all_players: list[dict] = [state.get("player", {})] + (state.get("opponents") or [])
@@ -147,7 +171,7 @@ def play_game(
                                     for p in all_players if p.get("id")}
 
     # --- Register players with their models ---
-    print(f"\nGame {game_id}", flush=True)
+    print(f"\nGame {game_id}  spectator: {spectator_url}", flush=True)
     assigned_models = register_players(ai_url, game_id, player_ids, models)
 
     # Show lineup
@@ -187,13 +211,34 @@ def play_game(
         input_response = move_data["input_response"]
         print(f"  → {json.dumps(input_response)[:80]}  ({elapsed:.1f}s)", flush=True)
 
-        # --- Submit move to TM server ---
-        step_payload = {"game_id": game_id, "player_id": player_id, "input_response": input_response}
-        try:
-            step_data = post_json(f"{tm_url}/api/ai/step", step_payload, timeout=30)
-        except RuntimeError as e:
-            print(f"  ✗ TM server rejected move: {e}")
-            sys.exit(1)
+        # --- Submit move to TM server (with retry-on-rejection) ---
+        step_data: dict = {}
+        step_last_error: str | None = None
+        for step_attempt in range(_MAX_STEP_RETRIES + 1):
+            if step_attempt > 0:
+                # Re-ask AI server with the rejection error
+                move_req["last_error"] = step_last_error
+                try:
+                    move_data = post_json(f"{ai_url}/move", move_req, timeout=300)
+                except RuntimeError as e:
+                    print(f"\n  ✗ AI server error on retry {step_attempt}: {e}")
+                    sys.exit(1)
+                input_response = move_data["input_response"]
+                print(f"  ↩ retry {step_attempt}/{_MAX_STEP_RETRIES}: {json.dumps(input_response)[:70]}",
+                      flush=True)
+
+            step_payload = {"game_id": game_id, "player_id": player_id, "input_response": input_response}
+            try:
+                step_data = post_json(f"{tm_url}/api/ai/step", step_payload, timeout=30)
+                break
+            except RuntimeError as e:
+                step_last_error = _extract_server_error(str(e))
+                if step_attempt < _MAX_STEP_RETRIES:
+                    print(f"\n  ⚠ TM rejected (attempt {step_attempt + 1}): {step_last_error[:100]}",
+                          flush=True)
+                else:
+                    print(f"\n  ✗ TM rejected after {_MAX_STEP_RETRIES} retries: {step_last_error}")
+                    sys.exit(1)
 
         if step_data.get("done"):
             print(f"\n=== Game over (gen {gen}) ===\n")

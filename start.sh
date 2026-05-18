@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
-# Start both servers in the background with the typical Gemini-LLM configuration.
+# Start both servers (and optionally a death-match experiment) in the background.
 #
 # USAGE
 #   ./start.sh                        # start AI (Gemini flash-lite) + TM servers
+#   ./start.sh --death-match          # start AI (OpenRouter) + TM + 4-LLM game
 #   GEMINI_MODEL=gemini-2.5-pro ./start.sh
+#   DEATH_MATCH_MODELS="anthropic/claude-sonnet-4-6,openai/gpt-4o-mini,google/gemini-2.5-flash,deepseek/deepseek-chat" ./start.sh --death-match
 #   LLM_DEBUG=false ./start.sh
 #   TM_AI_DIR=/path TM_DIR=/path ./start.sh
 #
 # REQUIREMENTS
-#   Reads `${TM_AI_DIR}/.env` for `GEMINI_API_KEY` — that env file is the only
-#   place the key should live. Aborts immediately if the key is missing.
+#   Normal mode:       GEMINI_API_KEY in ${TM_AI_DIR}/.env
+#   --death-match:     OPENROUTER_API_KEY in ${TM_AI_DIR}/.env
 #
 # PORTS
 #   8000 — AI server (FastAPI)
@@ -18,40 +20,57 @@
 #   asks for confirmation before killing them. Decline → script exits.
 #
 # OUTPUT
-#   PIDs printed at the end AND written to /tmp/tm-ai.pids
-#   Logs:  /tmp/ai-server.log  (AI)   /tmp/tm-server.log  (TM)
+#   Server PIDs written to /tmp/tm-ai.pids
+#   Game PID written to   /tmp/death-match.pids  (--death-match only)
+#   Logs:  /tmp/ai-server.log    (AI server)
+#          /tmp/tm-server.log    (TM server)
+#          /tmp/death-match.log  (game loop; --death-match only)
 #
 # STOP
-#   kill <AI_PID> <TM_PID>          # PIDs from this script's output, or:
-#   xargs kill < /tmp/tm-ai.pids
+#   ./stop.sh           # kills everything tracked in PID files
 
 set -euo pipefail
+
+# --- parse args ---------------------------------------------------------------
+DEATH_MATCH=false
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --death-match) DEATH_MATCH=true; shift ;;
+    *) echo "Unknown option: $1" >&2; exit 1 ;;
+  esac
+done
 
 TM_AI_DIR="${TM_AI_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 TM_DIR="${TM_DIR:-${TM_AI_DIR}/../terraforming-mars}"
 AI_LOG=/tmp/ai-server.log
 TM_LOG=/tmp/tm-server.log
+DM_LOG=/tmp/death-match.log
 PID_FILE=/tmp/tm-ai.pids
+DM_PID_FILE=/tmp/death-match.pids
 
-# --- env --------------------------------------------------------------------
+# Default 4-LLM lineup for --death-match (override via DEATH_MATCH_MODELS env var)
+DEATH_MATCH_MODELS="${DEATH_MATCH_MODELS:-anthropic/claude-sonnet-4-6,openai/gpt-4o-mini,google/gemini-2.5-flash,deepseek/deepseek-chat}"
+
+# --- env ----------------------------------------------------------------------
 if [[ -f "${TM_AI_DIR}/.env" ]]; then
   set -a; source "${TM_AI_DIR}/.env"; set +a
 fi
-: "${GEMINI_API_KEY:?GEMINI_API_KEY is not set (add it to ${TM_AI_DIR}/.env)}"
+
+if [[ "${DEATH_MATCH}" == "true" ]]; then
+  : "${OPENROUTER_API_KEY:?OPENROUTER_API_KEY is not set (add it to ${TM_AI_DIR}/.env)}"
+else
+  : "${GEMINI_API_KEY:?GEMINI_API_KEY is not set (add it to ${TM_AI_DIR}/.env)}"
+fi
 export AI_TRAINING_LOG_DIR="${AI_TRAINING_LOG_DIR:-${TM_AI_DIR}/logs/training}"
 
-# --- handle in-use ports ----------------------------------------------------
+# --- handle in-use ports ------------------------------------------------------
 free_port() {
   local port=$1
-  # PIDs listening on this port (skip the header line). The trailing `|| true`
-  # is critical: `grep -oE` returns 1 when nothing matches (port is free), and
-  # under `pipefail` that would propagate into the $(...) assignment and abort
-  # the script via `set -e` — silently, after killing on the first port.
   local pids
   pids=$(ss -ltnp "sport = :${port}" 2>/dev/null \
            | awk 'NR>1' \
            | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u | tr '\n' ' ' || true)
-  [[ -z "${pids// }" ]] && return 0  # port is free
+  [[ -z "${pids// }" ]] && return 0
 
   echo "⚠ port ${port} is already in use by PID(s):${pids%% }"
   ps -o pid=,user=,cmd= -p ${pids} 2>/dev/null | sed 's/^/    /'
@@ -63,7 +82,6 @@ free_port() {
   if [[ "${answer,,}" == "y" || "${answer,,}" == "yes" ]]; then
     # shellcheck disable=SC2086
     kill ${pids} 2>/dev/null || true
-    # Give them up to 5s to exit gracefully, then escalate to SIGKILL
     for _ in {1..10}; do
       if ! ss -ltn "sport = :${port}" 2>/dev/null | grep -q LISTEN; then
         echo "  ✔ port ${port} freed"
@@ -91,21 +109,33 @@ done
 
 : > "${PID_FILE}"
 
-# --- AI server (Gemini LLM, debug on) ---------------------------------------
-echo "▶ starting AI server (Gemini, log: ${AI_LOG})"
-(
-  cd "${TM_AI_DIR}/tm-ai-server"
-  USE_LLM=true LLM_PROVIDER=gemini \
-  GEMINI_MODEL="${GEMINI_MODEL:-gemini-2.5-flash-lite}" \
-  GEMINI_API_KEY="${GEMINI_API_KEY}" \
-  LLM_DEBUG="${LLM_DEBUG:-true}" \
-  exec uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000
-) >> "${AI_LOG}" 2>&1 &
+# --- AI server ----------------------------------------------------------------
+if [[ "${DEATH_MATCH}" == "true" ]]; then
+  echo "▶ starting AI server (OpenRouter / multi-model, log: ${AI_LOG})"
+  (
+    cd "${TM_AI_DIR}/tm-ai-server"
+    # API keys are already exported via `set -a; source .env` above — no need to
+    # pass them explicitly here, which would risk exposing them in process listings
+    # or debug traces.
+    USE_LLM=true LLM_PROVIDER=openrouter \
+    LLM_DEBUG="${LLM_DEBUG:-true}" \
+    exec uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000
+  ) >> "${AI_LOG}" 2>&1 &
+else
+  echo "▶ starting AI server (Gemini, log: ${AI_LOG})"
+  (
+    cd "${TM_AI_DIR}/tm-ai-server"
+    USE_LLM=true LLM_PROVIDER=gemini \
+    GEMINI_MODEL="${GEMINI_MODEL:-gemini-2.5-flash-lite}" \
+    LLM_DEBUG="${LLM_DEBUG:-true}" \
+    exec uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000
+  ) >> "${AI_LOG}" 2>&1 &
+fi
 AI_PID=$!
 echo "${AI_PID}" >> "${PID_FILE}"
 echo "  PID=${AI_PID}"
 
-# --- wait for AI /health ----------------------------------------------------
+# --- wait for AI /health ------------------------------------------------------
 for i in {1..30}; do
   if curl -fsS http://localhost:8000/health -o /dev/null 2>/dev/null; then
     echo "  ✔ AI /health OK"
@@ -120,7 +150,7 @@ for i in {1..30}; do
   [[ $i -eq 30 ]] && { echo "❌ AI /health did not respond in 30s — see ${AI_LOG}" >&2; exit 1; }
 done
 
-# --- TM server --------------------------------------------------------------
+# --- TM server ----------------------------------------------------------------
 echo "▶ starting TM server (log: ${TM_LOG})"
 if [[ ! -f "${TM_DIR}/build/src/server/server.js" ]]; then
   echo "  building TM server first..."
@@ -134,7 +164,7 @@ TM_PID=$!
 echo "${TM_PID}" >> "${PID_FILE}"
 echo "  PID=${TM_PID}"
 
-# --- wait for TM root -------------------------------------------------------
+# --- wait for TM root ---------------------------------------------------------
 for i in {1..30}; do
   if curl -fsS http://localhost:8080/ -o /dev/null 2>/dev/null; then
     echo "  ✔ TM server responding on :8080"
@@ -149,11 +179,61 @@ for i in {1..30}; do
   [[ $i -eq 30 ]] && { echo "❌ TM server did not respond in 30s — see ${TM_LOG}" >&2; exit 1; }
 done
 
-# --- done -------------------------------------------------------------------
+# --- death-match game loop ----------------------------------------------------
+if [[ "${DEATH_MATCH}" == "true" ]]; then
+  : > "${DM_LOG}"
+  rm -f /tmp/current-game.url  # clear stale URL from any previous run
+  echo "▶ launching death-match (log: ${DM_LOG})"
+  echo "  models: ${DEATH_MATCH_MODELS}"
+  (
+    cd "${TM_AI_DIR}"
+    exec uv run python scripts/play_game.py \
+      --players 4 \
+      --models "${DEATH_MATCH_MODELS}"
+  ) >> "${DM_LOG}" 2>&1 &
+  DM_PID=$!
+  echo "${DM_PID}" > "${DM_PID_FILE}"
+  echo "  PID=${DM_PID}"
+
+  # Wait for play_game.py to create the game and write the spectator URL
+  echo -n "  waiting for game ID"
+  for i in {1..20}; do
+    if [[ -f /tmp/current-game.url ]]; then
+      game_url=$(< /tmp/current-game.url)
+      echo ""
+      echo "  ✔ game ready: ${game_url}"
+      # Open in Chrome (falls back through available launchers)
+      if command -v google-chrome &>/dev/null; then
+        google-chrome "${game_url}" &>/dev/null &
+      elif command -v chromium-browser &>/dev/null; then
+        chromium-browser "${game_url}" &>/dev/null &
+      elif command -v xdg-open &>/dev/null; then
+        xdg-open "${game_url}" &>/dev/null &
+      fi
+      break
+    fi
+    if ! kill -0 "${DM_PID}" 2>/dev/null; then
+      echo ""
+      echo "❌ game loop exited before creating a game — see ${DM_LOG}" >&2
+      tail -10 "${DM_LOG}" >&2
+      break
+    fi
+    echo -n "."
+    sleep 1
+    [[ $i -eq 20 ]] && echo "" && echo "  ⚠ timed out waiting for game URL — check ${DM_LOG}"
+  done
+fi
+
+# --- done ---------------------------------------------------------------------
 echo
-echo "✅ both servers up"
+echo "✅ servers up"
 echo "   AI server :8000  (PID ${AI_PID})  ${AI_LOG}"
 echo "   TM server :8080  (PID ${TM_PID})  ${TM_LOG}"
-echo "   open: http://localhost:8080"
+if [[ "${DEATH_MATCH}" == "true" ]]; then
+  echo "   death-match      (PID ${DM_PID})  ${DM_LOG}"
+  echo
+  echo "   follow game:  tail -f ${DM_LOG}"
+  echo "   follow AI:    tail -f ${AI_LOG}"
+fi
 echo
-echo "stop with:  kill ${AI_PID} ${TM_PID}     # or:  xargs kill < ${PID_FILE}"
+echo "stop with:  ./stop.sh"

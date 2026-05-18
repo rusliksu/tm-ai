@@ -170,3 +170,26 @@ uv run python -m tm_ai_server.training.train_ppo \
 - [x] specs synced (TM-AI.md, TM-adaption.md, CLAUDE.md)
 
 
+# multi-LLM death match + stability hardening
+
+- [x] `start.sh --death-match` — starts OpenRouter AI server + TM server + `play_game.py` with 4 models; opens spectator URL in Chrome automatically
+- [x] `stop.sh` — kills PIDs from `/tmp/tm-ai.pids` and `/tmp/death-match.pids`; `--clean-db` flag removes self-play games from DB
+- [x] `scripts/play_game.py` retry loop — on TM server HTTP 400, re-calls `/move` with `last_error` and retries `/step` up to `_MAX_STEP_RETRIES=2` times
+- [x] `spectator_id` added to `POST /api/ai/new-game` response; `playerNames` accepted in request body
+- [x] `play_game.py` writes spectator URL to `/tmp/current-game.url`; `model_short_name()` preserves context for bare model names like "Chat"
+- [x] `encoding.py` — added `SelectResource` support to `flatten_options()`, `index_to_response()`, `_default_response()`
+- [x] `_check_payment_valid()` — pre-submission payment validation with per-resource error messages (before hitting the TM server)
+- [x] `_card_resource_values(card_name)` — looks up CARD_DB tags; steel only for building-tagged, titanium only for space-tagged cards
+- [x] `_correct_payment(payment, wf, player, card_name)` — tag-aware: zeros inapplicable steel/titanium before submission
+- [x] `_auto_payment_for_card(card_name, sub_node, player)` — generates optimal payment when AI omits PAYMENT line
+- [x] `_select_action` internal retry loop (`_MAX_ACTION_RETRIES=2`): retries on missing CHOICE or underfunded payment; falls back to Pass if only error is missing CHOICE
+- [x] `_select_setup` receives `last_error` — setup-phase rejections (corp/prelude) now also get server error feedback
+- [x] `TM_RULES` RESPONSE FORMAT section — mandatory `CHOICE: N` + `PAYMENT: MC=N[,...]` format
+- [x] `TM_RULES` SERVER AUTHORITY section — read the error, never repeat invalid moves
+- [x] `_build_action_prompt` error block strengthened — ⚠ THE GAME SERVER REJECTED + server-authority reminder
+- [x] Transient errors (429/503) don't permanently disable model capabilities
+- [x] `_prefetch_pricing()` — fetches all OpenRouter model prices once at startup (thread-safe)
+- [x] `_KNOWN_PRICING` dict — fallback rates for 9 common models (prevents $0 cost tracking when API ID doesn't match)
+- [x] Greenery VP fix: changed ⚠ warning from "DO NOT place greenery tiles" to correctly state tiles still give +1 VP even at max O₂; added `GREENERY OPPORTUNITY` reminder when plants ≥ 8 and O₂ maxed
+- [x] LLM death match game `g4c3797247592` analysis — `logs/llm-test/g4c3797247592/llm-death-match.md` (DeepSeek 71, Gemini 57, Claude 54, GPT 37 VP; full error/cost/strategy analysis)
+
