@@ -1818,13 +1818,6 @@ dependencies = [
     { name = "uvicorn", extra = ["standard"] },
 ]
 
-[package.optional-dependencies]
-dev = [
-    { name = "httpx" },
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-]
-
 [package.dev-dependencies]
 dev = [
     { name = "httpx" },
@@ -1836,12 +1829,9 @@ dev = [
 requires-dist = [
     { name = "fastapi", specifier = ">=0.104.0" },
     { name = "gymnasium", specifier = ">=0.29.0" },
-    { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.25" },
     { name = "numpy", specifier = ">=1.24.0" },
     { name = "openai", specifier = ">=2.37.0" },
     { name = "pydantic", specifier = ">=2.5.0" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
-    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.21" },
     { name = "requests", specifier = ">=2.34.0" },
     { name = "rich", specifier = ">=15.0.0" },
     { name = "sb3-contrib", specifier = ">=2.8.0" },
@@ -1851,7 +1841,6 @@ requires-dist = [
     { name = "tqdm", specifier = ">=4.67.3" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.24.0" },
 ]
-provides-extras = ["dev"]
 
 [package.metadata.requires-dev]
 dev = [

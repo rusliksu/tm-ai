@@ -4,7 +4,7 @@ A two-repo project that plays Terraforming Mars: a Python AI server makes the mo
 
 The agent can play in three modes:
 1. **Neural net** — a trained policy/value network (supervised pretrain + PPO self-play).
-2. **LLM** — Ollama (local) or Gemini (cloud). Reads the game state and picks moves with chain-of-thought.
+2. **LLM** — any OpenRouter model (cloud, e.g. Claude/GPT/Gemini/DeepSeek) or Ollama (local). Reads the game state and picks moves with chain-of-thought. The provider is derived from the model name: `vendor/model` → OpenRouter, `bare:tag` → Ollama.
 3. **AI Trainer** — same LLM, but it *coaches a human* via a chat sidebar instead of playing.
 
 ## Repo layout
@@ -36,8 +36,8 @@ cd ~/workspace/terraforming-mars && git checkout feat/ai-player
 
 # 2. AI server (Python via uv)
 cd ~/workspace/tm-ai/tm-ai-server
-uv sync                          # installs torch, fastapi, sb3-contrib, google-genai…
-uv run pytest tests/             # 30 tests, ~2s
+uv sync                          # installs torch, fastapi, sb3-contrib, openai…
+uv run pytest tests/             # 46 tests, ~1s
 
 # 3. TM server (Node 20+)
 cd ~/workspace/terraforming-mars
@@ -49,7 +49,7 @@ cp ~/workspace/tm-ai/.env.example ~/workspace/tm-ai/.env  # then edit
 source ~/workspace/tm-ai/.env                              # never read .env directly
 ```
 
-`.env` is the only place secrets live. The TM server reads `AI_TRAINING_LOG_DIR` (where Plan B JSONLs land) and `AI_SERVER_URL`. The AI server reads `GEMINI_API_KEY`, `MODEL_PATH`, etc.
+`.env` is the only place secrets live. The TM server reads `AI_TRAINING_LOG_DIR` (where Plan B JSONLs land) and `AI_SERVER_URL`. The AI server reads `OPENROUTER_API_KEY`, `MODEL_PATH`, etc.
 
 ## Running the stack
 
@@ -90,23 +90,23 @@ DEATH_MATCH_MODELS="anthropic/claude-sonnet-4-6,openai/gpt-4o-mini,google/gemini
 
 Default lineup: Claude Sonnet 4-6, GPT-4o-mini, Gemini 2.5 Flash, DeepSeek Chat. See `logs/llm-test/` for archived game logs and analysis.
 
-### B. Play vs. an LLM (Ollama or Gemini)
+### B. Play vs. a single LLM (OpenRouter or Ollama)
+
+The provider is chosen by the model name — no `LLM_PROVIDER` flag.
 
 ```bash
 source ~/workspace/tm-ai/.env
 
-# Ollama (local, free; needs `ollama serve` running with the model pulled)
+# OpenRouter (cloud; needs OPENROUTER_API_KEY). Any vendor/model id works,
+# e.g. anthropic/claude-sonnet-4-6, openai/gpt-4o-mini, google/gemini-2.5-flash-lite.
 cd ~/workspace/tm-ai/tm-ai-server
-USE_LLM=true LLM_PROVIDER=ollama OLLAMA_MODEL=qwen3:4b LLM_DEBUG=true \
+USE_LLM=true OPENROUTER_MODEL=google/gemini-2.5-flash-lite LLM_DEBUG=true \
   uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000
 
-# Gemini (cloud; ~$0.003/game on flash-lite, free tier ~1500 req/day)
-USE_LLM=true LLM_PROVIDER=gemini GEMINI_MODEL=gemini-2.5-flash-lite \
-  GEMINI_API_KEY=$GEMINI_API_KEY LLM_DEBUG=true \
+# Ollama (local, free; needs `ollama serve` running with the model pulled)
+USE_LLM=true OLLAMA_MODEL=qwen3:4b LLM_DEBUG=true \
   uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000
 ```
-
-Supported `GEMINI_MODEL`: `gemini-3-pro`, `gemini-3-flash`, `gemini-3-flash-lite`, `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite` (any Google AI Studio name works).
 
 ### C. Human play with AI Trainer coaching
 
@@ -147,7 +147,7 @@ The tool skips any game whose JSONL already exists in the output dir, so re-runs
 ```bash
 # AI server
 cd ~/workspace/tm-ai/tm-ai-server
-uv run pytest tests/                                         # 46 tests
+uv run pytest tests/                                         # 46 tests, ~1s
 uv run pytest tests/test_encoding.py::test_flatten_or_options -v
 
 # TM server
@@ -156,7 +156,7 @@ npm run build:server                                         # tsc + tsc-alias
 npm run build:client                                         # webpack (slow)
 ```
 
-Permissions for both repos are committed in `tm-ai/.claude/settings.json`. The canonical specs (`specs/TM-AI.md`, `specs/TM-adaption.md`) live in this repo only — there's no copy under `terraforming-mars/`.
+Claude Code permissions for both repos live in `tm-ai/.claude/settings.json` (gitignored — local to your machine, not committed). The canonical specs (`specs/TM-AI.md`, `specs/TM-adaption.md`) live in this repo only — there's no copy under `terraforming-mars/`.
 
 ---
 

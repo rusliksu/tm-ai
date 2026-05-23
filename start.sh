@@ -2,16 +2,17 @@
 # Start both servers (and optionally a death-match experiment) in the background.
 #
 # USAGE
-#   ./start.sh                        # start AI (Gemini flash-lite) + TM servers
+#   ./start.sh                        # start AI (OpenRouter, single model) + TM servers
 #   ./start.sh --death-match          # start AI (OpenRouter) + TM + 4-LLM game
-#   GEMINI_MODEL=gemini-2.5-pro ./start.sh
+#   OPENROUTER_MODEL=anthropic/claude-sonnet-4-6 ./start.sh
 #   DEATH_MATCH_MODELS="anthropic/claude-sonnet-4-6,openai/gpt-4o-mini,google/gemini-2.5-flash,deepseek/deepseek-chat" ./start.sh --death-match
 #   LLM_DEBUG=false ./start.sh
 #   TM_AI_DIR=/path TM_DIR=/path ./start.sh
 #
 # REQUIREMENTS
-#   Normal mode:       GEMINI_API_KEY in ${TM_AI_DIR}/.env
-#   --death-match:     OPENROUTER_API_KEY in ${TM_AI_DIR}/.env
+#   Both modes require OPENROUTER_API_KEY in ${TM_AI_DIR}/.env
+#   (the AI server derives the provider from the model name: "vendor/model" → OpenRouter,
+#    "bare:tag" → local Ollama; there is no LLM_PROVIDER / GEMINI_API_KEY any more)
 #
 # PORTS
 #   8000 — AI server (FastAPI)
@@ -56,11 +57,7 @@ if [[ -f "${TM_AI_DIR}/.env" ]]; then
   set -a; source "${TM_AI_DIR}/.env"; set +a
 fi
 
-if [[ "${DEATH_MATCH}" == "true" ]]; then
-  : "${OPENROUTER_API_KEY:?OPENROUTER_API_KEY is not set (add it to ${TM_AI_DIR}/.env)}"
-else
-  : "${GEMINI_API_KEY:?GEMINI_API_KEY is not set (add it to ${TM_AI_DIR}/.env)}"
-fi
+: "${OPENROUTER_API_KEY:?OPENROUTER_API_KEY is not set (add it to ${TM_AI_DIR}/.env)}"
 export AI_TRAINING_LOG_DIR="${AI_TRAINING_LOG_DIR:-${TM_AI_DIR}/logs/training}"
 
 # --- handle in-use ports ------------------------------------------------------
@@ -117,16 +114,17 @@ if [[ "${DEATH_MATCH}" == "true" ]]; then
     # API keys are already exported via `set -a; source .env` above — no need to
     # pass them explicitly here, which would risk exposing them in process listings
     # or debug traces.
-    USE_LLM=true LLM_PROVIDER=openrouter \
+    USE_LLM=true \
     LLM_DEBUG="${LLM_DEBUG:-true}" \
     exec uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000
   ) >> "${AI_LOG}" 2>&1 &
 else
-  echo "▶ starting AI server (Gemini, log: ${AI_LOG})"
+  echo "▶ starting AI server (OpenRouter, single model, log: ${AI_LOG})"
   (
     cd "${TM_AI_DIR}/tm-ai-server"
-    USE_LLM=true LLM_PROVIDER=gemini \
-    GEMINI_MODEL="${GEMINI_MODEL:-gemini-2.5-flash-lite}" \
+    # OPENROUTER_API_KEY is already exported via `set -a; source .env` above.
+    USE_LLM=true \
+    OPENROUTER_MODEL="${OPENROUTER_MODEL:-google/gemini-2.5-flash-lite}" \
     LLM_DEBUG="${LLM_DEBUG:-true}" \
     exec uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000
   ) >> "${AI_LOG}" 2>&1 &

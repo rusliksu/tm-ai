@@ -67,7 +67,7 @@ tm-ai-server/
     model.py                  # PolicyValueNet (backbone + policy head + value head)
     encoding.py               # encode_state(), flatten_options(), index_to_response(), response_to_index()
     inference.py              # load_model(), select_action(); routes to LLM if USE_LLM=true
-    llm_player.py             # LLM player (Ollama local or Gemini cloud): setup + action prompts + strategy doc + board/card context injection
+    llm_player.py             # LLM player (OpenRouter cloud or Ollama local): setup + action prompts + strategy doc + board/card context injection
     game_knowledge.py         # CARD_DB (970 cards), BOARD_INFO, EXPANSION_INFO; format_card_context/format_game_context
     training/
       dataset.py              # TMDataset: reads per-game JSONL logs from Plan B
@@ -182,16 +182,16 @@ source /home/pmunk/workspace/tm-ai/.env
 cd tm-ai-server && MODEL_PATH=../models/checkpoint_best.pt \
   uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000
 
+# The provider is derived from the model name — no LLM_PROVIDER flag.
+# "vendor/model" → OpenRouter (needs OPENROUTER_API_KEY); "bare:tag" → local Ollama.
+
 # 1. Start AI server — Ollama/LLM mode (local, requires Ollama running)
-cd tm-ai-server && USE_LLM=true LLM_PROVIDER=ollama OLLAMA_MODEL=qwen3:4b LLM_DEBUG=true \
+cd tm-ai-server && USE_LLM=true OLLAMA_MODEL=qwen3:4b LLM_DEBUG=true \
   uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000 >> /tmp/ai-server.log 2>&1 &
 
-# 1. Start AI server — Gemini mode (cloud, fast — get key at aistudio.google.com/apikey)
-cd tm-ai-server && USE_LLM=true LLM_PROVIDER=gemini GEMINI_API_KEY=$GEMINI_API_KEY LLM_DEBUG=true \
-  uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000 >> /tmp/ai-server.log 2>&1 &
-
-# 1. Start AI server — OpenRouter mode (multi-model, cloud — requires OPENROUTER_API_KEY in .env)
-cd tm-ai-server && USE_LLM=true LLM_PROVIDER=openrouter LLM_DEBUG=true \
+# 1. Start AI server — OpenRouter mode (single model, cloud — requires OPENROUTER_API_KEY in .env)
+#    Any vendor/model works, e.g. anthropic/claude-sonnet-4-6, google/gemini-2.5-flash-lite.
+cd tm-ai-server && USE_LLM=true OPENROUTER_MODEL=google/gemini-2.5-flash-lite LLM_DEBUG=true \
   uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000 >> /tmp/ai-server.log 2>&1 &
 
 # 2. Build and start TM server (from terraforming-mars/)
@@ -208,7 +208,7 @@ node build/src/server/server.js >> /tmp/tm-server.log 2>&1 &
 # Start everything + run a 4-LLM death match (AI server on OpenRouter, TM server, play_game.py)
 ./start.sh --death-match
 
-# Start AI server (Gemini flash-lite) + TM server only
+# Start AI server (OpenRouter, single model — default google/gemini-2.5-flash-lite) + TM server only
 ./start.sh
 
 # Override default death-match lineup
@@ -231,24 +231,22 @@ uv run python scripts/play_game.py \
 
 ## LLM Player (llm_player.py)
 
-Supports three providers: **Ollama** (local, free), **Gemini** (cloud, fast), and **OpenRouter** (cloud, multi-model — one player per model). Select via `LLM_PROVIDER`. Env vars:
+Supports two providers, selected by the **model name** (no `LLM_PROVIDER` flag): **OpenRouter** (cloud, multi-model — any `vendor/model` id, one player per model) and **Ollama** (local, free — a `bare:tag` model). `_provider_for(model)` does the routing. Env vars:
 
 | Var | Default | Description |
 |-----|---------|-------------|
 | `USE_LLM` | `false` | Enable LLM player |
-| `LLM_PROVIDER` | `ollama` | `ollama`, `gemini`, or `openrouter` |
 | `LLM_DEBUG` | `false` | Log prompts (`>` prefix) and responses (`<` prefix) |
-| `OLLAMA_MODEL` | `qwen3:4b` | Ollama model tag |
+| `OLLAMA_URL` | `http://localhost:11434` | Ollama base URL |
+| `OLLAMA_MODEL` | `qwen3:4b` | Ollama model tag (used when no OpenRouter key/model is set) |
 | `OLLAMA_TIMEOUT` | `600` | Ollama timeout (s) |
-| `GEMINI_API_KEY` | — | Google AI Studio key (required for Gemini) |
-| `GEMINI_MODEL` | `gemini-2.5-flash-lite` | Gemini model (any Google AI Studio name) |
-| `OPENROUTER_API_KEY` | — | OpenRouter API key (required for OpenRouter) |
+| `OPENROUTER_API_KEY` | — | OpenRouter API key (required for OpenRouter models) |
 | `OPENROUTER_MODEL` | `anthropic/claude-opus-4-7` | Default model for OpenRouter (per-player override via `POST /player/register`) |
 | `OPENROUTER_THINKING_BUDGET` | `1024` | Thinking tokens for capable models (setup/prelude always use 1024) |
 | `OPENROUTER_MAX_OUTPUT_TOKENS` | `2048` | Max output tokens per action (must exceed THINKING_BUDGET or response is truncated before CHOICE) |
 | `OPENROUTER_MAX_TURNS` | `80` | Trim session history after this many turns |
-| `GEMINI_THINKING_BUDGET` | `512` | Thinking tokens per turn for Gemini (setup/prelude always use 1024) |
-| `GEMINI_MAX_TURNS` | `80` | Trim Gemini chat history after this many turns |
+
+Gemini, GPT, DeepSeek, Grok, etc. are reached **through OpenRouter** by model id (e.g. `google/gemini-2.5-flash-lite`); there is no longer a dedicated Gemini provider or `GEMINI_*` env var.
 
 **Session-per-game architecture**: TM rules + board/expansion context sent once at game start; all subsequent turns continue the same session — no rules repetition.
 
@@ -274,7 +272,7 @@ On exhaustion, falls back to the "Pass" option if the only error is a missing CH
 
 **TM_RULES additions**: `RESPONSE FORMAT` section mandates ending with `CHOICE: N` + `PAYMENT: MC=N[, ...]`; `SERVER AUTHORITY` section instructs the model to read rejection errors and never repeat an invalid move.
 
-**Session recovery**: if an OpenRouter/Gemini session is lost (503 exhausted, server restart), `_session_recovery` re-initialises a chat session using the stored strategy as context.
+**Session recovery**: if an LLM session is lost (503 exhausted, server restart), `_session_recovery` re-initialises a chat session using the stored strategy as context.
 
 **Per-generation strategy update**: at each generation bump, `_maybe_per_generation_update` sends a structured restate prompt (standing, engine, milestone/award targets, next-gen priority). Response is stored in `_game_strategies`.
 

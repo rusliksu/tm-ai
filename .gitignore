@@ -4,6 +4,8 @@ tm-ai-server/.venv/
 tm-ai-server/__pycache__/
 tm-ai-server/src/**/__pycache__/
 tm-ai-server/**/*.pyc
+tm-ai-server/**/*.egg-info/
+tm-ai-server/.pytest_cache/
 models/
 ai_training_logs/
 .env

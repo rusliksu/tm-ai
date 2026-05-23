@@ -127,7 +127,7 @@ uv run python -m tm_ai_server.training.train_ppo \
 
 - [x] **victoryPoints added**: `buildPlayerSnapshot()` now emits `victoryPoints` (current VP total). Shown in action prompt for both self and opponents so AI can assess score standing.
 
-- [ ] **Context accumulation / tableau memory**: Over a 15-generation game the Gemini session accumulates ~150+ messages. The AI was asked to memorise its tableau but later turns may attend less to early session content. Consider re-injecting a tableau summary each turn OR compressing at each generation boundary.
+- [ ] **Context accumulation / tableau memory**: Over a 15-generation game the LLM session accumulates ~150+ messages. The AI was asked to memorise its tableau but later turns may attend less to early session content. Consider re-injecting a tableau summary each turn OR compressing at each generation boundary.
 
 - [ ] **Terraforming urgency signal**: AI needs to know if the game is ending soon. Add `estGenerationsLeft` (estimated remaining generations based on current global parameter pace) to the game state or action prompt.
 
