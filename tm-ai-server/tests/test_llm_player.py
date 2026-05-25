@@ -121,11 +121,11 @@ def test_per_generation_strategy_update_sends_prompt_and_stores():
 
     captured_prompt: list[str] = []
 
-    def fake_continue(user, max_output_tokens=None):
+    def fake_shot(system, user, max_output_tokens=None, thinking_budget=None):
         captured_prompt.append(user)
         return "1. STANDING: ahead. 2. ENGINE: Jovian. 3. MILESTONE: Rim Settler."
 
-    player.continue_session = fake_continue
+    player.single_shot = fake_shot
 
     llm._maybe_per_generation_update(player, 4, {
         "game": {"generation": 4, "temperature": -20, "oxygen": 0, "oceanCount": 0},
@@ -136,7 +136,7 @@ def test_per_generation_strategy_update_sends_prompt_and_stores():
 
     assert player.strategy.startswith("1. STANDING")
     assert player.last_generation == 4
-    assert captured_prompt, "continue_session was never called"
+    assert captured_prompt, "single_shot was never called"
     assert "Generation 4" in captured_prompt[0]
     assert "MILESTONE" in captured_prompt[0]
 
@@ -148,11 +148,11 @@ def test_per_generation_update_not_triggered_same_generation():
     player.strategy = "original"
 
     calls: list = []
-    player.continue_session = lambda u, **kw: calls.append(u) or "new strategy"
+    player.single_shot = lambda s, u, **kw: calls.append(u) or "new strategy"
 
     llm._maybe_per_generation_update(player, 5, {})
 
-    assert not calls, "continue_session should not have been called"
+    assert not calls, "single_shot should not have been called"
     assert player.strategy == "original"
 
 
@@ -161,7 +161,7 @@ def test_per_generation_update_skipped_before_first_action():
     player = _make_player()
     player.last_generation = -1
     calls: list = []
-    player.continue_session = lambda u, **kw: calls.append(u) or ""
+    player.single_shot = lambda s, u, **kw: calls.append(u) or ""
 
     llm._maybe_per_generation_update(player, 1, {})
 

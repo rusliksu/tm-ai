@@ -92,7 +92,7 @@ specs/
 ## API Contract
 
 The TM game server calls `POST /move` with:
-- `state.game` — global state: `generation`, `oxygen`, `temperature`, `oceanCount`, `boardName`, `expansions`, `availableMilestones`, `availableAwards`, `gameVariants`, `recentLog` (serialized game log entries since start of current generation — **opponents' moves and system messages only**; AI's own moves omitted, since they're in session memory)
+- `state.game` — global state: `generation`, `oxygen`, `temperature`, `oceanCount`, `boardName`, `expansions`, `availableMilestones`, `availableAwards`, `gameVariants`, `recentLog` (serialized game log entries since start of current generation — includes **the AI's own moves as well as opponents' and system messages**; the AI is stateless per-turn, so this log is how it learns what it did this generation)
 - `state.player` — active player: resources, production, tags, `cardsInHand` (list of card names), `playedCards`, `cardResources` (per-card), `corporations`
 - `state.opponents` — all other players: same fields plus `handSize` (count only — hand is secret)
 - `state.board` — placed tiles (id, x, y, tileType, playerColor)
@@ -157,7 +157,7 @@ Key files in `/home/pmunk/workspace/terraforming-mars/src/server/`:
 - `Game.ts` — `isSelfPlay: boolean` field; set via `newInstance(..., isSelfPlay=true)` before `gotoInitialPhase()`; writeResult in gotoEndGame
 - `IGame.ts` — `isSelfPlay: boolean` in interface
 - `ai/AiClient.ts` — HTTP client to AI server; `MoveRequestPayload` includes optional `last_error?: string`
-- `ai/stateMapping.ts` — full state; includes `cardsInHand` (self player only), `recentLog` (opponents' moves + system messages since generation start; own moves filtered out), `boardName`, `expansions`, `availableMilestones`, `availableAwards`, `gameVariants`; `cardResources` is per-card `{name: count}`
+- `ai/stateMapping.ts` — full state; includes `cardsInHand` (self player only), `recentLog` (all moves + system messages since generation start — own moves now included, cap 25), `boardName`, `expansions`, `availableMilestones`, `availableAwards`, `gameVariants`; `cardResources` is per-card `{name: count}`
 - `ai/TrainingLogger.ts` — writeMeta/appendTurn/writeResult; **skipped entirely for `game.isSelfPlay` games** in Player.process() and Game.gotoEndGame()
 - `routes/ApiAiSelfPlay.ts` — `POST /api/ai/new-game` and `POST /api/ai/step`
 - `routes/ApiAiAdvice.ts` — `POST /api/ai/advice` and `POST /api/ai/play-recommendation` (AI Trainer; opt-in per-player via UI toggle, no game-wide flag)
@@ -242,26 +242,37 @@ Supports two providers, selected by the **model name** (no `LLM_PROVIDER` flag):
 | `OLLAMA_TIMEOUT` | `600` | Ollama timeout (s) |
 | `OPENROUTER_API_KEY` | — | OpenRouter API key (required for OpenRouter models) |
 | `OPENROUTER_MODEL` | `anthropic/claude-opus-4-7` | Default model for OpenRouter (per-player override via `POST /player/register`) |
-| `OPENROUTER_THINKING_BUDGET` | `1024` | Thinking tokens for capable models (setup/prelude always use 1024) |
-| `OPENROUTER_MAX_OUTPUT_TOKENS` | `2048` | Max output tokens per action (must exceed THINKING_BUDGET or response is truncated before CHOICE) |
-| `OPENROUTER_MAX_TURNS` | `80` | Trim session history after this many turns |
+| `OPENROUTER_THINKING_BUDGET` | `1024` | Thinking tokens for setup/prelude/per-gen reflection |
+| `OPENROUTER_ACTION_THINKING_BUDGET` | `512` | Thinking tokens for tactical action turns (smaller = faster for reasoning models) |
+| `OPENROUTER_MAX_OUTPUT_TOKENS` | `4096` | Max output tokens per action (must exceed the thinking budget or response is truncated before CHOICE) |
+| `OPENROUTER_MAX_TURNS` | `44` | Trim session history at this many messages (keeps last 28 + strategy doc) |
 
 Gemini, GPT, DeepSeek, Grok, etc. are reached **through OpenRouter** by model id (e.g. `google/gemini-2.5-flash-lite`); there is no longer a dedicated Gemini provider or `GEMINI_*` env var.
 
-**Session-per-game architecture**: TM rules + board/expansion context sent once at game start; all subsequent turns continue the same session — no rules repetition.
+**Stateless-turn architecture (action phase)**: the action phase does **not** use a growing chat session. Each `/move` is a self-contained call (`LLMPlayer.single_shot`) of `[system, user]`:
+- **system** = `TM_RULES` + game config + board layout, built once per game and stored in `player.action_system` (`_ensure_action_system`). It is byte-identical every turn so prompt-caching reuses it.
+- **user** = full state snapshot (tableau, hand, all players, log) + the player's own two-part memory.
 
-**Setup phase** (`initialCards`/`prelude`): `think=True` → chain-of-thought corp + card selection, writes a 100–200 word strategy document including a TABLEAU section (played cards + effects). Strategy stored per `game_id` in `_game_strategies`.
+Because the TM server sends complete authoritative state every turn, no chat history is needed — the snapshot replaces it. The setup phase (`initialCards`/`prelude`) still uses the short multi-step session (`init_session`/`continue_session`); that session is simply not carried into the action phase.
+
+**Two-part memory** (both fields on `LLMPlayer`, fed into every action prompt):
+- **Part 1 — `player.tactical`** (intra-generation): a short ordered next-steps list. The model rewrites it inside each action response via a `TACTICAL:` line; `_capture_tactical()` parses and stores it; it's shown back next turn. No extra LLM call.
+- **Part 2 — `player.strategy`** (inter-generation, coarse): engine plan, milestone/award targets, standing, **plus a maintained BACKUP plan and a SWITCH DECISION** (keep primary vs pivot). Refreshed only at generation bumps.
+
+**Setup phase** (`initialCards`/`prelude`): `think=True` → chain-of-thought corp + card selection, writes a 150–250 word strategy document ending with a BACKUP PLAN line. Stored in `player.strategy`; `player.tactical` starts empty.
 
 **Action phase prompt** shows:
 - Current resources/production/tags
-- `Your hand (N cards):` with cost, tags, description for each card
+- `Your tableau (N cards in play):` from `playedCards` + per-card resources (authoritative — no longer relies on session memory)
+- `Your hand (N cards):` with cost, tags, description for each card (full descriptions every turn — no cross-turn elision)
 - Opponent resources/production/tags (incl. VP standing)
-- `Recent events:` from serialized game log (current generation)
+- `This generation's events so far:` from serialized game log — **now includes the AI's own moves**
+- `=== YOUR MEMORY ===` block: STRATEGY (Part 2) + TACTICAL PLAN (Part 1)
 - Numbered options with blue-card-action options annotated: `Use Soletta action — <desc>`
 - Payment section for `projectCard`/`payment` decisions: AI specifies `PAYMENT: MC=N[, STEEL=N][, TITANIUM=N]...`
 - `⚠ GREENERY OPPORTUNITY` reminder when plants ≥ 8 and O₂ is maxed (tiles still give +1 VP each)
 
-**Internal retry loop** (`_select_action`): up to `_MAX_ACTION_RETRIES=2` LLM retries within a single `/move` call. Before submitting, the server validates:
+**Internal retry loop** (`_select_action`): up to `_MAX_ACTION_RETRIES=2` retries within a single `/move`. Since turns are stateless, each retry **resends the full prompt** with the error banner prepended (not a session append). Before submitting, the server validates:
 1. CHOICE line is present — error fed back if missing
 2. Payment is sufficient (`_check_payment_valid()`) — feeds back exact resources available and required total
 On exhaustion, falls back to the "Pass" option if the only error is a missing CHOICE line; otherwise sends best-effort.
@@ -272,9 +283,9 @@ On exhaustion, falls back to the "Pass" option if the only error is a missing CH
 
 **TM_RULES additions**: `RESPONSE FORMAT` section mandates ending with `CHOICE: N` + `PAYMENT: MC=N[, ...]`; `SERVER AUTHORITY` section instructs the model to read rejection errors and never repeat an invalid move.
 
-**Session recovery**: if an LLM session is lost (503 exhausted, server restart), `_session_recovery` re-initialises a chat session using the stored strategy as context.
+**Session recovery**: only relevant to the setup phase (the action phase is stateless and self-contained, so a lost session never matters there). If a setup session is lost, `recover_session` re-initialises from the stored strategy.
 
-**Per-generation strategy update**: at each generation bump, `_maybe_per_generation_update` sends a structured restate prompt (standing, engine, milestone/award targets, next-gen priority). Response is stored in `_game_strategies`.
+**Per-generation strategy update**: at each generation bump, `_maybe_per_generation_update` makes a stateless `single_shot` call that is fed the **prior** `player.strategy` text explicitly (no conversation to scroll back through) and asks for a structured restate — standing, engine, milestone/award targets, next-gen priority, **BACKUP plan, and a SWITCH DECISION** (keep primary vs pivot to backup). The deferral-loop check compares the new priorities against the prior strategy shown in-prompt. Response stored in `player.strategy`.
 
 **Think on every turn**: thinking budget applies to every action and per-gen reflection. `thinking` vs `reasoning` params are branched by provider: Anthropic uses `extra_body["thinking"]`; all other OpenRouter models use `extra_body["reasoning"]["max_tokens"]`.
 
@@ -282,7 +293,7 @@ On exhaustion, falls back to the "Pass" option if the only error is a missing CH
 
 **Pricing**: `_prefetch_pricing()` fetches all OpenRouter model prices at startup (once, thread-safe). `_KNOWN_PRICING` dict provides fallback rates for 9 common models when the API response ID doesn't match exactly (prevents $0 cost tracking for e.g. `anthropic/claude-sonnet-4-6`).
 
-**Description elision**: for discard/keep/draft decisions (`wf_type == "card"`) where all cards are already in the hand block, descriptions are replaced with `"(see hand above)"` — saves ~50–200 tokens per such turn.
+**Description elision**: for discard/keep/draft decisions (`wf_type == "card"`) where all cards are already in the hand block shown earlier *in the same prompt*, the option descriptions are replaced with `"(see hand above)"`. (This is intra-prompt only — cross-turn elision was removed with the stateless rewrite, since there is no session memory to rely on.)
 
 **AI Trainer** (`select_action_advise`): per-player coaching via `POST /advise`. Opt-in per player from the UI toggle — no game-wide flag. Session namespace `trainer:<game_id>:<player_id>` isolates each player's session. Setup phases (`initialCards`, `prelude`) handled by `_select_setup_advise`. System prompt requires plain-text 1-3 sentence coaching plus a `<recommendation>` block; markdown is forbidden. Requires `USE_LLM=true`. Play Recommendation in `AiTrainerChat.vue` reloads the page on success.
 

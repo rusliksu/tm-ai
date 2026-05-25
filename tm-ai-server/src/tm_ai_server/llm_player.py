@@ -22,12 +22,14 @@ Env vars:
   USE_LLM                     Enable LLM player (default: false)
   OPENROUTER_API_KEY          Required for OpenRouter models
   OPENROUTER_MODEL            Default model (default: anthropic/claude-opus-4-7)
-  OPENROUTER_THINKING_BUDGET  Thinking tokens for capable models (default: 1024;
-                              setup/prelude always use 1024)
-  OPENROUTER_MAX_OUTPUT_TOKENS Cap on action response length (default: 2048;
-                              must exceed OPENROUTER_THINKING_BUDGET or the
-                              model gets truncated before writing CHOICE)
-  OPENROUTER_MAX_TURNS        Trim session after this many turns (default: 80)
+  OPENROUTER_THINKING_BUDGET  Thinking tokens for setup/prelude/per-gen reflection
+                              (default: 1024)
+  OPENROUTER_ACTION_THINKING_BUDGET  Thinking tokens for tactical action turns
+                              (default: 512 — smaller = faster for reasoning models)
+  OPENROUTER_MAX_OUTPUT_TOKENS Cap on action response length (default: 4096;
+                              must exceed the thinking budget or the model gets
+                              truncated before writing CHOICE)
+  OPENROUTER_MAX_TURNS        Trim session at this many messages (default: 44)
   OLLAMA_URL                  Ollama base URL (default: http://localhost:11434)
   OLLAMA_MODEL                Default Ollama model (default: qwen3:4b)
   OLLAMA_TIMEOUT              Ollama request timeout seconds (default: 600)
@@ -53,8 +55,11 @@ _LLM_DEBUG = os.getenv("LLM_DEBUG", "false").lower() == "true"
 _OPENROUTER_API_KEY         = os.getenv("OPENROUTER_API_KEY", "")
 _OPENROUTER_MODEL           = os.getenv("OPENROUTER_MODEL", "anthropic/claude-opus-4-7")
 _OPENROUTER_THINKING_BUDGET = int(os.getenv("OPENROUTER_THINKING_BUDGET", "1024"))
-_OPENROUTER_MAX_OUTPUT_TOKENS = int(os.getenv("OPENROUTER_MAX_OUTPUT_TOKENS", "2048"))
-_OPENROUTER_MAX_TURNS       = int(os.getenv("OPENROUTER_MAX_TURNS", "80"))
+# Action turns are tactical — a smaller reasoning budget keeps reasoning models fast.
+# Setup / per-generation reflection still use the full _OPENROUTER_THINKING_BUDGET.
+_OPENROUTER_ACTION_THINKING_BUDGET = int(os.getenv("OPENROUTER_ACTION_THINKING_BUDGET", "512"))
+# Must comfortably exceed the thinking budget or reasoning models truncate before CHOICE.
+_OPENROUTER_MAX_OUTPUT_TOKENS = int(os.getenv("OPENROUTER_MAX_OUTPUT_TOKENS", "4096"))
 
 # Ollama settings
 _OLLAMA_URL     = os.getenv("OLLAMA_URL",   "http://localhost:11434")
@@ -87,8 +92,12 @@ _openrouter_client = None
 # Games whose summary has been logged (avoid duplicate logging)
 _game_summary_logged: set[str] = set()
 
-# Maximum session length before trimming (message count including system)
-_MAX_SESSION_MESSAGES = 62  # ~30 user+assistant pairs + system
+# Maximum session length before trimming (message count including system).
+# Lower = less per-call input = faster/cheaper for reasoning models, at the cost of
+# shorter raw history (the strategy doc is always preserved on trim).
+_MAX_SESSION_MESSAGES = int(os.getenv("OPENROUTER_MAX_TURNS", "44"))
+# Messages kept after a trim (most recent user+assistant pairs).
+_SESSION_TAIL_MESSAGES = 28
 
 
 # ---------------------------------------------------------------------------
@@ -381,10 +390,12 @@ class LLMPlayer:
         self.model     = model
         self.provider  = _provider_for(model)
 
-        # Session state
+        # Session state (used by the multi-step setup phase only)
         self.session:               list[dict] = []
         self.base_system:           str = ""
-        self.strategy:              str = ""
+        self.strategy:              str = ""   # Part 2: coarse, inter-generation strategy + backup
+        self.tactical:              str = ""   # Part 1: intra-generation next-steps, updated per move
+        self.action_system:         str = ""   # stable system prompt for action turns (cached)
         self.last_generation:       int = -1
         self.hand_shown_generation: int = -1
 
@@ -415,7 +426,8 @@ class LLMPlayer:
             _log_response(f"=== INIT response (player={self.player_id}) ===", text)
         return text
 
-    def continue_session(self, user: str, max_output_tokens: int | None = None) -> str:
+    def continue_session(self, user: str, max_output_tokens: int | None = None,
+                         thinking_budget: int | None = None) -> str:
         """Continue the session with a new user message. Recovers if session is lost."""
         if not self.session:
             logger.warning("No session for player %s — recovering", self.player_id)
@@ -425,12 +437,48 @@ class LLMPlayer:
             _log_prompt(f"=== CONTINUE user (player={self.player_id}) ===", user)
 
         if self.provider == "openrouter":
-            text = self._continue_openrouter(user, max_output_tokens=max_output_tokens)
+            text = self._continue_openrouter(user, max_output_tokens=max_output_tokens,
+                                             thinking_budget=thinking_budget)
         else:
             text = self._continue_ollama(user)
 
         if _LLM_DEBUG:
             _log_response(f"=== CONTINUE response (player={self.player_id}) ===", text)
+        return text
+
+    def single_shot(self, system: str, user: str, max_output_tokens: int | None = None,
+                    thinking_budget: int | None = None) -> str:
+        """Stateless call: send [system, user] fresh, store NOTHING in self.session.
+
+        The action phase uses this — each turn carries the full state snapshot plus the
+        player's own memory (strategy + tactical plan), so no chat history is needed.
+        Keeping `system` byte-identical across turns lets prompt-caching reuse the rules.
+        """
+        if _LLM_DEBUG:
+            _log_prompt(f"=== SHOT user (player={self.player_id}) ===", user)
+
+        if self.provider == "openrouter":
+            _ensure_openrouter_client()
+            messages = [self._build_system_message(system), {"role": "user", "content": user}]
+            text = self._do_openrouter_call(messages, think=True,
+                                            max_output_tokens=max_output_tokens,
+                                            thinking_budget=thinking_budget)
+        else:
+            caps = _get_model_capabilities(self.model)
+            messages = [{"role": "system", "content": system},
+                        {"role": "user", "content": user}]
+            payload: dict = {"model": self.model, "stream": False, "messages": messages}
+            if caps.get("thinking"):
+                payload["think"] = True
+            r = _with_retry(lambda: requests.post(f"{_OLLAMA_URL}/api/chat",
+                                                  json=payload, timeout=_OLLAMA_TIMEOUT))
+            r.raise_for_status()
+            data = r.json()
+            text = data["message"]["content"]
+            self._accum_ollama(data, "shot")
+
+        if _LLM_DEBUG:
+            _log_response(f"=== SHOT response (player={self.player_id}) ===", text)
         return text
 
     def recover_session(self, user: str) -> str:
@@ -459,7 +507,7 @@ class LLMPlayer:
         system_with_reminder = (
             base + f"\n\n[CONTEXT TRIM — current strategy:\n{strategy}]" if strategy else base
         )
-        tail = self.session[-40:]  # keep last 40 messages (user+assistant pairs)
+        tail = self.session[-_SESSION_TAIL_MESSAGES:]  # most recent user+assistant pairs
         self.session.clear()
         if self.provider == "openrouter":
             caps = _get_model_capabilities(self.model)
@@ -472,7 +520,8 @@ class LLMPlayer:
         else:
             self.session.append({"role": "system", "content": system_with_reminder})
         self.session.extend(tail)
-        logger.info("Session trimmed for player %s — kept last 40 messages + strategy", self.player_id)
+        logger.info("Session trimmed for player %s — kept last %d messages + strategy",
+                    self.player_id, _SESSION_TAIL_MESSAGES)
 
     # ------------------------------------------------------------------
     # Internal call helpers
@@ -498,11 +547,14 @@ class LLMPlayer:
         self.session = messages + [{"role": "assistant", "content": text}]
         return text
 
-    def _continue_openrouter(self, user: str, max_output_tokens: int | None) -> str:
+    def _continue_openrouter(self, user: str, max_output_tokens: int | None,
+                             thinking_budget: int | None = None) -> str:
         """Continue call: append user msg, call, append response."""
         self.trim_session()
         self.session.append({"role": "user", "content": user})
-        text = self._do_openrouter_call(self.session, think=True, max_output_tokens=max_output_tokens)
+        text = self._do_openrouter_call(self.session, think=True,
+                                        max_output_tokens=max_output_tokens,
+                                        thinking_budget=thinking_budget)
         self.session.append({"role": "assistant", "content": text})
         return text
 
@@ -511,6 +563,7 @@ class LLMPlayer:
         messages: list[dict],
         think: bool,
         max_output_tokens: int | None,
+        thinking_budget: int | None = None,
     ) -> str:
         caps = _get_model_capabilities(self.model)
         kwargs: dict = {"model": self.model, "messages": messages}
@@ -521,7 +574,7 @@ class LLMPlayer:
         extra_body: dict    = {}
 
         if think and caps.get("thinking"):
-            budget = _OPENROUTER_THINKING_BUDGET
+            budget = thinking_budget or _OPENROUTER_THINKING_BUDGET
             if self.model.startswith("anthropic/"):
                 extra_body["thinking"] = {"type": "enabled", "budget_tokens": budget}
                 extra_headers["anthropic-beta"] = "interleaved-thinking-2025-05-14"
@@ -1104,9 +1157,15 @@ _PER_GEN_STRATEGY_PROMPT = (
     "=== End of Generation {prev_gen}, start of Generation {gen} ===\n"
     "{global_status}"
     "{income_note}"
-    "Before your next action, restate your strategy in ~120-180 words:\n"
+    "Your strategy notes from last generation (this is ALL you remember — there is no chat "
+    "history; the game state is supplied fresh each turn):\n"
+    "----- PRIOR STRATEGY -----\n"
+    "{prior_strategy}\n"
+    "--------------------------\n\n"
+    "Rewrite your strategy for this generation in ~150-220 words with these sections:\n"
     "1. STANDING: your VP/TR vs each opponent. Ahead, level, or behind?\n"
-    "2. ENGINE: primary path to victory — engine type, key cards in play, how you score each gen.\n"
+    "2. ENGINE (PRIMARY): primary path to victory — engine type, key cards in play, how you "
+    "score each gen.\n"
     "3. MILESTONE TARGET: which of the 5 milestones will you claim (5 VP, max 3 in whole game, 8 MC)?\n"
     "   List the requirement and your current progress. IF YOU ALREADY MEET ONE, "
     "claim it next action — don't let opponents block you!\n"
@@ -1121,11 +1180,17 @@ _PER_GEN_STRATEGY_PROMPT = (
     "Reminder: DO NOT use Convert Heat if temperature is already 8°C. "
     "If O₂ is already 14%, placing greenery tiles gives no TR/O₂ bonus — but each tile still "
     "scores +1 VP (plus +1 VP per adjacent city tile). Do NOT skip end-game greeneries just "
-    "because oxygen is maxed; they still count for VP.\n\n"
+    "because oxygen is maxed; they still count for VP.\n"
+    "6. BACKUP PLAN: always maintain a concrete ALTERNATIVE strategy — a different engine, "
+    "scoring path, or milestone/award target you could pivot to if your primary stalls or an "
+    "opponent blocks it. State it in 1-2 sentences (carry/refine the one from your prior notes).\n"
+    "7. SWITCH DECISION: weigh PRIMARY vs BACKUP given the current standing. Are you falling "
+    "behind on the primary, or is it blocked? Answer exactly 'Keep primary' or "
+    "'Switch: <one-line reason>'. If you switch, make sections 2-5 describe the BACKUP from now on.\n\n"
     "!! MANDATORY DEFERRAL LOOP CHECK !!\n"
-    "Scroll back through your last 2-3 strategy updates visible in this conversation. "
-    "For every goal you listed in previous NEXT-GEN PRIORITY sections: has the relevant "
-    "game state actually changed, or did you write the same priority again without acting?\n"
+    "Compare your NEXT-GEN PRIORITY above against the PRIOR STRATEGY shown above. "
+    "For every goal you listed last generation: has the relevant game state actually changed, "
+    "or are you about to write the same priority again without having acted on it?\n"
     "Examples of deferral loops:\n"
     "  • 'Build 3rd city for Mayor' stated last gen → still have same city count → LOOP\n"
     "  • 'Claim milestone X' stated last gen → milestone still unclaimed → LOOP\n"
@@ -1187,11 +1252,14 @@ def _per_generation_strategy_update(player: LLMPlayer, generation: int, state: d
         gen=generation,
         global_status=global_status,
         income_note=income_note,
+        prior_strategy=(player.strategy or "(none yet — this is your first strategy update)"),
     )
     if _LLM_DEBUG:
         _log_prompt(f"=== PER-GEN STRATEGY UPDATE (player={player.player_id} gen={generation}) ===", prompt)
     try:
-        strategy = player.continue_session(prompt)
+        # Stateless reflection: full thinking budget, reuses the cached action system prompt.
+        strategy = player.single_shot(player.action_system, prompt,
+                                      thinking_budget=_OPENROUTER_THINKING_BUDGET)
         player.strategy = strategy.strip()
         logger.info("Per-gen strategy update (player=%s gen=%d):\n%s",
                     player.player_id, generation, player.strategy)
@@ -1241,11 +1309,10 @@ def _select_setup(state: dict, waiting_for: dict, player: LLMPlayer, last_error:
             + "You are an expert Terraforming Mars strategist making the opening decisions. "
             "Think step by step about card synergies, engine building, the specific milestones "
             "and awards listed above, and any active game variants. "
-            "Remember everything in this session — you will continue playing this game in "
-            "subsequent messages without receiving these rules again. "
-            "IMPORTANT: Memorize every card you play and its ongoing effects. "
-            "Subsequent prompts will NOT list your played cards — that is your session memory. "
-            "Your strategy should always include a TABLEAU section listing what you have in play. "
+            "During the game you will receive the COMPLETE game state (your tableau, hand, all "
+            "players' resources/production/tags, the log) fresh on every turn, plus your own "
+            "STRATEGY notes — there is no chat history, so your STRATEGY is your long-term memory. "
+            "Write a strategy strong enough to guide play from these notes alone. "
             "Follow the EXACT output format requested — no extra text before or after."
         )
         text = player.init_session(system, user, think=True)
@@ -1340,8 +1407,10 @@ def _build_setup_prompt(state: dict, waiting_for: dict) -> str:
             lines.append("CEO_CARD: <exact name of 1 CEO card>")
         lines += [
             "STRATEGY:",
-            "<150-250 words: engine type, priority tags, milestone/award targets, key card",
-            " synergies, pace plan (accelerate or slow terraforming), opponent watch-outs>",
+            "<150-250 words: engine type (PRIMARY plan), priority tags, milestone/award targets,",
+            " key card synergies, pace plan (accelerate or slow terraforming), opponent watch-outs.",
+            " End with a BACKUP PLAN: one sentence naming an alternative engine/scoring path you",
+            " could pivot to if the primary stalls or is blocked.>",
         ]
 
     elif wf_type == "prelude":
@@ -1497,6 +1566,50 @@ def _parse_setup_response(
 
 _MAX_ACTION_RETRIES = 2
 
+# Stable instructions appended to the action system prompt (built once per game, cached).
+_ACTION_SYSTEM_SUFFIX = (
+    "\n\nYou are an expert Terraforming Mars player. From now on, each turn you receive the "
+    "COMPLETE game state plus YOUR OWN MEMORY (a coarse STRATEGY and a short TACTICAL PLAN). "
+    "There is NO chat history — those two notes are the only things you remember between turns, "
+    "so keep them accurate and act on them.\n"
+    "Every turn, respond in EXACTLY this order:\n"
+    "1. One or two sentences of reasoning tied to your strategy.\n"
+    "2. TACTICAL: <your updated plan for the REST of this generation — concrete ordered next "
+    "steps, e.g. 'convert 8 heat, then play Soletta, then pass'. This REPLACES your previous "
+    "tactical note and is the ONLY thing you will remember next move. Update it from what you "
+    "just did and what opponents did in the log.>\n"
+    "3. CHOICE: N  (the option number, on its own line)\n"
+    "4. PAYMENT: MC=<n>[, STEEL=<n>][, TITANIUM=<n>][, HEAT=<n>]  (only when playing a project card)"
+)
+
+_ACTION_RESPONSE_FORMAT = (
+    "\n\nBefore choosing, check: does this action advance my engine, milestone/award targets, and "
+    "pace plan? Then respond with your reasoning, a TACTICAL: line (updated next steps), and "
+    "CHOICE: N on its own line. If playing a project card, add a PAYMENT: line."
+)
+
+
+def _ensure_action_system(player: LLMPlayer, state: dict) -> None:
+    """Build the stable per-game action system prompt once (rules + config + board layout)."""
+    if player.action_system:
+        return
+    g = state.get("game", {})
+    game_ctx     = format_config_context(g)
+    board_layout = format_board_layout(state.get("boardSpaces") or [])
+    player.action_system = (
+        TM_RULES + "\n\n" + game_ctx + "\n\n"
+        + (board_layout + "\n\n" if board_layout else "")
+    ).rstrip() + _ACTION_SYSTEM_SUFFIX
+
+
+def _capture_tactical(player: LLMPlayer, text: str) -> None:
+    """Extract and store the TACTICAL: section from an action response (Part 1 memory)."""
+    m = re.search(r"TACTICAL:\s*(.*?)(?=\n\s*CHOICE:|\n\s*PAYMENT:|\Z)", text, re.IGNORECASE | re.DOTALL)
+    if m:
+        tactical = m.group(1).strip()
+        if tactical:
+            player.tactical = tactical
+
 
 def _select_action(
     state: dict, waiting_for: dict, player: LLMPlayer, last_error: str | None = None
@@ -1505,21 +1618,19 @@ def _select_action(
     if not options:
         return _default_response(waiting_for), {}
 
+    _ensure_action_system(player, state)
     generation = state.get("game", {}).get("generation", 1)
     _maybe_per_generation_update(player, generation, state)
 
     p = state.get("player", {})
-    user = _build_action_prompt(state, waiting_for, options, last_error=last_error, player=player)
-    user += (
-        "\n\nBefore choosing, check: does this action advance my engine, milestone/award targets, and pace plan?"
-        " 1-2 sentences explaining how your choice fits your strategy, then CHOICE: N on its own line."
-        " If playing a project card, add PAYMENT: MC=<n>[, STEEL=<n>][, TITANIUM=<n>] on the next line."
-    )
+    base_user = _build_action_prompt(state, waiting_for, options, last_error=last_error, player=player)
+    base_user += _ACTION_RESPONSE_FORMAT
     logger.debug("LLM action (player=%s type=%s options=%d)",
                  player.player_id, waiting_for.get("type"), len(options))
 
     _max_out = _OPENROUTER_MAX_OUTPUT_TOKENS if player.provider == "openrouter" else None
-    text = player.continue_session(user, max_output_tokens=_max_out)
+    text = player.single_shot(player.action_system, base_user, max_output_tokens=_max_out,
+                              thinking_budget=_OPENROUTER_ACTION_THINKING_BUDGET)
 
     response: dict = {}
     debug: dict    = {}
@@ -1553,7 +1664,13 @@ def _select_action(
                 "Action retry %d/%d (player=%s):\n%s",
                 attempt + 1, _MAX_ACTION_RETRIES, player.player_id, combined,
             )
-            text = player.continue_session(combined, max_output_tokens=_max_out)
+            # Stateless: resend the full prompt with the error banner prepended.
+            retry_user = (
+                "⚠ YOUR PREVIOUS RESPONSE WAS INVALID — fix it and answer again:\n"
+                + combined + "\n\n" + base_user
+            )
+            text = player.single_shot(player.action_system, retry_user, max_output_tokens=_max_out,
+                                      thinking_budget=_OPENROUTER_ACTION_THINKING_BUDGET)
         else:
             # All retries exhausted — if the only problem is a missing CHOICE
             # (no payment error), default to Pass rather than option 1, since a
@@ -1575,6 +1692,9 @@ def _select_action(
                     "Action still invalid after %d retries (player=%s):\n%s — sending best-effort",
                     _MAX_ACTION_RETRIES, player.player_id, combined,
                 )
+
+    # Capture the model's updated tactical plan (Part 1 memory) — fed back next turn.
+    _capture_tactical(player, text)
 
     g = state.get("game", {})
     if (g.get("temperature", -30) >= 8
@@ -2016,43 +2136,48 @@ def _build_action_prompt(
         lines.append(f"Tags: {tags}")
     lines.append("Note: Only MC production can go negative (min -5). Steel/Ti/Plants/Energy/Heat production CANNOT go below 0.")
 
+    # Tableau — cards in play (authoritative; the AI no longer carries this in session memory)
+    played = p.get("playedCards") or []
+    corps  = p.get("corporations") or []
+    if played or corps:
+        corp_str = f"  [corp: {', '.join(corps)}]" if corps else ""
+        tableau_names = ", ".join(played[:60]) if played else "(none yet)"
+        lines += ["", f"Your tableau ({len(played)} cards in play): {tableau_names}{corp_str}"]
+        card_res = p.get("cardResources") or {}
+        if card_res:
+            res_str = ", ".join(f"{name}={n}" for name, n in card_res.items())
+            lines.append(f"  Card resources: {res_str}")
+
     # Cards in hand
     hand_cards = p.get("cardsInHand") or []
     generation = g.get("generation", 1)
     wf_type    = waiting_for.get("type", "")
     _hand_irrelevant = wf_type in ("space", "payment", "amount")
     if hand_cards and not _hand_irrelevant:
-        last_shown_gen = player.hand_shown_generation if player else -1
-        if last_shown_gen == generation:
-            name_list = ", ".join(hand_cards[:30])
-            lines += ["", f"Your hand ({len(hand_cards)} cards): {name_list}",
-                      "  (Full descriptions shown earlier this generation — rely on your session memory.)"]
-        else:
-            ctx = format_card_context(hand_cards, header=f"Your hand ({len(hand_cards)} cards):", max_cards=30)
-            lines += ["", ctx]
-            if player:
-                player.hand_shown_generation = generation
-            # Effective cost annotations for steel/titanium discounts
-            steel_now = p.get("steel", 0)
-            ti_now    = p.get("titanium", 0)
-            eff_notes: list[str] = []
-            for card_name in hand_cards[:30]:
-                card_name_str = card_name if isinstance(card_name, str) else card_name.get("name", "")
-                info = CARD_DB.get(card_name_str, {})
-                cost = info.get("cost", 0) or 0
-                card_tags = info.get("tags") or []
-                if "building" in card_tags and steel_now >= 2:
-                    discount = min(steel_now, cost // 2) * 2
-                    eff = max(0, cost - discount)
-                    if discount > 0:
-                        eff_notes.append(f"  {card_name_str}: {cost}MC → {eff}MC effective (use {discount//2} steel)")
-                elif "space" in card_tags and ti_now >= 3:
-                    discount = min(ti_now, cost // 3) * 3
-                    eff = max(0, cost - discount)
-                    if discount > 0:
-                        eff_notes.append(f"  {card_name_str}: {cost}MC → {eff}MC effective (use {discount//3} titanium)")
-            if eff_notes:
-                lines += ["Effective cost with your resources (steel/titanium):"] + eff_notes
+        # Stateless turns: always show full hand descriptions (no session memory to rely on).
+        ctx = format_card_context(hand_cards, header=f"Your hand ({len(hand_cards)} cards):", max_cards=30)
+        lines += ["", ctx]
+        # Effective cost annotations for steel/titanium discounts
+        steel_now = p.get("steel", 0)
+        ti_now    = p.get("titanium", 0)
+        eff_notes: list[str] = []
+        for card_name in hand_cards[:30]:
+            card_name_str = card_name if isinstance(card_name, str) else card_name.get("name", "")
+            info = CARD_DB.get(card_name_str, {})
+            cost = info.get("cost", 0) or 0
+            card_tags = info.get("tags") or []
+            if "building" in card_tags and steel_now >= 2:
+                discount = min(steel_now, cost // 2) * 2
+                eff = max(0, cost - discount)
+                if discount > 0:
+                    eff_notes.append(f"  {card_name_str}: {cost}MC → {eff}MC effective (use {discount//2} steel)")
+            elif "space" in card_tags and ti_now >= 3:
+                discount = min(ti_now, cost // 3) * 3
+                eff = max(0, cost - discount)
+                if discount > 0:
+                    eff_notes.append(f"  {card_name_str}: {cost}MC → {eff}MC effective (use {discount//3} titanium)")
+        if eff_notes:
+            lines += ["Effective cost with your resources (steel/titanium):"] + eff_notes
 
     # Opponents
     opponents = state.get("opponents") or []
@@ -2063,7 +2188,7 @@ def _build_action_prompt(
         opp_vp   = opp.get("victoryPoints")
         opp_vp_str = f" VP:{opp_vp}" if opp_vp is not None else ""
         opp_hs   = opp.get("handSize")
-        opp_hs_str = f"  hand:{opp_hs}cards" if opp_hs is not None else ""
+        opp_hs_str = f"  hand:{opp_hs} cards" if opp_hs is not None else ""
         lines.append(
             f"{opp_name}: TR:{opp.get('terraformRating',20)}{opp_vp_str}  MC:{opp.get('megacredits',0)}"
             f"{opp_hs_str}  prod:{opp_prod}  tags:{opp_tags}"
@@ -2075,18 +2200,21 @@ def _build_action_prompt(
 
     recent_log = g.get("recentLog") or []
     if recent_log:
-        lines += ["", f"Recent opponent actions / events ({len(recent_log)}):"]
+        lines += ["", f"This generation's events so far ({len(recent_log)}) — your moves and opponents':"]
         for entry in recent_log:
             lines.append(f"  {entry}")
 
+    # Your memory — this is what carries between turns (no chat history is kept)
+    if player and (player.strategy or player.tactical):
+        lines += ["", "=== YOUR MEMORY (carries between turns — keep it accurate) ==="]
+        if player.strategy:
+            lines += ["STRATEGY (coarse, updated each generation):", player.strategy]
+        if player.tactical:
+            lines += ["TACTICAL PLAN (your own notes from last move):", player.tactical]
+
     # Decision title
     title_raw = waiting_for.get("title")
-    if isinstance(title_raw, str):
-        title = title_raw.strip()
-    elif isinstance(title_raw, dict):
-        title = str(title_raw.get("message", "Select action"))
-    else:
-        title = "Select action"
+    title = _format_message(title_raw).strip() or "Select action"
 
     lines += ["", f"Decision: {title}", "Options:"]
 
@@ -2313,12 +2441,31 @@ def _parse_action_response(
 # Utilities
 # ---------------------------------------------------------------------------
 
+def _format_message(title: object) -> str:
+    """Render a TM Message object, substituting ${N} placeholders with data[N].value.
+
+    TM serializes titles as {"message": "... ${0} ...", "data": [{"type": N, "value": V}]}.
+    A plain string is returned unchanged.
+    """
+    if isinstance(title, str):
+        return title
+    if isinstance(title, dict):
+        msg = str(title.get("message", ""))
+        data = title.get("data") or []
+        for i, item in enumerate(data):
+            val = item.get("value") if isinstance(item, dict) else item
+            msg = msg.replace(f"${{{i}}}", str(val))
+        return msg
+    return ""
+
+
 def _node_title(node: dict, fallback: int) -> str:
     title = node.get("title", "")
     if isinstance(title, str) and title:
         return title
     if isinstance(title, dict):
-        return str(title.get("message", f"Option {fallback}"))
+        rendered = _format_message(title)
+        return rendered or f"Option {fallback}"
     return f"Option {fallback}"
 
 
