@@ -289,6 +289,8 @@ On exhaustion, falls back to the "Pass" option if the only error is a missing CH
 
 **Think on every turn**: thinking budget applies to every action and per-gen reflection. `thinking` vs `reasoning` params are branched by provider: Anthropic uses `extra_body["thinking"]`; all other OpenRouter models use `extra_body["reasoning"]["max_tokens"]`.
 
+**Provider routing**: for non-Anthropic/non-OpenAI models (DeepSeek, Gemini, xAI, etc.), every `_do_openrouter_call` includes `extra_body["provider"] = {"sort": "throughput", "require_parameters": True}`. This makes OpenRouter consistently pick the highest-throughput provider, enabling its sticky routing so DeepSeek/Gemini automatic prompt caching can warm up (without this, a different provider is selected each call = zero cache hits). `require_parameters` filters out providers that don't support the `reasoning` parameter.
+
 **Capability fallback**: if a model rejects caching or thinking headers, the capability is permanently disabled for that model within the session and the call is retried. Transient 429/503 errors do NOT disable capabilities — they are re-raised for the retry wrapper.
 
 **Pricing**: `_prefetch_pricing()` fetches all OpenRouter model prices at startup (once, thread-safe). `_KNOWN_PRICING` dict provides fallback rates for 9 common models when the API response ID doesn't match exactly (prevents $0 cost tracking for e.g. `anthropic/claude-sonnet-4-6`).

@@ -591,6 +591,13 @@ class LLMPlayer:
                     else "prompt-caching-2024-07-31"
                 )
 
+        # For non-Anthropic/non-OpenAI models, pin to highest-throughput provider.
+        # This enables OpenRouter sticky routing so DeepSeek/Gemini/etc. auto-caching
+        # can warm up (different provider each call = zero cache hits).
+        # require_parameters filters out providers that don't support 'reasoning'.
+        if not self.model.startswith(("anthropic/", "openai/")):
+            extra_body["provider"] = {"sort": "throughput", "require_parameters": True}
+
         if extra_headers:
             kwargs["extra_headers"] = extra_headers
         if extra_body:
