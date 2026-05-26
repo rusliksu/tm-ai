@@ -972,12 +972,26 @@ AVAILABLE ACTIONS (choose 1 or 2 per turn):
   B. Use a standard project.
   C. Claim a milestone (8 MC + meet its requirement).
   D. Fund an award (8 MC 1st / 14 MC 2nd / 20 MC 3rd funded).
+       CRITICAL RULE: You only SCORE an award if you WIN 1st (5 VP) or 2nd (2 VP) at game end.
+       Funding an award you're losing = paying 8-20 MC for 0 VP. NEVER fund unless you are
+       currently in 1st or very close 2nd AND can maintain that lead. Check the award standings
+       shown in the prompt — fund only what you are already winning.
   E. Use the action on a blue card (once per generation per card; pay cost if any).
   F. Convert 8 plants into a greenery tile (+1 oxygen, +1 TR, place next to own tile).
   G. Convert 8 heat into +1 temperature (+1 TR).
 
 STANDARD PROJECTS (always available to any player):
   1. Sell patents:  discard N cards → gain N MC.
+       ALMOST ALWAYS BAD — cards are worth far more than 1 MC each as engine pieces
+       and future VP. Only sell patents in two situations:
+         (a) You have truly unplayable cards (requirements will never be met,
+             zero synergy with your engine) and need MC urgently.
+         (b) Very late game (global parameters nearly complete) when you have
+             excess hand cards and need MC to play one more high-VP card before
+             the game ends. Selling 3-4 dead cards to afford a key final play
+             can be correct in generation 10+.
+       Outside these situations, passing or doing almost anything else is better
+       than selling patents.
   2. Power plant:   11 MC → +1 energy production.
        WEAK — only useful if energy production < 3/gen or you need a card threshold.
        Once you can already convert heat regularly, more energy gives almost nothing.
@@ -1023,6 +1037,17 @@ PAYMENT:
   • Pay card play cost in MC; optionally substitute steel (building) or titanium (space).
   • Steel = 2 MC value, titanium = 3 MC value toward their card types.
   • You cannot overpay in MC; overpaying with steel/titanium is allowed (surplus lost).
+
+CARD THROUGHPUT — how many cards strong players typically play:
+  • By generation 3:   5-8 cards in play (corporation + 2-3 project cards/gen).
+  • By generation 6:  12-18 cards in play.
+  • By generation 9:  20-28 cards in play.
+  • By generation 12: 35-45 cards in play is normal for competitive players.
+  Playing only 1 card per generation leaves you severely behind — your engine
+  will be too weak to generate VP. Aim to play 2-4 project cards every generation.
+  If you have cards in hand but are running low on MC, use steel/titanium discounts,
+  sell ONE or two truly unplayable cards, or use the City SP to gain +1 MC production.
+  A hand of 8+ unplayed cards with low MC is a sign your engine is stalled — fix it.
 
 STRATEGIC TIPS:
   • Prioritise increasing MC production — it compounds every generation.
@@ -1079,21 +1104,28 @@ ADVANCED STRATEGIES:
       before opponents' engines overtake you.
 
   City-greenery VP engine:
-    – Place your first city EARLY — it anchors a region for your greeneries and scores
-      1 VP per greenery that ends up adjacent to it. Each greenery you place near a city
-      is worth 2 VP (1 greenery VP + 1 city-adjacency VP) instead of just 1 VP.
-    – Choose the city location where 4-5 adjacent hexes are free land (not ocean-reserved)
-      so you have room to surround it with greeneries later.
-    – A greenery adjacent to 2 cities scores +2 city VP (1 per city) plus its own 1 VP
-      = 3 VP total. A greenery adjacent to 3 cities = 4 VP total.
-    – Ideal 3-city triangle layout: place 3 cities so they share common adjacent hexes.
-      Then fill those shared hexes with greeneries:
-        (a) One central greenery adjacent to all 3 cities: 3 city VPs + 1 greenery VP = 4 VP
-        (b) One greenery between each pair of cities (adjacent to 2 cities): 2+1 = 3 VP each
-      Result: 3 cities + 4 greeneries = 13+ VP from board tiles alone.
-    – Cities cannot be adjacent to each other, but two cities CAN both be adjacent to the
-      same hex — that shared hex is where your high-value greenery goes.
-    – Deny opponents: avoid placing greeneries next to their cities unless you have no choice.
+    – Place your first city by generation 3-4 at the latest. Every generation you
+      delay costs you greenery adjacency VP that compounds for the rest of the game.
+    – City location is critical: count free LAND hexes adjacent to the target hex
+      (exclude ocean-reserved spaces). A good city spot has 5-6 adjacent land hexes
+      where YOU can place future greeneries. Edge and corner hexes have fewer neighbors
+      — avoid them unless a bonus tile is worth it.
+    – Each greenery adjacent to one of your cities scores 2 VP (1 greenery + 1 city).
+      Each greenery adjacent to two of your cities scores 3 VP. Adjacent to three = 4 VP.
+    – Ideal 2-city layout: place two cities exactly 2 hexes apart (one hex gap between
+      them). Both cities share the one hex between them — that hex is worth 3 VP as
+      a greenery (2 city VP + 1 greenery VP). Surround both cities with additional
+      greeneries for 2 VP each. Two cities + 6 greeneries = 14+ board VP.
+    – Ideal 3-city triangle: place 3 cities so each pair shares one common adjacent hex.
+      Fill those 3 shared hexes with greeneries (3 VP each) plus outer greeneries (2 VP):
+      Result: 3 cities + 6 greeneries ≈ 18-20 VP from board tiles alone.
+    – Cities cannot be adjacent to each other (1-hex minimum gap), but two cities CAN
+      both be adjacent to the same hex — place your greenery ON that shared hex.
+    – Never place a greenery adjacent to an opponent's city — you give them +1 VP for free.
+      Exception: if the only available land hex happens to be next to their city and you
+      have no choice (greenery must go next to your own tile).
+    – If you have NO cities yet and must place a greenery, pick a central position with
+      many free adjacent hexes so your future city can go right next to it.
 
 OPPONENT ANALYSIS — read opponents constantly:
   • Their played cards reveal their engine (energy → heat, plant engine, etc.).
@@ -1193,7 +1225,11 @@ _PER_GEN_STRATEGY_PROMPT = (
     "opponent blocks it. State it in 1-2 sentences (carry/refine the one from your prior notes).\n"
     "7. SWITCH DECISION: weigh PRIMARY vs BACKUP given the current standing. Are you falling "
     "behind on the primary, or is it blocked? Answer exactly 'Keep primary' or "
-    "'Switch: <one-line reason>'. If you switch, make sections 2-5 describe the BACKUP from now on.\n\n"
+    "'Switch: <one-line reason>'. If you switch, make sections 2-5 describe the BACKUP from now on.\n"
+    "   MANDATORY OVERRIDE: if you are >20 VP behind the leader AND fewer than 4 generations "
+    "likely remain (e.g., global parameters nearly complete), 'Keep primary' is INVALID — "
+    "you MUST switch to an aggressive catch-up plan (milestone, late award, greenery sprint, "
+    "high-VP cards). State what VP you will score from the new plan specifically.\n\n"
     "!! MANDATORY DEFERRAL LOOP CHECK !!\n"
     "Compare your NEXT-GEN PRIORITY above against the PRIOR STRATEGY shown above. "
     "For every goal you listed last generation: has the relevant game state actually changed, "
@@ -1252,6 +1288,42 @@ def _per_generation_strategy_update(player: LLMPlayer, generation: int, state: d
         income_note += (
             f">> PLANTS STOCKPILE: {current_plants} — 'Convert 8 plants' is AVAILABLE NOW (+1 TR, 0 MC cost). "
             f"Plan this as your first action this generation.\n"
+        )
+
+    # Resource waste and production gap alerts (verified numbers, not hallucinated)
+    opponents = state.get("opponents") or []
+    opp_incomes = [
+        opp.get("terraformRating", 20) + opp.get("production", {}).get("megacredits", 0)
+        for opp in opponents
+    ]
+    if opp_incomes:
+        max_opp_income = max(opp_incomes)
+        if max_opp_income - mc_income >= 8:
+            income_note += (
+                f">> INCOME GAP: your MC income {mc_income}/gen vs best opponent {max_opp_income}/gen "
+                f"(gap: {max_opp_income - mc_income}/gen, compounding). "
+                f"Production cards and City SP (+1 MC prod +1 TR) must be top priority.\n"
+            )
+
+    steel_now = p.get("steel", 0)
+    ti_now    = p.get("titanium", 0)
+    if steel_now >= 8:
+        income_note += (
+            f">> STEEL SURPLUS: {steel_now} steel stockpiled. If you lack building-tagged cards to spend it, "
+            f"this is wasted production — stop accumulating and play building cards or City SP.\n"
+        )
+    if ti_now >= 6:
+        income_note += (
+            f">> TITANIUM SURPLUS: {ti_now} titanium stockpiled. If you lack space-tagged cards, "
+            f"this is wasted production — prioritize space cards in the next draft.\n"
+        )
+
+    # Award standings for unfunded awards (so the AI can verify standings before planning)
+    award_standings = _compute_award_standings(state)
+    if award_standings:
+        income_note += (
+            "Unfunded award standings RIGHT NOW (only fund if you are 1st or very close 2nd):\n"
+            + "\n".join(f"  {line}" for line in award_standings) + "\n"
         )
 
     prompt = _PER_GEN_STRATEGY_PROMPT.format(
@@ -2065,6 +2137,63 @@ def _get_card_desc_for_option(opt: dict) -> str:
     return f"Use {name} action — {desc}" if desc else f"Use {name} action"
 
 
+def _compute_award_standings(state: dict) -> list[str]:
+    """Return human-readable standing lines for each available (unfunded) award.
+
+    Called once per action prompt to give the AI verified numbers before it decides
+    whether to fund an award. Only covers awards that can be computed from the state;
+    tile-south-of-equator (Desert Settler) uses total board tiles as a proxy.
+    """
+    g  = state.get("game", {})
+    p  = state.get("player", {})
+    opps = state.get("opponents") or []
+    funded_names = {a["name"] for a in state.get("awards", [])}
+    available = g.get("availableAwards") or []
+    if not available:
+        return []
+
+    def _val(entity: dict, award_name: str) -> int:
+        """Numeric value of entity for the given award category."""
+        name_low = award_name.lower()
+        prod = entity.get("production", {})
+        tags = entity.get("tags", {})
+        bt   = entity.get("boardTiles", {})
+        if "banker" in name_low:
+            return prod.get("megacredits", 0)
+        if "scientist" in name_low:
+            return tags.get("science", 0)
+        if "thermalist" in name_low:
+            return entity.get("heat", 0)
+        if "miner" in name_low:
+            return entity.get("steel", 0) + entity.get("titanium", 0)
+        if "industrialist" in name_low:
+            return entity.get("steel", 0) + entity.get("energy", 0)
+        if "landlord" in name_low or "settler" in name_low or "estate" in name_low:
+            # Total board tiles as proxy for Desert Settler / Landlord
+            return sum(bt.values()) if isinstance(bt, dict) else 0
+        # For unknown awards return 0 (won't add a standing line)
+        return -1
+
+    my_name = p.get("name", "You")
+    lines: list[str] = []
+    for award_info in available:
+        aname = award_info.get("name", "?")
+        if aname in funded_names:
+            continue  # already funded — no need to evaluate
+        my_v = _val(p, aname)
+        if my_v < 0:
+            continue  # unknown award type
+        entries = [(my_name, my_v)]
+        for opp in opps:
+            entries.append((opp.get("name", "Opp"), _val(opp, aname)))
+        entries.sort(key=lambda x: x[1], reverse=True)
+        rank = next((i + 1 for i, (n, _) in enumerate(entries) if n == my_name), len(entries))
+        rank_str = {1: "1st", 2: "2nd", 3: "3rd"}.get(rank, f"{rank}th")
+        standings = ", ".join(f"{n}={v}" for n, v in entries)
+        lines.append(f"  {aname}: you are {rank_str} ({standings})")
+    return lines
+
+
 def _build_action_prompt(
     state: dict,
     waiting_for: dict,
@@ -2143,6 +2272,77 @@ def _build_action_prompt(
         lines.append(f"Tags: {tags}")
     lines.append("Note: Only MC production can go negative (min -5). Steel/Ti/Plants/Energy/Heat production CANNOT go below 0.")
 
+    # --- Situational warnings (computed from verified state) ---
+    opponents = state.get("opponents") or []
+
+    # Production gap warning: flag when MC income is dangerously below opponents
+    if opponents:
+        opp_incomes = [
+            opp.get("terraformRating", 20) + opp.get("production", {}).get("megacredits", 0)
+            for opp in opponents
+        ]
+        max_opp_income = max(opp_incomes)
+        if max_opp_income - mc_income >= 8:
+            lines.append(
+                f"⚠ INCOME GAP: your MC income is {mc_income}/gen; best opponent earns "
+                f"{max_opp_income}/gen. You fall {max_opp_income - mc_income} MC behind "
+                f"EVERY generation. This COMPOUNDS — treat production cards and City SP "
+                f"(25 MC → +1 MC prod + 1 TR) as top priority."
+            )
+
+    # Resource waste warning: steel or titanium stockpiling with no matching cards to spend
+    steel_now = p.get("steel", 0)
+    ti_now    = p.get("titanium", 0)
+    hand_cards_for_warn = p.get("cardsInHand") or []
+    has_building_in_hand = any(
+        "building" in (CARD_DB.get(c if isinstance(c, str) else c.get("name",""), {}).get("tags") or [])
+        for c in hand_cards_for_warn
+    )
+    has_space_in_hand = any(
+        "space" in (CARD_DB.get(c if isinstance(c, str) else c.get("name",""), {}).get("tags") or [])
+        for c in hand_cards_for_warn
+    )
+    if steel_now >= 8 and not has_building_in_hand:
+        lines.append(
+            f"⚠ STEEL SURPLUS: {steel_now} steel stockpiled but no building-tagged cards in hand. "
+            f"Steel sitting unused = wasted production. Prioritize drawing/playing building-tagged cards, "
+            f"or stop taking steel production."
+        )
+    if ti_now >= 6 and not has_space_in_hand:
+        lines.append(
+            f"⚠ TITANIUM SURPLUS: {ti_now} titanium stockpiled but no space-tagged cards in hand. "
+            f"Consider playing space cards from future draws or passing resources on cheaper cards."
+        )
+
+    # Card throughput warning: flag if played card count is well below human benchmark
+    played_count = len(p.get("playedCards") or [])
+    generation   = g.get("generation", 1)
+    # Human benchmark: ~3-5 cards/gen → roughly gen*3 to gen*4 by each generation
+    card_benchmark = max(5, generation * 3)
+    if played_count < card_benchmark and generation >= 3:
+        lines.append(
+            f"⚠ CARD THROUGHPUT: you have {played_count} cards in play at generation {generation}. "
+            f"Competitive players typically have {card_benchmark}+ by now. "
+            f"Playing more cards per generation is essential for engine and VP — "
+            f"use steel/titanium discounts and prioritize cheap synergy cards."
+        )
+
+    # VP urgency: if badly behind leader near end game, flag it
+    my_vp = p.get("victoryPoints", 0) or 0
+    opp_vps = [opp.get("victoryPoints", 0) or 0 for opp in opponents]
+    if opp_vps:
+        max_opp_vp = max(opp_vps)
+        gap = max_opp_vp - my_vp
+        # Warn if >15 VP behind with few oceans/params left (rough end-game proxy)
+        params_left = max(0, 14 - oxygen) + max(0, 9 - oceans) + max(0, (8 - temp) // 2)
+        if gap >= 15 and params_left <= 8:
+            lines.append(
+                f"⚠ VP DEFICIT: you are {gap} VP behind the leader ({max_opp_vp} VP) with "
+                f"~{params_left} parameter steps left. 'Keep primary' is NOT enough — you need "
+                f"drastic moves: claim an unclaimed milestone, fund an award you are leading, "
+                f"or convert plants/heat aggressively."
+            )
+
     # Tableau — cards in play (authoritative; the AI no longer carries this in session memory)
     played = p.get("playedCards") or []
     corps  = p.get("corporations") or []
@@ -2204,6 +2404,12 @@ def _build_action_prompt(
         lines.append(f"Milestones claimed: {ms}")
     if aw:
         lines.append(f"Awards funded: {aw}")
+    # Award standings: show current position for each unfunded award so the AI can
+    # verify it is actually winning before deciding to fund.
+    award_standings = _compute_award_standings(state)
+    if award_standings:
+        lines.append("Unfunded award standings (verify you are 1st or close 2nd BEFORE funding):")
+        lines.extend(award_standings)
 
     recent_log = g.get("recentLog") or []
     if recent_log:
@@ -2246,35 +2452,58 @@ def _build_action_prompt(
 
         tile_title = title.lower()
         if "greenery" in tile_title:
-            lines += [
+            tip_lines = [
                 "PLACEMENT TIP — Greenery VP math:",
-                "  • Adjacent to 1 of your cities: +1 city VP + 1 greenery VP = 2 VP total",
-                "  • Adjacent to 2 of your cities: +2 city VP + 1 greenery VP = 3 VP total",
-                "  • Adjacent to 3 of your cities: +3 city VP + 1 greenery VP = 4 VP total",
-                "  • Maximize: pick the hex adjacent to the most of YOUR cities.",
-                "  ⚠ Never place adjacent to an opponent's city — you give them +1 VP for free.",
+                "  • Adjacent to 0 of your cities: 1 VP (just the greenery itself)",
+                "  • Adjacent to 1 of your cities: 2 VP (greenery + 1 city adjacency)",
+                "  • Adjacent to 2 of your cities: 3 VP (greenery + 2 city adjacency)",
+                "  • Adjacent to 3 of your cities: 4 VP (greenery + 3 city adjacency)",
+                "  → ALWAYS place adjacent to the most of YOUR own cities.",
+                "  ⚠ Never place adjacent to an opponent's city — you give them a free VP.",
             ]
+            if own_cities:
+                tip_lines.append(
+                    f"  You have {len(own_cities)} city tile(s) — look for the hex adjacent to the most of them."
+                )
+            else:
+                tip_lines.append(
+                    "  You have NO cities yet. Place greenery centrally so your first city can go "
+                    "adjacent to it later (that city will immediately score 1 VP from this greenery)."
+                )
             if opp_cities:
-                lines.append(f"  (Opponent has {len(opp_cities)} cities — avoid their adjacency.)")
+                tip_lines.append(
+                    f"  Opponents have {len(opp_cities)} city tile(s) — check the board space IDs and "
+                    "avoid placing on hexes adjacent to those cities."
+                )
+            lines += tip_lines
 
         elif "city" in tile_title:
             if not own_cities:
                 lines += [
-                    "PLACEMENT TIP — First city (critical decision):",
-                    "  • Choose a hex with 4-5 adjacent free LAND hexes (not ocean-reserved).",
-                    "  • This gives you room to place greeneries around it for 2 VP each.",
-                    "  • Aim for a spot where you can eventually build 2-3 cities and surround",
-                    "    them with shared greeneries (each shared greenery = 3-4 VP).",
-                    "  • Ideal: a position that lets you form a triangle of 3 cities later,",
-                    "    sharing central hexes worth 4 VP each.",
+                    "PLACEMENT TIP — First city (critical, plan ahead):",
+                    "  • Count free LAND hexes adjacent to each candidate hex (not ocean-reserved).",
+                    "    A good spot has 5-6 free adjacent land hexes for future greeneries.",
+                    "  • Avoid board edges and corners — fewer neighbors = fewer VP from greeneries.",
+                    "  • Choose a position where you can eventually place a SECOND city exactly",
+                    "    2 hexes away, sharing one common adjacent hex (worth 3 VP as a greenery).",
+                    "  • A central position with room for 2-3 nearby cities is worth 15-20+ board VP.",
+                ]
+            elif len(own_cities) == 1:
+                lines += [
+                    "PLACEMENT TIP — Second city:",
+                    f"  • You already have 1 city. Place the new city exactly 2 hexes away",
+                    "    (the minimum gap — cities cannot be adjacent).",
+                    "  • The one hex between them is shared by both cities: a greenery there scores 3 VP.",
+                    "  • This 2-city pair + surrounding greeneries = 10-12 board VP.",
+                    "  • Leave room for a 3rd city to complete a triangle later.",
                 ]
             else:
                 lines += [
-                    "PLACEMENT TIP — Subsequent city:",
-                    f"  • You already have {len(own_cities)} city/cities. Place close to your existing city",
-                    "    so you can place greeneries adjacent to BOTH cities (3 VP per greenery).",
-                    "  • A greenery adjacent to 2 cities = 3 VP; adjacent to 3 cities = 4 VP.",
-                    "  • Forming a triangle with your 3rd city sets up the highest-value greenery layout.",
+                    "PLACEMENT TIP — Additional city:",
+                    f"  • You have {len(own_cities)} cities. Place the new city to maximize shared hexes",
+                    "    with your existing cities (each shared hex = +2 VP for a greenery placed there).",
+                    "  • A greenery between 3 cities = 4 VP total — the highest-value single tile.",
+                    "  • Ensure the new city is not adjacent to any other city (game rule).",
                 ]
 
     # Options list
