@@ -2396,6 +2396,124 @@ def _get_card_desc_for_option(opt: dict) -> str:
     return f"Use {name} action — {desc}" if desc else f"Use {name} action"
 
 
+# Known milestone thresholds. Keys are matched as substrings of milestone names
+# (lowercased), so "Terraformer" → "terraformer". Variants (Hellas, Venus, etc.)
+# fall through to the unknown-milestone branch with no opponent-proximity check.
+_MILESTONE_THRESHOLDS: dict[str, int] = {
+    "terraformer": 35,   # TR ≥ 35
+    "mayor":       3,    # cities ≥ 3
+    "gardener":    3,    # greeneries ≥ 3
+    "builder":     8,    # building tags ≥ 8
+    "planner":     16,   # hand size ≥ 16
+}
+# Distance (in milestone units) at which an opponent is treated as a real
+# threat to race for the same milestone next turn.
+_MILESTONE_RACE_GAP = 3
+
+
+def _milestone_value(entity: dict, ms_name_lower: str) -> int | None:
+    """Numeric progress of `entity` toward a known milestone. None for unknowns."""
+    if "terraformer" in ms_name_lower:
+        return entity.get("terraformRating", 20)
+    if "mayor" in ms_name_lower:
+        return (entity.get("boardTiles") or {}).get("city", 0)
+    if "gardener" in ms_name_lower:
+        return (entity.get("boardTiles") or {}).get("greenery", 0)
+    if "builder" in ms_name_lower:
+        return (entity.get("tags") or {}).get("building", 0)
+    if "planner" in ms_name_lower:
+        return entity.get("handSize", 0)
+    return None
+
+
+def _milestone_threshold(ms_name_lower: str) -> int | None:
+    for key, val in _MILESTONE_THRESHOLDS.items():
+        if key in ms_name_lower:
+            return val
+    return None
+
+
+def _milestone_claim_options(options: list[dict]) -> list[tuple[int, str]]:
+    """Return [(option_index, milestone_name)] for any 'Claim milestone X' options.
+
+    Detects TM's actual option titles ("Claim milestone Terraformer", etc.).
+    The generic top-level "Claim a milestone" picker is not included because
+    it carries no specific milestone name — the per-milestone options appear
+    one level deeper.
+    """
+    out: list[tuple[int, str]] = []
+    for opt in options:
+        title = str(opt.get("title", "")).strip()
+        # Match "Claim milestone <Name>" — case-insensitive, allow trailing punctuation
+        m = re.match(r"^claim\s+milestone\s+(.+?)\s*$", title, re.IGNORECASE)
+        if m:
+            name = m.group(1).strip().rstrip(".")
+            if name and name.lower() not in ("a milestone", "milestone"):
+                out.append((opt["index"], name))
+    return out
+
+
+def _milestone_advisory(state: dict, options: list[dict]) -> list[str]:
+    """Build the 'CLAIM IT' advisory block when the game offers a milestone claim.
+
+    Returns [] when no claim-milestone option is in the menu. Otherwise returns a
+    multi-line block telling the LLM to claim; for known milestones, also
+    reports each opponent's progress and flags any opponent within race range
+    as a reason to claim NOW.
+    """
+    ms_opts = _milestone_claim_options(options)
+    if not ms_opts:
+        return []
+
+    opponents = state.get("opponents") or []
+    lines: list[str] = [
+        "",
+        "⚠ MILESTONE CLAIM AVAILABLE — STRONG ADVISORY:",
+        "The game engine offered a 'Claim milestone' option, which means you have already "
+        "met its requirement AND can afford the 8 MC cost. Milestones give 5 VP for 8 MC "
+        "(~0.6 VP/MC — exceptional ROI), and only 3 milestones can ever be claimed in the "
+        "whole game. Default: CLAIM IT THIS TURN.",
+        "Postpone ONLY if BOTH hold: (a) every opponent is well outside race range for "
+        "every unclaimed milestone (numbers below), AND (b) you have a concrete 8-MC play "
+        "this turn that scores MORE than 5 VP. Otherwise claim now — opponents can race "
+        "you on their next turn and the supply is capped at 3.",
+    ]
+
+    for idx, ms_name in ms_opts:
+        ms_name_lower = ms_name.lower()
+        threshold = _milestone_threshold(ms_name_lower)
+        opt_label = f"Option {idx + 1}: Claim '{ms_name}'"
+
+        if threshold is None:
+            lines.append(f"  {opt_label} (5 VP for 8 MC). Default action: CLAIM.")
+            continue
+
+        opp_progress: list[str] = []
+        any_close = False
+        for opp in opponents:
+            ov = _milestone_value(opp, ms_name_lower)
+            if ov is None:
+                continue
+            gap = max(0, threshold - ov)
+            opp_progress.append(f"{opp.get('name', 'Opp')}={ov}/{threshold}(gap {gap})")
+            if gap <= _MILESTONE_RACE_GAP:
+                any_close = True
+
+        progress_str = "; ".join(opp_progress) if opp_progress else "no opponents tracked"
+        if any_close:
+            lines.append(
+                f"  {opt_label}: ⚠ at least one opponent is within {_MILESTONE_RACE_GAP} of "
+                f"the threshold — CLAIM NOW or risk being blocked. Opponents: {progress_str}."
+            )
+        else:
+            lines.append(
+                f"  {opt_label}: no opponent is within race range. Opponents: {progress_str}. "
+                f"You MAY postpone if you have a higher-VP 8-MC play this turn — but the 3-claim "
+                f"cap still pressures you to grab it eventually."
+            )
+    return lines
+
+
 def _compute_award_standings(state: dict) -> list[str]:
     """Return human-readable standing lines for each available (unfunded) award.
 
@@ -2525,6 +2643,11 @@ def _build_action_prompt(
             f" O₂ is maxed so no TR bonus, but each tile scores +1 VP (plus +1 VP per adjacent city)."
             f" Worth doing if land is available."
         )
+
+    # Milestone-claim advisory: if the game offers a "Claim milestone X" option
+    # the player has already met the requirement — strongly advise claiming.
+    lines.extend(_milestone_advisory(state, options))
+
     if prod:
         lines.append(f"Production: {prod}")
     if tags:

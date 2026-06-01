@@ -583,3 +583,140 @@ def test_with_retry_respects_max_attempts_cap_for_tests():
     with patch.object(llm.time, "sleep"):
         with pytest.raises(RuntimeError):
             llm._with_retry(fn, max_attempts=3)
+
+
+# ---------------------------------------------------------------------------
+# Milestone-claim advisory
+# ---------------------------------------------------------------------------
+
+def test_milestone_claim_options_detects_titles():
+    options = [
+        {"index": 0, "title": "Play project card"},
+        {"index": 1, "title": "Claim milestone Terraformer"},
+        {"index": 2, "title": "Claim milestone Builder."},
+        {"index": 3, "title": "Pass"},
+    ]
+    result = llm._milestone_claim_options(options)
+    assert result == [(1, "Terraformer"), (2, "Builder")]
+
+
+def test_milestone_claim_options_ignores_generic_picker():
+    """The top-level 'Claim a milestone' picker should not match."""
+    options = [
+        {"index": 0, "title": "Claim a milestone"},
+        {"index": 1, "title": "Pass"},
+    ]
+    assert llm._milestone_claim_options(options) == []
+
+
+def test_milestone_advisory_empty_when_no_claim_option():
+    state = {"opponents": [{"name": "Alice", "terraformRating": 30}]}
+    options = [{"index": 0, "title": "Pass"}]
+    assert llm._milestone_advisory(state, options) == []
+
+
+def test_milestone_advisory_flags_close_opponent():
+    """When an opponent is within 3 of the threshold → CLAIM NOW warning."""
+    state = {
+        "opponents": [
+            {"name": "Alice", "terraformRating": 33},  # gap 2 → close
+            {"name": "Bob",   "terraformRating": 25},  # gap 10 → far
+        ],
+    }
+    options = [{"index": 1, "title": "Claim milestone Terraformer"}]
+    lines = llm._milestone_advisory(state, options)
+    blob = "\n".join(lines)
+    assert "MILESTONE CLAIM AVAILABLE" in blob
+    assert "CLAIM NOW" in blob          # close-opponent flag
+    assert "Alice=33/35" in blob
+    assert "Bob=25/35" in blob
+
+
+def test_milestone_advisory_postpone_allowed_when_no_opponent_close():
+    """No opponent in race range → softer 'may postpone if higher-VP play exists' note."""
+    state = {
+        "opponents": [
+            {"name": "Alice", "terraformRating": 22},
+            {"name": "Bob",   "terraformRating": 24},
+        ],
+    }
+    options = [{"index": 1, "title": "Claim milestone Terraformer"}]
+    lines = llm._milestone_advisory(state, options)
+    blob = "\n".join(lines)
+    assert "MILESTONE CLAIM AVAILABLE" in blob
+    assert "CLAIM NOW" not in blob
+    assert "may postpone" in blob.lower() or "MAY postpone" in blob
+    # Still mentions opponent progress numerically
+    assert "Alice=22/35" in blob
+
+
+def test_milestone_advisory_unknown_milestone_still_advises_claim():
+    """Variant milestones with no known threshold still get the strong claim advisory."""
+    state = {"opponents": [{"name": "Alice"}]}
+    options = [{"index": 2, "title": "Claim milestone Hoverlord"}]
+    lines = llm._milestone_advisory(state, options)
+    blob = "\n".join(lines)
+    assert "MILESTONE CLAIM AVAILABLE" in blob
+    assert "Hoverlord" in blob
+    assert "Default action: CLAIM" in blob
+
+
+def test_milestone_advisory_handles_board_tile_milestones():
+    """Mayor (cities ≥ 3) and Gardener (greeneries ≥ 3) use boardTiles fields."""
+    state = {
+        "opponents": [
+            {"name": "Alice", "boardTiles": {"city": 2}},     # gap 1 → close
+            {"name": "Bob",   "boardTiles": {"city": 0}},     # gap 3 → close (==3)
+        ],
+    }
+    options = [{"index": 1, "title": "Claim milestone Mayor"}]
+    lines = llm._milestone_advisory(state, options)
+    blob = "\n".join(lines)
+    assert "CLAIM NOW" in blob
+    assert "Alice=2/3" in blob
+    assert "Bob=0/3" in blob
+
+
+def test_build_action_prompt_emits_milestone_advisory():
+    """End-to-end: _build_action_prompt includes the advisory when the option is offered."""
+    state = {
+        "game": {"generation": 4, "temperature": 0, "oxygen": 5, "oceanCount": 3},
+        "player": {
+            "terraformRating": 36, "megacredits": 25, "victoryPoints": 12,
+            "steel": 0, "titanium": 0, "plants": 2, "energy": 0, "heat": 0,
+            "handSize": 4, "tags": {}, "production": {"megacredits": 2},
+        },
+        "opponents": [{"name": "Alice", "terraformRating": 33}],
+        "milestones": [], "awards": [],
+    }
+    waiting_for = {"type": "or", "title": "Take action", "options": []}
+    options = [
+        {"index": 0, "title": "Play project card"},
+        {"index": 1, "title": "Claim milestone Terraformer"},
+        {"index": 2, "title": "Pass"},
+    ]
+    prompt = llm._build_action_prompt(state, waiting_for, options)
+    assert "MILESTONE CLAIM AVAILABLE" in prompt
+    assert "Terraformer" in prompt
+    assert "CLAIM NOW" in prompt  # Alice at 33/35 → close
+
+
+def test_build_action_prompt_skips_advisory_when_no_claim_option():
+    """No claim-milestone option in menu → no advisory in prompt."""
+    state = {
+        "game": {"generation": 4, "temperature": 0, "oxygen": 5, "oceanCount": 3},
+        "player": {
+            "terraformRating": 30, "megacredits": 25, "victoryPoints": 8,
+            "steel": 0, "titanium": 0, "plants": 2, "energy": 0, "heat": 0,
+            "handSize": 4, "tags": {}, "production": {"megacredits": 2},
+        },
+        "opponents": [],
+        "milestones": [], "awards": [],
+    }
+    waiting_for = {"type": "or", "title": "Take action", "options": []}
+    options = [
+        {"index": 0, "title": "Play project card"},
+        {"index": 1, "title": "Pass"},
+    ]
+    prompt = llm._build_action_prompt(state, waiting_for, options)
+    assert "MILESTONE CLAIM AVAILABLE" not in prompt
