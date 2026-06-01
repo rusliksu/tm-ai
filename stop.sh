@@ -6,8 +6,10 @@
 #   ./stop.sh --clean-db   # also remove current game(s) from the TM SQLite DB
 #
 # PID files consumed:
-#   /tmp/tm-ai.pids         — AI server + TM server (written by start.sh)
-#   /tmp/death-match.pids   — game loop process     (written by start.sh --death-match)
+#   /tmp/tm-ai.pids         — AI server + TM server (written by start.sh / start-deathmatch.sh)
+#   /tmp/death-match.pids   — game loop process     (written by start-deathmatch.sh)
+#
+# Also clears: /tmp/current-game.id, /tmp/current-game.url
 
 set -euo pipefail
 
@@ -62,6 +64,8 @@ for port in 8000 8080; do
     killed_any=true
   fi
 done
+
+rm -f /tmp/current-game.id /tmp/current-game.url
 
 if [[ "${killed_any}" == "false" ]]; then
   echo "  nothing was running"

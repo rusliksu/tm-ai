@@ -1,33 +1,29 @@
 #!/usr/bin/env bash
-# Start the AI + TM servers in the background.
+# Start AI + TM servers and run a 4-LLM death-match game.
 #
 # USAGE
-#   ./start.sh                                      # default: deepseek/deepseek-v4-flash
-#   OPENROUTER_MODEL=anthropic/claude-sonnet-4-6 ./start.sh
-#   LLM_DEBUG=false ./start.sh
-#   TM_AI_DIR=/path TM_DIR=/path ./start.sh
-#
-# For multi-LLM death-match runs, use:
 #   ./start-deathmatch.sh
+#   DEATH_MATCH_MODELS="anthropic/claude-sonnet-4-6,openai/gpt-4o-mini,google/gemini-2.5-flash,deepseek/deepseek-chat" ./start-deathmatch.sh
+#   LLM_DEBUG=false ./start-deathmatch.sh
+#   TM_AI_DIR=/path TM_DIR=/path ./start-deathmatch.sh
 #
 # REQUIREMENTS
-#   OPENROUTER_API_KEY must be set in ${TM_AI_DIR}/.env. The AI server derives
-#   the provider from the model name: "vendor/model" → OpenRouter, "bare:tag"
-#   → local Ollama.
+#   OPENROUTER_API_KEY must be set in ${TM_AI_DIR}/.env.
 #
 # PORTS
 #   8000 — AI server (FastAPI)
 #   8080 — TM server (Node)
-#   If either port is already bound the script lists the offending PIDs and
-#   asks for confirmation before killing them. Decline → script exits.
 #
 # OUTPUT
 #   Server PIDs   /tmp/tm-ai.pids
-#   Session dir   ./logs/llm-test/<timestamp>/    (created at start)
-#       ai-server.log    (AI server)
-#       tm-server.log    (TM server)
-#   The latest session is also symlinked at ./logs/llm-test/_latest for
-#   convenience (`tail -f logs/llm-test/_latest/ai-server.log`).
+#   Game PID      /tmp/death-match.pids
+#   Session dir   ./logs/llm-test/<session-id>/    (used at startup)
+#       ai-server.log
+#       tm-server.log
+#       death-match.log
+#   Once the game has been created (game_id known), the session directory is
+#   renamed to ./logs/llm-test/<game-id>/ and ./logs/llm-test/_latest points
+#   at it. Running processes keep writing to the same inodes after the rename.
 #
 # STOP
 #   ./stop.sh
@@ -45,7 +41,13 @@ ln -sfn "${SESSION_ID}" "${TM_AI_DIR}/logs/llm-test/_latest"
 
 AI_LOG="${SESSION_DIR}/ai-server.log"
 TM_LOG="${SESSION_DIR}/tm-server.log"
+DM_LOG="${SESSION_DIR}/death-match.log"
 PID_FILE=/tmp/tm-ai.pids
+DM_PID_FILE=/tmp/death-match.pids
+GAME_ID_FILE=/tmp/current-game.id
+
+# Default 4-LLM lineup (override via DEATH_MATCH_MODELS)
+DEATH_MATCH_MODELS="${DEATH_MATCH_MODELS:-anthropic/claude-sonnet-4-6,openai/gpt-4o-mini,google/gemini-2.5-flash,deepseek/deepseek-chat}"
 
 # --- env ----------------------------------------------------------------------
 if [[ -f "${TM_AI_DIR}/.env" ]]; then
@@ -100,14 +102,15 @@ for port in 8000 8080; do
 done
 
 : > "${PID_FILE}"
+rm -f "${GAME_ID_FILE}" /tmp/current-game.url
 
 # --- AI server ----------------------------------------------------------------
-echo "▶ starting AI server (OpenRouter, single model, log: ${AI_LOG})"
+echo "▶ starting AI server (OpenRouter / multi-model, log: ${AI_LOG})"
 (
   cd "${TM_AI_DIR}/tm-ai-server"
-  # OPENROUTER_API_KEY is already exported via `set -a; source .env` above.
+  # API keys are already exported via `set -a; source .env` above — no need to
+  # pass them explicitly here, which would risk exposing them in process listings.
   USE_LLM=true \
-  OPENROUTER_MODEL="${OPENROUTER_MODEL:-deepseek/deepseek-v4-flash}" \
   LLM_DEBUG="${LLM_DEBUG:-true}" \
   exec uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000
 ) >> "${AI_LOG}" 2>&1 &
@@ -159,12 +162,77 @@ for i in {1..30}; do
   [[ $i -eq 30 ]] && { echo "❌ TM server did not respond in 30s — see ${TM_LOG}" >&2; exit 1; }
 done
 
+# --- death-match game loop ----------------------------------------------------
+echo "▶ launching death-match (log: ${DM_LOG})"
+echo "  models: ${DEATH_MATCH_MODELS}"
+(
+  cd "${TM_AI_DIR}"
+  exec uv run python scripts/play_game.py \
+    --players 4 \
+    --models "${DEATH_MATCH_MODELS}"
+) >> "${DM_LOG}" 2>&1 &
+DM_PID=$!
+echo "${DM_PID}" > "${DM_PID_FILE}"
+echo "  PID=${DM_PID}"
+
+# --- wait for game_id, then rename session dir to game-id ---------------------
+echo -n "  waiting for game ID"
+GAME_ID=""
+for i in {1..20}; do
+  if [[ -f "${GAME_ID_FILE}" ]]; then
+    GAME_ID="$(< "${GAME_ID_FILE}")"
+    echo ""
+    break
+  fi
+  if ! kill -0 "${DM_PID}" 2>/dev/null; then
+    echo ""
+    echo "❌ game loop exited before creating a game — see ${DM_LOG}" >&2
+    tail -10 "${DM_LOG}" >&2
+    break
+  fi
+  echo -n "."
+  sleep 1
+  [[ $i -eq 20 ]] && echo "" && echo "  ⚠ timed out waiting for game ID — check ${DM_LOG}"
+done
+
+if [[ -n "${GAME_ID}" ]]; then
+  GAME_DIR="${TM_AI_DIR}/logs/llm-test/${GAME_ID}"
+  if [[ -e "${GAME_DIR}" ]]; then
+    echo "  ⚠ ${GAME_DIR} already exists — leaving session at ${SESSION_DIR}"
+  else
+    mv "${SESSION_DIR}" "${GAME_DIR}"
+    ln -sfn "${GAME_ID}" "${TM_AI_DIR}/logs/llm-test/_latest"
+    AI_LOG="${GAME_DIR}/ai-server.log"
+    TM_LOG="${GAME_DIR}/tm-server.log"
+    DM_LOG="${GAME_DIR}/death-match.log"
+    SESSION_DIR="${GAME_DIR}"
+    echo "  ✔ logs renamed → ${GAME_DIR}"
+  fi
+fi
+
+# Open spectator URL in browser
+if [[ -f /tmp/current-game.url ]]; then
+  game_url=$(< /tmp/current-game.url)
+  echo "  ✔ game ready: ${game_url}"
+  if command -v google-chrome &>/dev/null; then
+    google-chrome "${game_url}" &>/dev/null &
+  elif command -v chromium-browser &>/dev/null; then
+    chromium-browser "${game_url}" &>/dev/null &
+  elif command -v xdg-open &>/dev/null; then
+    xdg-open "${game_url}" &>/dev/null &
+  fi
+fi
+
 # --- done ---------------------------------------------------------------------
 echo
-echo "✅ servers up"
+echo "✅ servers up + death-match running"
 echo "   AI server :8000  (PID ${AI_PID})  ${AI_LOG}"
 echo "   TM server :8080  (PID ${TM_PID})  ${TM_LOG}"
+echo "   death-match      (PID ${DM_PID})  ${DM_LOG}"
 echo "   session dir      ${SESSION_DIR}"
 echo "                    symlinked at logs/llm-test/_latest"
+echo
+echo "   follow game:  tail -f ${DM_LOG}"
+echo "   follow AI:    tail -f ${AI_LOG}"
 echo
 echo "stop with:  ./stop.sh"

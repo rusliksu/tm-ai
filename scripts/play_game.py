@@ -156,11 +156,19 @@ def play_game(
     state        = data["state"]
     wf           = data["waitingFor"]
 
-    # Write spectator URL to a temp file so start.sh can open it in a browser
+    # Write spectator URL + game_id to temp files so start scripts can pick them up:
+    #   /tmp/current-game.url — opened in browser (spectator view)
+    #   /tmp/current-game.id  — used by start-deathmatch.sh to rename the session
+    #                           log directory to ./logs/llm-test/<game-id>/
     spectator_url = f"{tm_url}/spectator?id={spectator_id}" if spectator_id else f"{tm_url}"
     try:
         with open("/tmp/current-game.url", "w") as _f:
             _f.write(spectator_url + "\n")
+    except OSError:
+        pass
+    try:
+        with open("/tmp/current-game.id", "w") as _f:
+            _f.write(game_id)
     except OSError:
         pass
 

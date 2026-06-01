@@ -205,15 +205,18 @@ node build/src/server/server.js >> /tmp/tm-server.log 2>&1 &
 ### Quick-start scripts (recommended)
 
 ```bash
-# Start everything + run a 4-LLM death match (AI server on OpenRouter, TM server, play_game.py)
-./start.sh --death-match
-
-# Start AI server (OpenRouter, single model — default google/gemini-2.5-flash-lite) + TM server only
+# Start AI server (OpenRouter, single model — default deepseek/deepseek-v4-flash) + TM server only
 ./start.sh
 
-# Override default death-match lineup
+# Override the default model
+OPENROUTER_MODEL=anthropic/claude-sonnet-4-6 ./start.sh
+
+# Start servers + run a 4-LLM death match (separate script — deathmatch lives here, not in start.sh)
+./start-deathmatch.sh
+
+# Override the default death-match lineup
 DEATH_MATCH_MODELS="anthropic/claude-sonnet-4-6,openai/gpt-4o-mini,google/gemini-2.5-flash,deepseek/deepseek-chat" \
-  ./start.sh --death-match
+  ./start-deathmatch.sh
 
 # Stop everything (kills PIDs tracked in /tmp/tm-ai.pids and /tmp/death-match.pids)
 ./stop.sh
@@ -227,7 +230,7 @@ uv run python scripts/play_game.py \
 # --verbose                         (print full state JSON each turn)
 ```
 
-`start.sh` writes `PID` files to `/tmp/tm-ai.pids` (servers) and `/tmp/death-match.pids` (game loop). The game's spectator URL is written to `/tmp/current-game.url` once the game is created, and the script attempts to open it in Chrome/Chromium automatically.
+Both scripts write PID files to `/tmp/tm-ai.pids` (servers) and `/tmp/death-match.pids` (game loop). Logs go to `./logs/llm-test/<session-id>/` — `<session-id>` is a UTC timestamp at startup; `start-deathmatch.sh` renames it to `<game-id>` once `play_game.py` creates the game (game_id is published to `/tmp/current-game.id`). The spectator URL is written to `/tmp/current-game.url` and the script attempts to open it in Chrome/Chromium automatically. A convenience symlink `./logs/llm-test/_latest` always points at the most recent session/game directory.
 
 ## LLM Player (llm_player.py)
 
