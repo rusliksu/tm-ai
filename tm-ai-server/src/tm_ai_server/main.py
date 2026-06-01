@@ -13,7 +13,10 @@ if not _app_logger.handlers:
 
 from .config import STATE_DIM, HIDDEN_SIZES, ACTION_SPACE_SIZE, PORT
 from .inference import select_action, select_advice
-from .llm_player import validate_llm_config, log_game_token_summary, register_player
+from .llm_player import (
+    log_game_token_summary, prune_stale_state, register_player,
+    save_all_active_players, validate_llm_config,
+)
 from .schemas import (
     AdviceRequest, AdviceResponse, HealthResponse, MoveDebug,
     MoveRequest, MoveResponse, PlayerRegisterRequest, PlayerRegisterResponse, VersionResponse,
@@ -25,7 +28,11 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     validate_llm_config()
-    yield
+    prune_stale_state()
+    try:
+        yield
+    finally:
+        save_all_active_players()
 
 
 app = FastAPI(title="TM AI Server", version="0.1.0", lifespan=lifespan)

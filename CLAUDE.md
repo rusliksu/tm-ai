@@ -246,6 +246,9 @@ Supports two providers, selected by the **model name** (no `LLM_PROVIDER` flag):
 | `OPENROUTER_ACTION_THINKING_BUDGET` | `512` | Thinking tokens for tactical action turns (smaller = faster for reasoning models) |
 | `OPENROUTER_MAX_OUTPUT_TOKENS` | `4096` | Max output tokens per action (must exceed the thinking budget or response is truncated before CHOICE) |
 | `OPENROUTER_MAX_TURNS` | `44` | Trim session history at this many messages (keeps last 28 + strategy doc) |
+| `LLM_STATE_PERSIST` | `true` | Persist per-player state to disk on graceful shutdown |
+| `LLM_STATE_DIR` | `<repo>/logs/llm-state` | Where per-player state JSONs are written (one file per `player_id`) |
+| `LLM_STATE_MAX_AGE_DAYS` | `7` | Files older than this are pruned at server startup |
 
 Gemini, GPT, DeepSeek, Grok, etc. are reached **through OpenRouter** by model id (e.g. `google/gemini-2.5-flash-lite`); there is no longer a dedicated Gemini provider or `GEMINI_*` env var.
 
@@ -300,6 +303,8 @@ On exhaustion, falls back to the "Pass" option if the only error is a missing CH
 **AI Trainer** (`select_action_advise`): per-player coaching via `POST /advise`. Opt-in per player from the UI toggle — no game-wide flag. Session namespace `trainer:<game_id>:<player_id>` isolates each player's session. Setup phases (`initialCards`, `prelude`) handled by `_select_setup_advise`. System prompt requires plain-text 1-3 sentence coaching plus a `<recommendation>` block; markdown is forbidden. Requires `USE_LLM=true`. Play Recommendation in `AiTrainerChat.vue` reloads the page on success.
 
 **Multi-LLM death match**: `POST /player/register` assigns a model to a player before game start. `play_game.py --models "a/m1,b/m2,..."` registers one model per seat and runs a full game. `POST /game-done` flushes the per-player token/cost summary.
+
+**State persistence across restarts**: on graceful shutdown (FastAPI lifespan `finally`), `save_all_active_players()` writes each in-flight LLM player's durable state (model, strategy, tactical plan, last_generation, token_usage) to `logs/llm-state/<player_id>.json` — one file per AI player. Trainer players and players whose game has already ended (in `_game_summary_logged`) are skipped. On the next startup, `prune_stale_state()` removes files older than `LLM_STATE_MAX_AGE_DAYS`. When TM server next calls `/move`, `get_or_create_player` lazily restores state from the matching JSON (validating `game_id` matches; stale files are deleted). `/game-done` deletes a game's state files after logging the token summary. Setup-phase chat sessions and `action_system` are **not** persisted — both regenerate naturally. Survives graceful shutdowns only; `kill -9` loses the in-memory state. See `specs/LLM-state-persistence.md` for the full design.
 
 ## Remaining Work
 

@@ -37,10 +37,13 @@ Env vars:
 """
 
 from __future__ import annotations
+import json
 import logging
 import os
 import re
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
 
@@ -65,6 +68,13 @@ _OPENROUTER_MAX_OUTPUT_TOKENS = int(os.getenv("OPENROUTER_MAX_OUTPUT_TOKENS", "4
 _OLLAMA_URL     = os.getenv("OLLAMA_URL",   "http://localhost:11434")
 _OLLAMA_MODEL   = os.getenv("OLLAMA_MODEL", "qwen3:4b")
 _OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "600"))
+
+# State persistence (see specs/LLM-state-persistence.md)
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_LLM_STATE_DIR = Path(os.getenv("LLM_STATE_DIR", str(_REPO_ROOT / "logs" / "llm-state")))
+_LLM_STATE_MAX_AGE_DAYS = int(os.getenv("LLM_STATE_MAX_AGE_DAYS", "7"))
+_LLM_STATE_PERSIST = os.getenv("LLM_STATE_PERSIST", "true").lower() == "true"
+_LLM_STATE_SCHEMA_VERSION = 1
 
 SETUP_TYPES = {"initialCards", "prelude"}
 
@@ -405,6 +415,48 @@ class LLMPlayer:
             "cache_read": 0, "cache_write": 0, "thinking": 0,
         }
         self.summary_logged: bool = False
+
+    # ------------------------------------------------------------------
+    # Persistence (see specs/LLM-state-persistence.md)
+    # ------------------------------------------------------------------
+
+    def to_dict(self) -> dict:
+        """Serialize the durable parts of this player's state.
+
+        Skips `session` (only used in short-lived setup phase) and
+        `action_system` (rebuilt deterministically from game state on first
+        action call).
+        """
+        return {
+            "schema_version": _LLM_STATE_SCHEMA_VERSION,
+            "saved_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "player_id": self.player_id,
+            "game_id":   self.game_id,
+            "model":     self.model,
+            "strategy":  self.strategy,
+            "tactical":  self.tactical,
+            "last_generation":       self.last_generation,
+            "hand_shown_generation": self.hand_shown_generation,
+            "token_usage":    dict(self.token_usage),
+            "summary_logged": self.summary_logged,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "LLMPlayer":
+        """Reconstruct an LLMPlayer from a `to_dict` payload."""
+        p = cls(player_id=data["player_id"],
+                game_id=data["game_id"],
+                model=data["model"])
+        p.strategy              = data.get("strategy", "") or ""
+        p.tactical              = data.get("tactical", "") or ""
+        p.last_generation       = int(data.get("last_generation", -1))
+        p.hand_shown_generation = int(data.get("hand_shown_generation", -1))
+        usage = data.get("token_usage") or {}
+        for k in ("calls", "input", "output", "cache_read", "cache_write", "thinking"):
+            if k in usage:
+                p.token_usage[k] = int(usage[k])
+        p.summary_logged = bool(data.get("summary_logged", False))
+        return p
 
     # ------------------------------------------------------------------
     # Session management
@@ -854,15 +906,36 @@ def register_player(player_id: str, game_id: str, model: str | None = None) -> "
 
 
 def get_or_create_player(player_id: str, game_id: str) -> "LLMPlayer":
-    """Return existing player or auto-create with default model (warn if auto-created)."""
+    """Return existing player or auto-create with default model (warn if auto-created).
+
+    On a registry miss, first try to lazily restore state persisted from a
+    previous server run (`logs/llm-state/<player_id>.json`). If no matching
+    state file is found, fall back to the original auto-create + warn path.
+    """
     if player_id not in _player_registry:
-        logger.warning("Player %s not pre-registered — auto-creating with default model", player_id)
-        register_player(player_id, game_id)
+        restored = try_load_player_state(player_id, game_id)
+        if restored is not None:
+            _player_registry[player_id] = restored
+            _game_players.setdefault(game_id, [])
+            if player_id not in _game_players[game_id]:
+                _game_players[game_id].append(player_id)
+            logger.info(
+                "LLM state restored: player=%s game=%s model=%s gen=%d",
+                restored.player_id, restored.game_id, restored.model,
+                restored.last_generation,
+            )
+        else:
+            logger.warning("Player %s not pre-registered — auto-creating with default model", player_id)
+            register_player(player_id, game_id)
     return _player_registry[player_id]
 
 
 def log_game_token_summary(game_id: str) -> None:
-    """Log per-player token summary for all AI players in a game."""
+    """Log per-player token summary for all AI players in a game.
+
+    After logging, delete any persisted state files for this game's players —
+    the game is finished, so the state is no longer useful.
+    """
     if game_id in _game_summary_logged:
         return
     _game_summary_logged.add(game_id)
@@ -882,6 +955,140 @@ def log_game_token_summary(game_id: str) -> None:
         "TOKEN SUMMARY game=%s | players=%d | total calls=%d in=%d out=%d",
         game_id, len(player_ids), totals["calls"], totals["input"], totals["output"],
     )
+
+    removed = 0
+    for pid in player_ids:
+        if clear_player_state(pid):
+            removed += 1
+    if removed:
+        logger.info("LLM state cleaned up: %d files removed for game=%s", removed, game_id)
+
+
+# ---------------------------------------------------------------------------
+# Persistence helpers (see specs/LLM-state-persistence.md)
+# ---------------------------------------------------------------------------
+
+def _state_path(player_id: str) -> Path:
+    """Filesystem path for a player's state file. Sanitises ':' for filenames."""
+    safe = player_id.replace(":", "_").replace("/", "_")
+    return _LLM_STATE_DIR / f"{safe}.json"
+
+
+def save_all_active_players() -> int:
+    """Persist all in-flight LLM players to disk. Returns number of files written.
+
+    Skips trainer players (`player_id` starting with `trainer:`) and players
+    whose `game_id` is in `_game_summary_logged` (game already finished).
+    Errors are logged as warnings and do not propagate.
+    """
+    if not _LLM_STATE_PERSIST:
+        return 0
+    try:
+        _LLM_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        logger.warning("Could not create LLM state dir %s: %s", _LLM_STATE_DIR, exc)
+        return 0
+
+    written = 0
+    for pid, player in list(_player_registry.items()):
+        if pid.startswith("trainer:"):
+            continue
+        if player.game_id in _game_summary_logged:
+            continue
+        try:
+            path = _state_path(pid)
+            tmp  = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(player.to_dict(), indent=2))
+            os.replace(tmp, path)
+            written += 1
+        except Exception as exc:
+            logger.warning("Failed to persist LLM state for player %s: %s", pid, exc)
+
+    if written:
+        logger.info("LLM state persisted: %d players → %s", written, _LLM_STATE_DIR)
+    return written
+
+
+def try_load_player_state(player_id: str, game_id: str) -> "LLMPlayer | None":
+    """Try to restore a persisted `LLMPlayer` from disk.
+
+    Returns the restored player on success, or None if the file is missing,
+    stale (mismatched `game_id`), corrupt, or written by a newer schema.
+    A stale file is deleted as a side effect.
+    """
+    if not _LLM_STATE_PERSIST:
+        return None
+    path = _state_path(player_id)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except Exception as exc:
+        logger.warning("Could not read LLM state %s: %s", path, exc)
+        return None
+
+    saved_version = int(data.get("schema_version", 0))
+    if saved_version > _LLM_STATE_SCHEMA_VERSION:
+        logger.warning(
+            "LLM state at %s has schema_version=%d (newer than %d) — ignoring",
+            path, saved_version, _LLM_STATE_SCHEMA_VERSION,
+        )
+        return None
+
+    if data.get("game_id") != game_id:
+        logger.warning(
+            "LLM state at %s has stale game_id=%s (expected %s) — discarding",
+            path, data.get("game_id"), game_id,
+        )
+        try:
+            path.unlink()
+        except Exception:
+            pass
+        return None
+
+    try:
+        return LLMPlayer.from_dict(data)
+    except Exception as exc:
+        logger.warning("Could not deserialize LLM state %s: %s", path, exc)
+        return None
+
+
+def clear_player_state(player_id: str) -> bool:
+    """Delete a player's persisted state file if it exists. Returns True if removed."""
+    path = _state_path(player_id)
+    try:
+        if path.exists():
+            path.unlink()
+            return True
+    except Exception as exc:
+        logger.warning("Could not delete LLM state %s: %s", path, exc)
+    return False
+
+
+def prune_stale_state(max_age_days: int | None = None) -> int:
+    """Delete state files older than `max_age_days` (default from env).
+
+    Cold-start hygiene against games that crashed without `/game-done` ever
+    firing. Returns number of files removed.
+    """
+    if not _LLM_STATE_PERSIST:
+        return 0
+    if not _LLM_STATE_DIR.exists():
+        return 0
+    cutoff_days = _LLM_STATE_MAX_AGE_DAYS if max_age_days is None else max_age_days
+    cutoff = time.time() - cutoff_days * 86400
+    removed = 0
+    for path in _LLM_STATE_DIR.glob("*.json"):
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+                removed += 1
+        except Exception as exc:
+            logger.warning("Could not prune LLM state %s: %s", path, exc)
+    if removed:
+        logger.info("LLM state pruned: %d files older than %d days removed from %s",
+                    removed, cutoff_days, _LLM_STATE_DIR)
+    return removed
 
 
 # ---------------------------------------------------------------------------
