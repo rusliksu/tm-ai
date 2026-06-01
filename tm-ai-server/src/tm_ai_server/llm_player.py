@@ -63,6 +63,12 @@ _OPENROUTER_THINKING_BUDGET = int(os.getenv("OPENROUTER_THINKING_BUDGET", "1024"
 _OPENROUTER_ACTION_THINKING_BUDGET = int(os.getenv("OPENROUTER_ACTION_THINKING_BUDGET", "512"))
 # Must comfortably exceed the thinking budget or reasoning models truncate before CHOICE.
 _OPENROUTER_MAX_OUTPUT_TOKENS = int(os.getenv("OPENROUTER_MAX_OUTPUT_TOKENS", "4096"))
+# Hard ceiling when the truncation-retry loop widens max_tokens. Some providers
+# (e.g. DeepSeek via SiliconFlow) ignore the reasoning budget hint and chew up
+# the entire max_tokens on thinking, returning an empty visible response with
+# finish_reason="length". We retry with max_tokens doubled, capped here.
+_OPENROUTER_TRUNCATION_MAX = int(os.getenv("OPENROUTER_TRUNCATION_MAX", "16384"))
+_OPENROUTER_TRUNCATION_RETRIES = int(os.getenv("OPENROUTER_TRUNCATION_RETRIES", "2"))
 
 # Ollama settings
 _OLLAMA_URL     = os.getenv("OLLAMA_URL",   "http://localhost:11434")
@@ -707,39 +713,85 @@ class LLMPlayer:
         if extra_body:
             kwargs["extra_body"] = extra_body
 
-        # Capability-fallback loop: retry without the failing feature on first error
-        for _attempt in range(3):
-            try:
-                response = _with_retry(lambda: _openrouter_client.chat.completions.create(**kwargs))  # type: ignore[union-attr]
-                break
-            except Exception as e:
-                if _is_transient_error(e):
-                    raise  # transient (429/503) — don't permanently disable capabilities
-                err = str(e).lower()
-                if "cache" in err and caps.get("caching"):
-                    caps["caching"] = False
-                    _model_capabilities[self.model]["caching"] = False
-                    # Rebuild messages without cache_control blocks
-                    messages = _strip_cache_control(messages)
-                    kwargs["messages"] = messages
-                    extra_headers.pop("anthropic-beta", None)
-                    kwargs.pop("extra_headers", None)
-                    logger.info("Disabled caching for %s after error: %s", self.model, e)
-                    continue
-                if ("thinking" in err or "budget" in err or "reasoning" in err) and caps.get("thinking"):
-                    caps["thinking"] = False
-                    _model_capabilities[self.model]["thinking"] = False
-                    extra_body.pop("thinking", None)
-                    extra_body.pop("reasoning", None)
-                    if extra_body:
-                        kwargs["extra_body"] = extra_body
-                    else:
-                        kwargs.pop("extra_body", None)
-                    logger.info("Disabled thinking for %s after error: %s", self.model, e)
-                    continue
-                raise
+        # Outer loop: detect truncation (finish_reason == "length" with no usable
+        # output) and retry with widened max_tokens + halved reasoning budget.
+        # Common with non-Anthropic models that ignore the reasoning-budget hint
+        # and consume the entire max_tokens on hidden thinking, leaving zero room
+        # for the visible answer (no CHOICE line → server falls back to option 1).
+        for _trunc_attempt in range(_OPENROUTER_TRUNCATION_RETRIES + 1):
+            # Inner loop: capability-fallback (disable caching/thinking on error).
+            response = None
+            for _attempt in range(3):
+                try:
+                    response = _with_retry(lambda: _openrouter_client.chat.completions.create(**kwargs))  # type: ignore[union-attr]
+                    break
+                except Exception as e:
+                    if _is_transient_error(e):
+                        raise  # transient (429/503) — don't permanently disable capabilities
+                    err = str(e).lower()
+                    if "cache" in err and caps.get("caching"):
+                        caps["caching"] = False
+                        _model_capabilities[self.model]["caching"] = False
+                        # Rebuild messages without cache_control blocks
+                        messages = _strip_cache_control(messages)
+                        kwargs["messages"] = messages
+                        extra_headers.pop("anthropic-beta", None)
+                        kwargs.pop("extra_headers", None)
+                        logger.info("Disabled caching for %s after error: %s", self.model, e)
+                        continue
+                    if ("thinking" in err or "budget" in err or "reasoning" in err) and caps.get("thinking"):
+                        caps["thinking"] = False
+                        _model_capabilities[self.model]["thinking"] = False
+                        extra_body.pop("thinking", None)
+                        extra_body.pop("reasoning", None)
+                        if extra_body:
+                            kwargs["extra_body"] = extra_body
+                        else:
+                            kwargs.pop("extra_body", None)
+                        logger.info("Disabled thinking for %s after error: %s", self.model, e)
+                        continue
+                    raise
 
-        text = _extract_text(response)
+            text = _extract_text(response)
+
+            if not _response_is_truncated(response, text):
+                break
+            if _trunc_attempt >= _OPENROUTER_TRUNCATION_RETRIES:
+                logger.warning(
+                    "Response truncated (finish_reason=length) and retries exhausted "
+                    "for %s — returning best-effort text (%d chars).",
+                    self.model, len(text or ""),
+                )
+                # Mark this model as not honouring the reasoning budget so future
+                # calls start with a wider max_tokens upfront.
+                _get_model_capabilities(self.model)["honors_reasoning_budget"] = False
+                _model_capabilities[self.model]["honors_reasoning_budget"] = False
+                break
+
+            cur_max = int(kwargs.get("max_tokens") or _OPENROUTER_MAX_OUTPUT_TOKENS)
+            new_max = min(_OPENROUTER_TRUNCATION_MAX, cur_max * 2)
+            if new_max <= cur_max:
+                logger.warning(
+                    "Response truncated for %s but max_tokens already at ceiling (%d) — giving up.",
+                    self.model, cur_max,
+                )
+                break
+            kwargs["max_tokens"] = new_max
+            # Halve the reasoning budget so the model has room to write the answer.
+            if "thinking" in extra_body:
+                old = int(extra_body["thinking"].get("budget_tokens", 1024))
+                extra_body["thinking"]["budget_tokens"] = max(256, old // 2)
+                kwargs["extra_body"] = extra_body
+            if "reasoning" in extra_body:
+                old = int(extra_body["reasoning"].get("max_tokens", 1024))
+                extra_body["reasoning"]["max_tokens"] = max(256, old // 2)
+                kwargs["extra_body"] = extra_body
+            logger.warning(
+                "Response truncated for %s (finish_reason=length, %d chars visible) — "
+                "retrying with max_tokens=%d (was %d), reasoning budget halved.",
+                self.model, len(text or ""), new_max, cur_max,
+            )
+
         self._accum_openrouter(response)
         return text
 
@@ -905,6 +957,34 @@ def _extract_text(response) -> str:
                 parts.append(block.get("text", ""))
         return "\n".join(parts)
     return str(msg.content or "")
+
+
+def _response_is_truncated(response, text: str) -> bool:
+    """True iff the response was cut off at max_tokens and lacks a usable answer.
+
+    DeepSeek/SiliconFlow (and some others) ignore the reasoning-budget hint and
+    blow the entire max_tokens on hidden thinking, returning empty visible text
+    with finish_reason="length". We retry with a wider cap when this happens.
+
+    A response is "truncated" if (a) the finish reason is length AND (b) the
+    visible text is either empty/whitespace OR missing the CHOICE/PAYMENT
+    markers we always require. We don't retry when there's a usable answer
+    even if finish_reason is "length" — the model just wrote a long body.
+    """
+    try:
+        choice = response.choices[0]
+    except Exception:
+        return False
+    finish = (getattr(choice, "finish_reason", None) or "").lower()
+    if finish != "length":
+        return False
+    if not text or not text.strip():
+        return True
+    # If the response carries a CHOICE line we consider it usable, even if the
+    # model also blew through max_tokens — at least the answer survived.
+    if re.search(r"CHOICE:\s*\d", text):
+        return False
+    return True
 
 
 def _strip_cache_control(messages: list[dict]) -> list[dict]:
@@ -1464,11 +1544,15 @@ _PER_GEN_STRATEGY_PROMPT = (
     "1. STANDING: your VP/TR vs each opponent. Ahead, level, or behind?\n"
     "2. ENGINE (PRIMARY): primary path to victory — engine type, key cards in play, how you "
     "score each gen.\n"
-    "3. MILESTONE TARGET: which of the 5 milestones will you claim (5 VP, max 3 in whole game, 8 MC)?\n"
-    "   List the requirement and your current progress. IF YOU ALREADY MEET ONE, "
-    "claim it next action — don't let opponents block you!\n"
-    "4. AWARD TARGET: which award will you fund and place 1st in (5 VP for 1st, 2 VP for 2nd, "
-    "max 3 funded at 8/14/20 MC)? Don't fund awards you can't win.\n"
+    "3. MILESTONE TARGET: pick from the milestone list above. Rules: 5 VP each, max 3 claimed "
+    "in the WHOLE game (across all players), costs 8 MC. You MUST pick a milestone marked "
+    "'•' or '✓' above — never one marked '✗' (claimed by you or an opponent). If the list "
+    "shows '3/3 claimed — MILESTONE PHASE OVER', write 'NONE — milestone phase over' and "
+    "skip ahead. If you ALREADY meet a milestone (marked '✓'), claim it as your VERY FIRST "
+    "action this generation — opponents can race you next turn.\n"
+    "4. AWARD TARGET: pick from the award standings above. Rules: 5 VP for 1st / 2 VP for 2nd, "
+    "max 3 funded at 8/14/20 MC. If '3/3 funded' shows, write 'NONE — award funding phase "
+    "over'. Don't fund awards you can't win 1st/close-2nd in.\n"
     "5. NEXT-GEN PRIORITY: concrete plan for this generation's actions. "
     "IMPORTANT: if you currently have >=8 heat and temperature < 8°C, 'Convert 8 heat' MUST be "
     "one of your first actions this generation (free +1 TR = +1 VP + +1 MC income every gen). "
@@ -1577,18 +1661,38 @@ def _per_generation_strategy_update(player: LLMPlayer, generation: int, state: d
             f"this is wasted production — prioritize space cards in the next draft.\n"
         )
 
+    # Milestone status — explicit list of which milestones are claimed (and by whom)
+    # vs. still available, so the per-gen MILESTONE TARGET section cannot keep
+    # picking a milestone that's already been taken.
+    milestone_status = _compute_milestone_status(state)
+    if milestone_status:
+        income_note += "\n".join(milestone_status) + "\n"
+
     # Award standings for unfunded awards (so the AI can verify standings before planning)
     award_standings = _compute_award_standings(state)
-    if award_standings:
+    funded_count = len(state.get("awards") or [])
+    if funded_count >= 3:
         income_note += (
-            "Unfunded award standings RIGHT NOW (only fund if you are 1st or very close 2nd):\n"
+            f"Awards ({funded_count}/3 funded — AWARD FUNDING PHASE OVER, no more can be funded). "
+            f"Remove 'fund award' lines from your plan.\n"
+        )
+    elif award_standings:
+        income_note += (
+            f"Awards ({funded_count}/3 funded). Unfunded standings RIGHT NOW (only fund if you "
+            f"are 1st or a very close 2nd):\n"
             + "\n".join(f"  {line}" for line in award_standings) + "\n"
         )
 
+    own_name  = p.get("name", "?")
+    own_color = p.get("color", "?")
+    identity_note = (
+        f'You are "{own_name}" (color={own_color}). In the event log and standings '
+        f'below, "{own_name}" refers to YOU — never to an opponent.\n'
+    )
     prompt = _PER_GEN_STRATEGY_PROMPT.format(
         prev_gen=generation - 1,
         gen=generation,
-        global_status=global_status,
+        global_status=identity_note + global_status,
         income_note=income_note,
         prior_strategy=(player.strategy or "(none yet — this is your first strategy update)"),
     )
@@ -2514,6 +2618,144 @@ def _milestone_advisory(state: dict, options: list[dict]) -> list[str]:
     return lines
 
 
+# Standard-project base costs (vanilla TM + common expansions). Keys are the
+# title slugs the TM server emits ("Power Plant:SP", "Asteroid:SP", ...).
+# Sell Patents is free; the table omits it so it never gets an "unaffordable" tag.
+_STANDARD_PROJECT_COSTS: dict[str, int] = {
+    "power plant:sp":   11,
+    "asteroid:sp":      14,
+    "aquifer:sp":       18,
+    "greenery:sp":      23,
+    "city:sp":          25,
+    "buffer gas:sp":    16,
+    "air scrapping:sp": 15,   # Venus
+    "lava flows:sp":    36,   # Promos
+    "asteroid mining:sp": 35,
+}
+
+
+def _standard_project_cost(title: str) -> int | None:
+    """Return the MC cost of a standard project given its option title, or None
+    if the title doesn't match a known SP. Power Plant SP is sometimes shown as
+    "Power Plant standard project" depending on TM build — normalise lightly.
+    """
+    if not title:
+        return None
+    t = title.lower().strip()
+    if t in _STANDARD_PROJECT_COSTS:
+        return _STANDARD_PROJECT_COSTS[t]
+    # Strip a trailing ".(\\d+ M€)" cost annotation if the TM server adds one.
+    t2 = re.sub(r"\s*\(\d+ ?m€\)\s*$", "", t)
+    if t2 in _STANDARD_PROJECT_COSTS:
+        return _STANDARD_PROJECT_COSTS[t2]
+    return None
+
+
+def _compute_milestone_status(state: dict) -> list[str]:
+    """Build a structured milestone status block for the action / per-gen prompts.
+
+    Always returns at least one line so the model never has to parse the raw
+    `Milestones claimed: [...]` dict dump to figure out who claimed what or how
+    many milestone slots are left. Examples of output:
+
+        Milestones (1/3 claimed; 2 more can be claimed):
+          ✗ Diversifier — claimed by you (Kai)
+          • Terraformer — requires TR ≥ 35 (you: 24, Peter: 29, Sandra: 22)
+          ...
+
+        Milestones (3/3 claimed — MILESTONE PHASE OVER, no further claims possible):
+          ✗ Diversifier — claimed by you (Kai)
+          ✗ Specialist  — claimed by Peter
+          ✗ Energizer   — claimed by Sandra
+    """
+    g  = state.get("game", {})
+    p  = state.get("player", {})
+    opps = state.get("opponents") or []
+    claimed = state.get("milestones") or []
+    available = g.get("availableMilestones") or []
+
+    if not available and not claimed:
+        return []
+
+    my_id   = p.get("id")
+    my_name = p.get("name", "You")
+
+    # Build playerId → name map for showing who claimed each milestone.
+    id_to_name = {my_id: my_name} if my_id else {}
+    for opp in opps:
+        if opp.get("id"):
+            id_to_name[opp["id"]] = opp.get("name", "Opp")
+
+    claimed_by: dict[str, str] = {}
+    for entry in claimed:
+        ms_name = entry.get("name") if isinstance(entry, dict) else None
+        pid     = entry.get("playerId") if isinstance(entry, dict) else None
+        if ms_name:
+            holder = id_to_name.get(pid, "?")
+            if pid == my_id:
+                holder = f"you ({my_name})"
+            claimed_by[ms_name] = holder
+
+    n_claimed = len(claimed)
+    n_max = 3  # TM rule: at most 3 milestones claimed per game
+    phase_over = n_claimed >= n_max
+
+    if phase_over:
+        header = (
+            f"Milestones ({n_claimed}/{n_max} claimed — MILESTONE PHASE OVER, "
+            f"no further claims possible; remove any 'claim a milestone' line from your plan):"
+        )
+    else:
+        header = f"Milestones ({n_claimed}/{n_max} claimed; {n_max - n_claimed} more can be claimed):"
+
+    lines = [header]
+
+    # Show every available milestone with its state.
+    all_names: list[str] = []
+    for ms in available:
+        name = ms.get("name") if isinstance(ms, dict) else None
+        if name and name not in all_names:
+            all_names.append(name)
+    for name in claimed_by:
+        if name not in all_names:
+            all_names.append(name)
+
+    for ms_name in all_names:
+        if ms_name in claimed_by:
+            lines.append(f"  ✗ {ms_name} — claimed by {claimed_by[ms_name]}")
+            continue
+        if phase_over:
+            # Cap reached — listing requirements would mislead the model into
+            # thinking the milestone can still be claimed.
+            lines.append(f"  ✗ {ms_name} — unclaimed but CANNOT be claimed (3-claim cap reached)")
+            continue
+        # Phase still open: render the standings if we know the requirement.
+        ms_lower = ms_name.lower()
+        threshold = _milestone_threshold(ms_lower)
+        my_v = _milestone_value(p, ms_lower)
+        if threshold is None or my_v is None:
+            lines.append(f"  • {ms_name} — claimable; specific requirement varies by variant")
+            continue
+        gap = max(0, threshold - my_v)
+        opp_progress = []
+        for opp in opps:
+            ov = _milestone_value(opp, ms_lower)
+            if ov is None:
+                continue
+            opp_progress.append(f"{opp.get('name','Opp')}={ov}")
+        progress_str = ", ".join([f"you={my_v}"] + opp_progress)
+        if my_v >= threshold:
+            lines.append(
+                f"  ✓ {ms_name} — requires ≥{threshold} (you ALREADY meet it; "
+                f"{progress_str}) — CLAIMABLE NOW"
+            )
+        else:
+            lines.append(
+                f"  • {ms_name} — requires ≥{threshold} ({progress_str}; you need {gap} more)"
+            )
+    return lines
+
+
 def _compute_award_standings(state: dict) -> list[str]:
     """Return human-readable standing lines for each available (unfunded) award.
 
@@ -2605,8 +2847,14 @@ def _build_action_prompt(
         lines.append("Do NOT repeat the same choice. Adapt based on the error above.")
         lines.append("")
 
+    own_name  = p.get("name", "?")
+    own_color = p.get("color", "?")
     lines += [
         f"Gen {g.get('generation',1)} | Temp:{temp}°C O₂:{oxygen}% Oceans:{oceans}/9",
+        # Make identity explicit: small models otherwise confuse themselves with
+        # their own name in the recent-log (treating "Kai" as an opponent).
+        f'You are "{own_name}" (color={own_color}). In the event log below, '
+        f'lines starting "You ({own_name})" are your own past actions.',
         f"You: TR:{tr} VP:{p.get('victoryPoints','?')}  MC:{mc}(income:{mc_income})  "
         f"Steel:{p.get('steel',0)} Ti:{p.get('titanium',0)}  "
         f"Plants:{p.get('plants',0)} Energy:{p.get('energy',0)} Heat:{p.get('heat',0)}",
@@ -2782,22 +3030,42 @@ def _build_action_prompt(
             f"{opp_name}: TR:{opp.get('terraformRating',20)}{opp_vp_str}  MC:{opp.get('megacredits',0)}"
             f"{opp_hs_str}  prod:{opp_prod}  tags:{opp_tags}"
         )
-    if ms:
+    # Structured milestone status — replaces the old "Milestones claimed: [...]"
+    # raw-dict dump. Lists every milestone with claim state + your progress so
+    # the AI can never plan to claim one that's already been claimed.
+    milestone_status = _compute_milestone_status(state)
+    if milestone_status:
+        lines.extend(milestone_status)
+    elif ms:
         lines.append(f"Milestones claimed: {ms}")
-    if aw:
-        lines.append(f"Awards funded: {aw}")
-    # Award standings: show current position for each unfunded award so the AI can
-    # verify it is actually winning before deciding to fund.
-    award_standings = _compute_award_standings(state)
-    if award_standings:
-        lines.append("Unfunded award standings (verify you are 1st or close 2nd BEFORE funding):")
-        lines.extend(award_standings)
+
+    # Award funded/funding status.
+    n_funded = len(aw) if aw else 0
+    if n_funded >= 3:
+        lines.append(
+            f"Awards ({n_funded}/3 funded — AWARD FUNDING PHASE OVER, no more awards can be funded):"
+        )
+        for entry in aw or []:
+            lines.append(f"  ✗ {entry.get('name','?')} — funded by {entry.get('playerId','?')}")
+    else:
+        if aw:
+            lines.append(f"Awards funded ({n_funded}/3): {aw}")
+        award_standings = _compute_award_standings(state)
+        if award_standings:
+            lines.append("Unfunded award standings (verify you are 1st or close 2nd BEFORE funding):")
+            lines.extend(award_standings)
 
     recent_log = g.get("recentLog") or []
     if recent_log:
         lines += ["", f"This generation's events so far ({len(recent_log)}) — your moves and opponents':"]
         for entry in recent_log:
-            lines.append(f"  {entry}")
+            # Rewrite "<own_name> ..." → "You (<own_name>) ..." so the model never
+            # mistakes its own past actions for an opponent's. The TM server emits
+            # log entries by display name; the AI's "You drew ..." lines stay as-is.
+            text = str(entry)
+            if own_name and own_name != "?" and text.startswith(own_name + " "):
+                text = f"You ({own_name}) " + text[len(own_name) + 1:]
+            lines.append(f"  {text}")
 
     # Your memory — this is what carries between turns (no chat history is kept)
     if player and (player.strategy or player.tactical):
@@ -2892,19 +3160,36 @@ def _build_action_prompt(
     card_names_in_decision = _extract_card_names(waiting_for)
     is_hand_decision = _is_card_decision_about_hand(card_names_in_decision, hand_cards)
 
+    own_mc = p.get("megacredits", 0)
     for opt in options:
         idx    = opt["index"] + 1
         title2 = opt["title"]
         desc   = _get_card_desc_for_option(opt)
 
+        # Annotate standard projects with their MC cost vs your balance so the
+        # AI doesn't pick one it can't afford (which triggers a TM-side retry
+        # cycle and ends up using Pass as the eventual fallback).
+        sp_cost = _standard_project_cost(
+            # Sub-options expanded from "Standard projects" have titles like
+            # "Standard projects: Power Plant:SP" — strip the prefix.
+            (title2.split(":", 1)[1].strip() if title2.lower().startswith("standard projects:")
+             else title2)
+        )
+        cost_tag = ""
+        if sp_cost is not None:
+            if sp_cost > own_mc:
+                cost_tag = f"  [{sp_cost} MC — NOT AFFORDABLE, you have {own_mc} MC]"
+            else:
+                cost_tag = f"  [{sp_cost} MC; you have {own_mc} MC]"
+
         if wf_type == "card" and is_hand_decision and card_names_in_decision:
             title2_clean = str(title2)[:70]
-            lines.append(f"  {idx}. {title2_clean} (see hand above)")
+            lines.append(f"  {idx}. {title2_clean} (see hand above){cost_tag}")
         elif desc:
-            lines.append(f"  {idx}. {desc}")
+            lines.append(f"  {idx}. {desc}{cost_tag}")
         else:
             title2_clean = str(title2)[:70]
-            lines.append(f"  {idx}. {title2_clean}")
+            lines.append(f"  {idx}. {title2_clean}{cost_tag}")
 
     # Payment section
     if wf_type in ("projectCard", "payment"):

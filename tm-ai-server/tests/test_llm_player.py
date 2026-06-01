@@ -720,3 +720,220 @@ def test_build_action_prompt_skips_advisory_when_no_claim_option():
     ]
     prompt = llm._build_action_prompt(state, waiting_for, options)
     assert "MILESTONE CLAIM AVAILABLE" not in prompt
+
+
+# ---------------------------------------------------------------------------
+# Fix #1 — player identity surfaced in prompt + recentLog rewrite
+# ---------------------------------------------------------------------------
+
+def _action_state(player_name="Kai", color="red", recent_log=None,
+                  claimed_milestones=None, available_milestones=None,
+                  opponents=None, mc=20, tr=22, vp=12, gen=4):
+    """Compact factory for state dicts used by _build_action_prompt."""
+    return {
+        "game": {
+            "generation": gen, "temperature": 0, "oxygen": 5, "oceanCount": 3,
+            "recentLog": recent_log or [],
+            "availableMilestones": available_milestones or [],
+        },
+        "player": {
+            "id": "pme", "name": player_name, "color": color,
+            "terraformRating": tr, "megacredits": mc, "victoryPoints": vp,
+            "steel": 0, "titanium": 0, "plants": 0, "energy": 0, "heat": 0,
+            "handSize": 4, "tags": {}, "production": {"megacredits": 2},
+        },
+        "opponents": opponents or [],
+        "milestones": claimed_milestones or [],
+        "awards": [],
+    }
+
+
+def test_build_action_prompt_states_player_name_and_color():
+    state = _action_state(player_name="Kai", color="red")
+    waiting_for = {"type": "or", "title": "Take action", "options": []}
+    options = [{"index": 0, "title": "Pass"}]
+    prompt = llm._build_action_prompt(state, waiting_for, options)
+    assert 'You are "Kai" (color=red)' in prompt
+    assert "starting \"You (Kai)\" are your own past actions" in prompt
+
+
+def test_build_action_prompt_rewrites_own_name_in_recent_log():
+    state = _action_state(
+        player_name="Kai",
+        recent_log=[
+            "Kai claimed Diversifier milestone",
+            "Peter played GHG Factories",
+            "Kai played Ore Processor",
+            "You drew Kelp Farming",
+        ],
+    )
+    waiting_for = {"type": "or", "title": "Take action", "options": []}
+    options = [{"index": 0, "title": "Pass"}]
+    prompt = llm._build_action_prompt(state, waiting_for, options)
+    # Own actions get the "You (Kai)" prefix
+    assert "You (Kai) claimed Diversifier milestone" in prompt
+    assert "You (Kai) played Ore Processor" in prompt
+    # Opponent actions stay as-is
+    assert "Peter played GHG Factories" in prompt
+    # TM-emitted "You drew ..." lines are left alone (don't double-wrap)
+    assert "You drew Kelp Farming" in prompt
+    # The raw "Kai claimed" / "Kai played" must NOT appear
+    assert "  Kai claimed" not in prompt
+    assert "  Kai played" not in prompt
+
+
+# ---------------------------------------------------------------------------
+# Fix #3 — structured milestone status block
+# ---------------------------------------------------------------------------
+
+def test_compute_milestone_status_in_progress_lists_claimable_and_claimed():
+    state = {
+        "game": {"availableMilestones": [
+            {"name": "Terraformer"}, {"name": "Mayor"}, {"name": "Diversifier"},
+        ]},
+        "player": {"id": "pme", "name": "Kai", "terraformRating": 30,
+                   "boardTiles": {"city": 1}, "tags": {"building": 6}, "handSize": 10},
+        "opponents": [{"id": "po", "name": "Peter", "terraformRating": 34,
+                       "boardTiles": {"city": 0}, "tags": {"building": 3}, "handSize": 8}],
+        "milestones": [{"name": "Diversifier", "playerId": "pme"}],
+    }
+    lines = llm._compute_milestone_status(state)
+    blob = "\n".join(lines)
+    assert "Milestones (1/3 claimed; 2 more can be claimed)" in blob
+    assert "✗ Diversifier — claimed by you (Kai)" in blob
+    # Terraformer: you=30, threshold 35 — you need 5 more; Peter=34
+    assert "Terraformer" in blob and "you=30" in blob and "Peter=34" in blob
+
+
+def test_compute_milestone_status_marks_already_met_as_claimable_now():
+    state = {
+        "game": {"availableMilestones": [{"name": "Mayor"}]},
+        "player": {"id": "pme", "name": "Kai", "boardTiles": {"city": 4}},
+        "opponents": [{"id": "po", "name": "Peter", "boardTiles": {"city": 0}}],
+        "milestones": [],
+    }
+    blob = "\n".join(llm._compute_milestone_status(state))
+    assert "✓ Mayor" in blob
+    assert "CLAIMABLE NOW" in blob
+
+
+def test_compute_milestone_status_phase_over_when_three_claimed():
+    state = {
+        "game": {"availableMilestones": [
+            {"name": "Terraformer"}, {"name": "Mayor"}, {"name": "Diversifier"},
+            {"name": "Specialist"},  {"name": "Energizer"},
+        ]},
+        "player": {"id": "pme", "name": "Kai", "terraformRating": 22},
+        "opponents": [
+            {"id": "p1", "name": "Peter",  "terraformRating": 29},
+            {"id": "p2", "name": "Sandra", "terraformRating": 25},
+        ],
+        "milestones": [
+            {"name": "Diversifier", "playerId": "pme"},
+            {"name": "Specialist",  "playerId": "p1"},
+            {"name": "Energizer",   "playerId": "p2"},
+        ],
+    }
+    blob = "\n".join(llm._compute_milestone_status(state))
+    assert "Milestones (3/3 claimed — MILESTONE PHASE OVER" in blob
+    assert "✗ Diversifier — claimed by you (Kai)" in blob
+    assert "✗ Specialist — claimed by Peter" in blob
+    assert "✗ Energizer — claimed by Sandra" in blob
+    # Unclaimed milestones in phase-over mode mention they're uncl​aimable
+    assert "Terraformer" in blob
+    assert "CANNOT be claimed (3-claim cap reached)" in blob
+
+
+def test_build_action_prompt_uses_milestone_status_block():
+    """The bare 'Milestones claimed: [...]' dict dump should be replaced
+    by the human-readable block from _compute_milestone_status."""
+    state = _action_state(
+        claimed_milestones=[
+            {"name": "Diversifier", "playerId": "pme"},
+            {"name": "Specialist",  "playerId": "p1"},
+            {"name": "Energizer",   "playerId": "p2"},
+        ],
+        available_milestones=[{"name": "Diversifier"}, {"name": "Specialist"},
+                              {"name": "Energizer"}, {"name": "Terraformer"}],
+        opponents=[
+            {"id": "p1", "name": "Peter",  "terraformRating": 29},
+            {"id": "p2", "name": "Sandra", "terraformRating": 25},
+        ],
+    )
+    waiting_for = {"type": "or", "title": "Take action", "options": []}
+    options = [{"index": 0, "title": "Pass"}]
+    prompt = llm._build_action_prompt(state, waiting_for, options)
+    assert "MILESTONE PHASE OVER" in prompt
+    # Old-style raw dict dump must NOT appear when the status block is rendered
+    assert "Milestones claimed: [{" not in prompt
+
+
+# ---------------------------------------------------------------------------
+# Fix #2 — truncation detection
+# ---------------------------------------------------------------------------
+
+class _FakeChoice:
+    def __init__(self, finish_reason):
+        self.finish_reason = finish_reason
+
+class _FakeResponse:
+    def __init__(self, finish_reason):
+        self.choices = [_FakeChoice(finish_reason)]
+
+
+def test_response_is_truncated_empty_with_length():
+    resp = _FakeResponse("length")
+    assert llm._response_is_truncated(resp, "") is True
+    assert llm._response_is_truncated(resp, "   \n  ") is True
+
+
+def test_response_is_truncated_false_when_choice_present_even_with_length():
+    """A long body that hit max_tokens but DID write CHOICE: N is usable."""
+    resp = _FakeResponse("length")
+    text = "Reasoning ...\nTACTICAL: stuff\nCHOICE: 2"
+    assert llm._response_is_truncated(resp, text) is False
+
+
+def test_response_is_truncated_false_when_finish_is_stop():
+    resp = _FakeResponse("stop")
+    assert llm._response_is_truncated(resp, "") is False  # empty but model stopped on its own
+
+
+# ---------------------------------------------------------------------------
+# Fix #5 — unaffordable standard-project annotation
+# ---------------------------------------------------------------------------
+
+def test_standard_project_cost_lookup():
+    assert llm._standard_project_cost("Power Plant:SP") == 11
+    assert llm._standard_project_cost("Asteroid:SP")    == 14
+    assert llm._standard_project_cost("City:SP")        == 25
+    # Unknown titles return None (no annotation)
+    assert llm._standard_project_cost("Buy a corporation") is None
+    # Case-insensitive
+    assert llm._standard_project_cost("power plant:sp") == 11
+
+
+def test_build_action_prompt_marks_unaffordable_sp():
+    state = _action_state(mc=9)  # 9 MC — cannot afford Power Plant (11)
+    waiting_for = {"type": "or", "title": "Standard projects", "options": []}
+    options = [
+        {"index": 0, "title": "Power Plant:SP"},
+        {"index": 1, "title": "Pass"},
+    ]
+    prompt = llm._build_action_prompt(state, waiting_for, options)
+    assert "NOT AFFORDABLE" in prompt
+    assert "you have 9 MC" in prompt
+
+
+def test_build_action_prompt_marks_affordable_sp():
+    state = _action_state(mc=30)
+    waiting_for = {"type": "or", "title": "Standard projects", "options": []}
+    options = [
+        {"index": 0, "title": "Power Plant:SP"},
+        {"index": 1, "title": "City:SP"},
+        {"index": 2, "title": "Pass"},
+    ]
+    prompt = llm._build_action_prompt(state, waiting_for, options)
+    assert "[11 MC; you have 30 MC]" in prompt
+    assert "[25 MC; you have 30 MC]" in prompt
+    assert "NOT AFFORDABLE" not in prompt
