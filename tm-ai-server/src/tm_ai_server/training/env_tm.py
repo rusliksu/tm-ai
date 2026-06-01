@@ -96,8 +96,8 @@ class TerraformingMarsEnv(gym.Env):
             logger.warning("Empty options for game %s wf_type=%s; skipping step",
                            self._game_id, self._waiting_for.get("type"))
             return np.zeros(STATE_DIM, dtype=np.float32), 0.0, True, False, {"error": "empty_options"}
-        option_index = options[min(action, len(options) - 1)]["index"]
-        input_response = index_to_response(self._waiting_for, option_index)
+        option_path = options[min(action, len(options) - 1)]["path"]
+        input_response = index_to_response(self._waiting_for, option_path)
 
         def _do_step(ir: dict) -> requests.Response:
             for attempt in range(4):
@@ -118,7 +118,7 @@ class TerraformingMarsEnv(gym.Env):
             # Invalid move — retry with each option from last to first until one succeeds
             succeeded = False
             for fallback_opt in reversed(options):
-                fb_resp = _do_step(index_to_response(self._waiting_for, fallback_opt["index"]))
+                fb_resp = _do_step(index_to_response(self._waiting_for, fallback_opt["path"]))
                 if fb_resp.status_code == 200:
                     resp = fb_resp
                     succeeded = True
@@ -127,9 +127,9 @@ class TerraformingMarsEnv(gym.Env):
                 import json as _json
                 _errs = []
                 for _opt in list(reversed(options))[:6]:
-                    _ir = index_to_response(self._waiting_for, _opt["index"])
+                    _ir = index_to_response(self._waiting_for, _opt["path"])
                     _r = _do_step(_ir)
-                    _errs.append(f"idx={_opt['index']} {_r.status_code} {_r.json().get('error','?')[:50]!r} {_json.dumps(_ir)[:70]}")
+                    _errs.append(f"idx={_opt['index']} path={_opt['path']} {_r.status_code} {_r.json().get('error','?')[:50]!r} {_json.dumps(_ir)[:70]}")
                 logger.warning("All fallback failed game=%s type=%r title=%r\n  %s",
                     self._game_id, self._waiting_for.get("type"),
                     self._waiting_for.get("title", ""), "\n  ".join(_errs))

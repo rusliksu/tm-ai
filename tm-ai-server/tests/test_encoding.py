@@ -176,3 +176,107 @@ def test_default_response_or_empty_options():
     node = {"type": "or", "options": []}
     resp = _default_response(node)
     assert resp == {"type": "or", "index": 0, "response": {"type": "option"}}
+
+
+# ---------------------------------------------------------------------------
+# Nested-OR expansion (regression: "Fund an award" auto-resolved to Benefactor
+# instead of letting the AI pick which award)
+# ---------------------------------------------------------------------------
+
+def test_flatten_options_expands_nested_or_of_leaf_options():
+    """A nested OR whose children are all bare 'option' leaves should expand
+    inline so the LLM picks the specific sub-choice directly."""
+    waiting_for = {
+        "type": "or",
+        "title": "Take action",
+        "options": [
+            {
+                "type": "or",
+                "title": "Fund an award (14 M€)",
+                "options": [
+                    {"type": "option", "title": "Benefactor"},
+                    {"type": "option", "title": "Desert Settler"},
+                    {"type": "option", "title": "Scientist"},
+                ],
+            },
+            {"type": "option", "title": "Pass for this generation"},
+        ],
+    }
+    opts = flatten_options(waiting_for)
+    titles = [o["title"] for o in opts]
+    assert titles == [
+        "Fund an award (14 M€): Benefactor",
+        "Fund an award (14 M€): Desert Settler",
+        "Fund an award (14 M€): Scientist",
+        "Pass for this generation",
+    ]
+    # index = flat position (used for the displayed CHOICE number)
+    assert [o["index"] for o in opts] == [0, 1, 2, 3]
+    # path = walk into the tree
+    assert [o["path"] for o in opts] == [[0, 0], [0, 1], [0, 2], [1]]
+
+
+def test_index_to_response_walks_nested_path():
+    """index_to_response(wf, [parent, child]) builds a nested OR response."""
+    waiting_for = {
+        "type": "or",
+        "options": [
+            {
+                "type": "or",
+                "options": [
+                    {"type": "option", "title": "Benefactor"},
+                    {"type": "option", "title": "Desert Settler"},
+                    {"type": "option", "title": "Scientist"},
+                ],
+            },
+            {"type": "option", "title": "Pass"},
+        ],
+    }
+    # Picking "Desert Settler" via path [0, 1]
+    resp = index_to_response(waiting_for, [0, 1])
+    assert resp == {
+        "type": "or",
+        "index": 0,
+        "response": {"type": "or", "index": 1, "response": {"type": "option"}},
+    }
+
+
+def test_index_to_response_accepts_bare_int_for_backcompat():
+    """index_to_response(wf, 2) still works (treated as path=[2])."""
+    waiting_for = {
+        "type": "or",
+        "options": [
+            {"type": "option", "title": "A"},
+            {"type": "option", "title": "B"},
+            {"type": "option", "title": "C"},
+        ],
+    }
+    resp = index_to_response(waiting_for, 2)
+    assert resp == {"type": "or", "index": 2, "response": {"type": "option"}}
+
+
+def test_flatten_options_does_not_expand_deep_nesting():
+    """A nested OR whose children are themselves non-leaf (e.g. another OR)
+    is NOT expanded — the AI picks the top-level option and the sub-decision
+    appears in the next /move call as a fresh waitingFor."""
+    waiting_for = {
+        "type": "or",
+        "options": [
+            {
+                "type": "or",
+                "title": "Use blue action",
+                "options": [
+                    {"type": "or", "title": "Sub-action", "options": [
+                        {"type": "option", "title": "Sub-A"},
+                        {"type": "option", "title": "Sub-B"},
+                    ]},
+                ],
+            },
+            {"type": "option", "title": "Pass"},
+        ],
+    }
+    opts = flatten_options(waiting_for)
+    titles = [o["title"] for o in opts]
+    # The "Use blue action" OR is NOT expanded (its child is another OR, not a leaf option)
+    assert titles == ["Use blue action", "Pass"]
+    assert [o["path"] for o in opts] == [[0], [1]]

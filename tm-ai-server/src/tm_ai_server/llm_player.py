@@ -2019,7 +2019,7 @@ def _select_action(
                 None,
             ) if only_choice_error else None
             if pass_opt is not None:
-                response = index_to_response(waiting_for, pass_opt["index"])
+                response = index_to_response(waiting_for, pass_opt["path"])
                 debug = {"fallback": "pass"}
                 logger.warning(
                     "Action still invalid after %d retries (player=%s) — best-effort is Pass (%r)",
@@ -2181,7 +2181,7 @@ def select_action_advise(
     m = re.search(r"CHOICE:\s*(\d+)", rec_text)
     chosen = int(m.group(1)) - 1 if m else 0
     chosen = max(0, min(chosen, len(options) - 1))
-    recommendation = index_to_response(waiting_for, options[chosen]["index"])
+    recommendation = index_to_response(waiting_for, options[chosen]["path"])
 
     wf_type2 = waiting_for.get("type", "")
     if wf_type2 in ("projectCard", "payment"):
@@ -2991,7 +2991,7 @@ def _parse_action_response(
     chosen = max(0, min(chosen, len(options) - 1))
     option = options[chosen]
     logger.info("Action choice player=%s: %d. %s", player_id, chosen + 1, option["title"])
-    response = index_to_response(waiting_for, option["index"])
+    response = index_to_response(waiting_for, option["path"])
 
     wf_type = waiting_for.get("type", "")
     p = player or {}

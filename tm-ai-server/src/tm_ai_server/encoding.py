@@ -169,80 +169,121 @@ def encode_state(state: dict, game_spec: dict | None = None) -> np.ndarray:
 def flatten_options(waiting_for: dict, max_actions: int = ACTION_SPACE_SIZE) -> list[dict]:
     """
     Enumerate the immediate selectable choices from a PlayerInputModel node.
-    Each returned dict has {title, index, node} where node is the sub-model
-    for the chosen option (used to build the sub-response via index_to_response).
+
+    Each returned dict has:
+      - title: display string (parent-prefixed for expanded nested ORs)
+      - index: 0-based position in the flat output (= displayed CHOICE number minus 1)
+      - path:  list[int] walking the original tree, passed to index_to_response
+               to build the nested InputResponse
+      - node:  the leaf node for this choice (for card/desc extraction)
+
+    Nested OR options whose children are all leaf 'option' types are expanded
+    inline so the LLM picks the specific sub-choice directly. Without this
+    expansion the heuristic `_default_response` auto-fills the sub-decision
+    (e.g. it would pick the first/last award for a "Fund an award" OR even
+    though the AI's reasoning was about a different one). Common cases:
+      • "Fund an award (X M€)" → "Benefactor", "Desert Settler", ...
+      • "Standard projects"    → "Power Plant:SP", "Asteroid:SP", ...
     """
     node_type = waiting_for.get("type", "")
     options: list[dict] = []
+
+    def _emit(title: str, path: list[int], node: dict) -> bool:
+        if len(options) >= max_actions:
+            return False
+        options.append({"title": title, "index": len(options), "path": path, "node": node})
+        return True
 
     if node_type in ("or", "and", "initialCards"):
         for i, opt in enumerate(waiting_for.get("options", [])):
             if len(options) >= max_actions:
                 break
-            options.append({"title": _node_title(opt, i), "index": i, "node": opt})
+
+            # Expand a nested OR-of-leaf-options inline so the LLM sees each
+            # sub-choice individually rather than having one auto-picked by the
+            # heuristic in _default_response. Only safe when every sub-option
+            # is a bare "option" leaf — deeper nesting falls through to the
+            # default behaviour (let `_default_response` pick a placeholder
+            # for the sub-decision; downstream waitingFors will let the LLM
+            # refine the rest of the choice).
+            child_opts = opt.get("options") or []
+            if (
+                opt.get("type") == "or"
+                and child_opts
+                and all(c.get("type") == "option" for c in child_opts)
+            ):
+                parent_title = _node_title(opt, i).strip()
+                for j, child in enumerate(child_opts):
+                    if len(options) >= max_actions:
+                        break
+                    child_title = _node_title(child, j)
+                    full_title = f"{parent_title}: {child_title}" if parent_title else child_title
+                    _emit(full_title, [i, j], child)
+            else:
+                _emit(_node_title(opt, i), [i], opt)
 
     elif node_type == "card":
         cards = waiting_for.get("cards", [])
         if not cards or waiting_for.get("max", 1) == 0:
             # No selection possible (empty list or max=0 notification like "You cannot afford any cards")
-            options.append({"title": waiting_for.get("title", "OK") or "OK", "index": 0, "node": {}})
+            _emit(waiting_for.get("title", "OK") or "OK", [0], {})
         else:
             for i, card in enumerate(cards):
                 if len(options) >= max_actions:
                     break
-                options.append({"title": card.get("name", f"Card {i}"), "index": i, "node": card})
+                _emit(card.get("name", f"Card {i}"), [i], card)
 
     elif node_type == "projectCard":
         for i, card in enumerate(waiting_for.get("cards", [])):
             if len(options) >= max_actions:
                 break
-            options.append({"title": card.get("name", f"Card {i}"), "index": i, "node": card})
+            _emit(card.get("name", f"Card {i}"), [i], card)
 
     elif node_type == "space":
         for i, space_id in enumerate(waiting_for.get("spaces", [])):
             if len(options) >= max_actions:
                 break
-            options.append({"title": str(space_id), "index": i, "node": {"spaceId": space_id}})
+            _emit(str(space_id), [i], {"spaceId": space_id})
 
     elif node_type == "amount":
         min_val = waiting_for.get("min", 0)
         max_val = min(waiting_for.get("max", min_val), min_val + max_actions - 1)
         for i, v in enumerate(range(min_val, max_val + 1)):
-            options.append({"title": str(v), "index": i, "node": {"amount": v}})
+            _emit(str(v), [i], {"amount": v})
 
     elif node_type == "player":
         for i, p in enumerate(waiting_for.get("players", [])):
             if len(options) >= max_actions:
                 break
-            options.append({"title": str(p), "index": i, "node": {"player": p}})
+            _emit(str(p), [i], {"player": p})
 
     elif node_type == "colony":
         for i, colony in enumerate(waiting_for.get("coloniesModel", [])):
             if len(options) >= max_actions:
                 break
-            options.append({"title": colony.get("name", f"Colony {i}"), "index": i, "node": colony})
+            _emit(colony.get("name", f"Colony {i}"), [i], colony)
 
     elif node_type == "delegate":
         for i, p in enumerate(waiting_for.get("players", [])):
             if len(options) >= max_actions:
                 break
-            options.append({"title": str(p), "index": i, "node": {"player": p}})
+            _emit(str(p), [i], {"player": p})
 
     elif node_type == "party":
         for i, party in enumerate(waiting_for.get("parties", [])):
             if len(options) >= max_actions:
                 break
-            options.append({"title": str(party), "index": i, "node": {"partyName": party}})
+            _emit(str(party), [i], {"partyName": party})
 
     elif node_type == "resource":
         for i, res in enumerate(waiting_for.get("resources", [])):
             if len(options) >= max_actions:
                 break
-            options.append({"title": str(res), "index": i, "node": {"resourceType": res}})
+            _emit(str(res), [i], {"resourceType": res})
 
     else:
         # Leaf node (option, payment, etc.) — single choice
-        options.append({"title": _node_title(waiting_for, 0), "index": 0, "node": waiting_for})
+        _emit(_node_title(waiting_for, 0), [0], waiting_for)
 
     return options
 
@@ -254,14 +295,35 @@ def build_mask(num_valid: int, max_size: int = ACTION_SPACE_SIZE) -> np.ndarray:
     return mask
 
 
-def index_to_response(waiting_for: dict, index: int) -> dict:
-    """Construct a valid InputResponse for choosing option at `index`."""
+def index_to_response(waiting_for: dict, index) -> dict:
+    """Construct a valid InputResponse for choosing option at `index`.
+
+    `index` may be either:
+      • an int — picks index at the top level (single-level decision)
+      • a list[int] — a path through nested decisions; element 0 picks at
+        the top level, element 1 picks inside the chosen sub-OR, etc.
+        Used when `flatten_options` expanded a nested OR-of-leaf-options so
+        the LLM could directly pick the specific sub-choice (e.g. a specific
+        award instead of the generic "Fund an award" OR).
+    """
+    # Normalise to a path. A bare int is treated as a one-element path.
+    if isinstance(index, (list, tuple)):
+        path = list(index)
+    else:
+        path = [int(index)]
+    head = path[0] if path else 0
+    rest = path[1:]
+
     node_type = waiting_for.get("type", "option")
 
     if node_type == "or":
         options = waiting_for.get("options", [])
-        chosen = options[index] if index < len(options) else {}
-        return {"type": "or", "index": index, "response": _default_response(chosen)}
+        chosen = options[head] if head < len(options) else {}
+        if rest:
+            sub_response = index_to_response(chosen, rest)
+        else:
+            sub_response = _default_response(chosen)
+        return {"type": "or", "index": head, "response": sub_response}
 
     elif node_type == "initialCards":
         options = waiting_for.get("options", [])
@@ -277,44 +339,44 @@ def index_to_response(waiting_for: dict, index: int) -> dict:
             return {"type": "card", "cards": []}
         min_count = max(waiting_for.get("min", 1), 1)
         n = len(cards)
-        # Pick min_count cards starting at index, wrapping around
-        selected = [cards[(index + i) % n].get("name", "") for i in range(min(min_count, n))]
+        # Pick min_count cards starting at head, wrapping around
+        selected = [cards[(head + i) % n].get("name", "") for i in range(min(min_count, n))]
         return {"type": "card", "cards": selected}
 
     elif node_type == "projectCard":
         cards = waiting_for.get("cards", [])
-        chosen = cards[index] if index < len(cards) else {}
+        chosen = cards[head] if head < len(cards) else {}
         cost = chosen.get("calculatedCost", 0)
         return {"type": "projectCard", "card": chosen.get("name", ""), "payment": _mc_payment(cost)}
 
     elif node_type == "space":
         spaces = waiting_for.get("spaces", [])
-        space_id = spaces[index] if index < len(spaces) else ""
+        space_id = spaces[head] if head < len(spaces) else ""
         return {"type": "space", "spaceId": space_id}
 
     elif node_type == "amount":
-        return {"type": "amount", "amount": waiting_for.get("min", 0) + index}
+        return {"type": "amount", "amount": waiting_for.get("min", 0) + head}
 
     elif node_type == "player":
         players = waiting_for.get("players", [])
-        return {"type": "player", "player": players[index] if index < len(players) else ""}
+        return {"type": "player", "player": players[head] if head < len(players) else ""}
 
     elif node_type == "colony":
         colonies = waiting_for.get("coloniesModel", [])
-        chosen = colonies[index] if index < len(colonies) else {}
+        chosen = colonies[head] if head < len(colonies) else {}
         return {"type": "colony", "colonyName": chosen.get("name", "")}
 
     elif node_type == "delegate":
         players = waiting_for.get("players", [])
-        return {"type": "delegate", "player": players[index] if index < len(players) else "neutral"}
+        return {"type": "delegate", "player": players[head] if head < len(players) else "neutral"}
 
     elif node_type == "party":
         parties = waiting_for.get("parties", [])
-        return {"type": "party", "partyName": parties[index] if index < len(parties) else ""}
+        return {"type": "party", "partyName": parties[head] if head < len(parties) else ""}
 
     elif node_type == "resource":
         resources = waiting_for.get("resources", ["megacredits"])
-        res = resources[index] if index < len(resources) else resources[0]
+        res = resources[head] if head < len(resources) else resources[0]
         return {"type": "resource", "resourceType": res}
 
     else:

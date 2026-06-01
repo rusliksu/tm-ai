@@ -94,7 +94,7 @@ def select_action(
         # Random policy
         valid_indices = [i for i, v in enumerate(mask) if v]
         chosen_idx = random.choice(valid_indices)
-        return index_to_response(waiting_for, options[chosen_idx]["index"]), {}
+        return index_to_response(waiting_for, options[chosen_idx]["path"]), {}
 
     # Model-based policy
     x = torch.tensor(state_vec, dtype=torch.float32).unsqueeze(0)
@@ -104,7 +104,7 @@ def select_action(
     probs = torch.softmax(logits.squeeze(0), dim=-1)
     chosen_slot = int(torch.argmax(probs).item())
     chosen_option = options[min(chosen_slot, len(options) - 1)]
-    input_response = index_to_response(waiting_for, chosen_option["index"])
+    input_response = index_to_response(waiting_for, chosen_option["path"])
     debug = {
         "policy_logits": logits.squeeze(0).tolist(),
         "value_estimate": float(value.item()),
