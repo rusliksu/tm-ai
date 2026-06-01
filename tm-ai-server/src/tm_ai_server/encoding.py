@@ -413,8 +413,16 @@ def _default_response(node: dict) -> dict:
         return {"type": "option"}
     elif t == "or":
         opts = node.get("options", [])
-        sub = _default_response(opts[0]) if opts else {"type": "option"}
-        return {"type": "or", "index": 0, "response": sub}
+        if not opts:
+            return {"type": "or", "index": 0, "response": {"type": "option"}}
+        # Match TM's aiFallbackResponse: prefer the LAST option-type sub-option
+        # (conventionally Pass). Picking option 0 historically caused garbage
+        # moves like "play first project card" that TM then rejects.
+        for i in range(len(opts) - 1, -1, -1):
+            if opts[i].get("type") == "option":
+                return {"type": "or", "index": i, "response": {"type": "option"}}
+        # No bare option found — fall back to the first sub-option's default.
+        return {"type": "or", "index": 0, "response": _default_response(opts[0])}
     elif t == "initialCards":
         opts = node.get("options", [])
         return {"type": "initialCards", "responses": [_default_response(opt) for opt in opts]}

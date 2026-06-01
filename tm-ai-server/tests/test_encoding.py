@@ -132,3 +132,47 @@ def test_response_roundtrip():
         resp = index_to_response(SAMPLE_OR, i)
         idx = response_to_index(SAMPLE_OR, resp)
         assert idx == i
+
+
+# ---------------------------------------------------------------------------
+# _default_response — OR fallback should prefer the last 'option' (Pass)
+# ---------------------------------------------------------------------------
+
+from tm_ai_server.encoding import _default_response
+
+
+def test_default_response_or_prefers_last_option_type():
+    """For OrOptions, _default_response should pick the LAST bare option
+    (conventionally "Pass" in TM), matching TM's aiFallbackResponse."""
+    node = {
+        "type": "or",
+        "options": [
+            {"type": "projectCard", "cards": []},
+            {"type": "option", "title": "Use action"},
+            {"type": "option", "title": "Pass"},
+        ],
+    }
+    resp = _default_response(node)
+    assert resp["type"] == "or"
+    assert resp["index"] == 2          # last 'option'-typed sub-option
+    assert resp["response"] == {"type": "option"}
+
+
+def test_default_response_or_no_option_type_falls_back_to_zero():
+    """If no bare 'option' sub-option exists, fall through to first sub-option's default."""
+    node = {
+        "type": "or",
+        "options": [
+            {"type": "amount", "min": 0, "max": 5},
+        ],
+    }
+    resp = _default_response(node)
+    assert resp["index"] == 0
+    assert resp["response"]["type"] == "amount"
+
+
+def test_default_response_or_empty_options():
+    """Empty options list should produce a safe placeholder."""
+    node = {"type": "or", "options": []}
+    resp = _default_response(node)
+    assert resp == {"type": "or", "index": 0, "response": {"type": "option"}}

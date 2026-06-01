@@ -345,14 +345,49 @@ def _get_openrouter_pricing(model: str) -> tuple[float, float]:
 # Retry logic (generic)
 # ---------------------------------------------------------------------------
 
-_RETRY_ATTEMPTS = 3
-_RETRY_BASE_DELAY = 5.0  # seconds, doubles on each attempt
+# Wait schedule on transient errors: 1s, 5s, 10s, then 30s indefinitely.
+# Network outages can last minutes; retrying forever is the right behaviour
+# because the alternative is the heuristic `_default_response` fallback —
+# which usually produces a junk move. The TM-server-side request has its own
+# timeout (AI_TIMEOUT_MS, default 600s); when that fires, TM uses its own
+# Pass fallback, and the next /move call sees a fresh socket.
+_RETRY_SCHEDULE: list[float] = [1.0, 5.0, 10.0]
+_RETRY_FOREVER_DELAY = 30.0
 
 
 def _is_transient_error(exc: Exception) -> bool:
+    """True if this error should be retried (network blip / rate-limit / 5xx).
+
+    Catches: openai SDK connection/timeout errors by type, requests connection
+    errors by type, plus substring matches for common HTTP/network error
+    messages that don't surface as a known exception class.
+    """
+    # Type-based detection — most reliable.
+    try:
+        import openai
+        if isinstance(exc, (openai.APIConnectionError, openai.APITimeoutError)):
+            return True
+        if isinstance(exc, openai.RateLimitError):
+            return True
+        if isinstance(exc, openai.APIStatusError) and 500 <= getattr(exc, "status_code", 0) < 600:
+            return True
+    except ImportError:
+        pass
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return True
+
+    # Substring fallback for errors that escape the type checks above
+    # (provider-wrapped errors, raw RuntimeError carrying an HTTP message, etc.)
     msg = str(exc).lower()
-    return any(k in msg for k in ("503", "unavailable", "429", "rate limit",
-                                   "overloaded", "resource exhausted", "timeout"))
+    return any(k in msg for k in (
+        "503", "unavailable", "429", "rate limit",
+        "overloaded", "resource exhausted", "timeout",
+        "connection error", "connection refused", "connection reset",
+        "remote end closed connection", "broken pipe",
+        "network is unreachable", "no route to host",
+        "name or service not known", "temporary failure in name resolution",
+        "ssl", "tls",
+    ))
 
 
 def _parse_retry_delay(exc: Exception) -> float | None:
@@ -362,29 +397,46 @@ def _parse_retry_delay(exc: Exception) -> float | None:
     return float(m.group(1)) if m else None
 
 
-def _with_retry(fn, attempts: int = _RETRY_ATTEMPTS, base_delay: float = _RETRY_BASE_DELAY):
-    """Call fn() with exponential back-off on transient errors (429/503)."""
-    last_exc: Exception | None = None
-    for attempt in range(attempts):
+def _retry_delay_for_attempt(attempt: int) -> float:
+    """Wait schedule: 1s, 5s, 10s, then 30s forever (attempt is 0-indexed)."""
+    if attempt < len(_RETRY_SCHEDULE):
+        return _RETRY_SCHEDULE[attempt]
+    return _RETRY_FOREVER_DELAY
+
+
+def _with_retry(fn, max_attempts: int | None = None):
+    """Call fn() with the wait schedule on transient errors.
+
+    Non-transient errors raise immediately. Transient errors retry on the
+    1s/5s/10s/30s/30s/... schedule. `max_attempts=None` (default) means
+    retry indefinitely on transient failures; a finite cap is mainly useful
+    for tests.
+    """
+    attempt = 0
+    while True:
         try:
             return fn()
         except Exception as exc:
-            if attempt < attempts - 1 and _is_transient_error(exc):
-                msg = str(exc)
-                if "429" in msg or "resource exhausted" in msg.lower():
-                    api_delay = _parse_retry_delay(exc)
-                    wait = (api_delay + 2.0) if api_delay else 62.0
-                    logger.warning("Rate-limited (attempt %d/%d) — waiting %.0fs",
-                                   attempt + 1, attempts, wait)
-                else:
-                    wait = base_delay * (2 ** attempt)
-                    logger.warning("Transient error (attempt %d/%d): %s — retrying in %.0fs",
-                                   attempt + 1, attempts, exc, wait)
-                time.sleep(wait)
-                last_exc = exc
-            else:
+            if not _is_transient_error(exc):
                 raise
-    raise last_exc  # type: ignore[misc]
+            if max_attempts is not None and attempt + 1 >= max_attempts:
+                raise
+
+            msg = str(exc)
+            # For provider-reported rate limits, honour the supplied retry-after
+            # if it's longer than our schedule. Otherwise use the schedule.
+            api_delay: float | None = None
+            if "429" in msg or "resource exhausted" in msg.lower():
+                api_delay = _parse_retry_delay(exc)
+
+            scheduled = _retry_delay_for_attempt(attempt)
+            wait = max(api_delay + 2.0, scheduled) if api_delay else scheduled
+            logger.warning(
+                "Transient error (attempt %d): %s — retrying in %.0fs",
+                attempt + 1, exc, wait,
+            )
+            time.sleep(wait)
+            attempt += 1
 
 
 # ---------------------------------------------------------------------------

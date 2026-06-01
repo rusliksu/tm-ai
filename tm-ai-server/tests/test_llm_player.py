@@ -474,3 +474,112 @@ def test_strip_cache_control_removes_blocks():
     assert "Rule A." in result[0]["content"]
     # User message unchanged
     assert result[1] == messages[1]
+
+
+# ---------------------------------------------------------------------------
+# Retry logic (network-outage handling)
+# ---------------------------------------------------------------------------
+
+def test_is_transient_matches_openai_connection_error():
+    import openai
+    # APIConnectionError requires a 'request' kwarg in modern openai SDK; mock it.
+    exc = openai.APIConnectionError.__new__(openai.APIConnectionError)
+    Exception.__init__(exc, "Connection error.")
+    assert llm._is_transient_error(exc)
+
+
+def test_is_transient_matches_openai_timeout():
+    import openai
+    exc = openai.APITimeoutError.__new__(openai.APITimeoutError)
+    Exception.__init__(exc, "Request timed out")
+    assert llm._is_transient_error(exc)
+
+
+def test_is_transient_matches_requests_connection_error():
+    import requests
+    exc = requests.ConnectionError("HTTPSConnectionPool: max retries exceeded")
+    assert llm._is_transient_error(exc)
+
+
+def test_is_transient_matches_substring_keywords():
+    """Pure RuntimeError carrying a network error string should be transient too."""
+    assert llm._is_transient_error(RuntimeError("Connection refused"))
+    assert llm._is_transient_error(RuntimeError("Network is unreachable"))
+    assert llm._is_transient_error(RuntimeError("Temporary failure in name resolution"))
+    assert llm._is_transient_error(RuntimeError("503 Service Unavailable"))
+    assert llm._is_transient_error(RuntimeError("429 Too Many Requests"))
+
+
+def test_is_transient_rejects_non_network_errors():
+    assert not llm._is_transient_error(ValueError("bad payload"))
+    assert not llm._is_transient_error(KeyError("missing"))
+    assert not llm._is_transient_error(RuntimeError("Authentication failed (401)"))
+
+
+def test_retry_delay_schedule():
+    """Schedule is 1s, 5s, 10s, then 30s forever."""
+    assert llm._retry_delay_for_attempt(0) == 1.0
+    assert llm._retry_delay_for_attempt(1) == 5.0
+    assert llm._retry_delay_for_attempt(2) == 10.0
+    assert llm._retry_delay_for_attempt(3) == 30.0
+    assert llm._retry_delay_for_attempt(10) == 30.0
+    assert llm._retry_delay_for_attempt(1_000_000) == 30.0
+
+
+def test_with_retry_raises_immediately_on_non_transient():
+    """Non-transient errors must raise on the first attempt."""
+    calls = {"n": 0}
+    def fn():
+        calls["n"] += 1
+        raise ValueError("bad payload")
+
+    with patch.object(llm.time, "sleep") as sleep_mock:
+        with pytest.raises(ValueError):
+            llm._with_retry(fn)
+    assert calls["n"] == 1
+    sleep_mock.assert_not_called()
+
+
+def test_with_retry_retries_transient_until_success():
+    """Transient errors retry; the call eventually succeeds."""
+    calls = {"n": 0}
+    def fn():
+        calls["n"] += 1
+        if calls["n"] < 4:
+            raise RuntimeError("Connection refused")
+        return "ok"
+
+    with patch.object(llm.time, "sleep") as sleep_mock:
+        result = llm._with_retry(fn)
+
+    assert result == "ok"
+    assert calls["n"] == 4
+    # 3 sleeps for the 3 failed attempts: 1s, 5s, 10s
+    assert [c.args[0] for c in sleep_mock.call_args_list] == [1.0, 5.0, 10.0]
+
+
+def test_with_retry_follows_schedule_then_30s_forever():
+    """After the 1/5/10s ramp every subsequent retry is 30s."""
+    calls = {"n": 0}
+    def fn():
+        calls["n"] += 1
+        if calls["n"] < 7:
+            raise RuntimeError("Connection refused")
+        return "ok"
+
+    with patch.object(llm.time, "sleep") as sleep_mock:
+        result = llm._with_retry(fn)
+
+    assert result == "ok"
+    assert calls["n"] == 7
+    assert [c.args[0] for c in sleep_mock.call_args_list] == [1.0, 5.0, 10.0, 30.0, 30.0, 30.0]
+
+
+def test_with_retry_respects_max_attempts_cap_for_tests():
+    """max_attempts caps the number of attempts (mainly for tests)."""
+    def fn():
+        raise RuntimeError("Connection refused")
+
+    with patch.object(llm.time, "sleep"):
+        with pytest.raises(RuntimeError):
+            llm._with_retry(fn, max_attempts=3)
