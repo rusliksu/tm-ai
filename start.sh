@@ -106,10 +106,9 @@ echo "▶ starting AI server (OpenRouter, single model, log: ${AI_LOG})"
 (
   cd "${TM_AI_DIR}/tm-ai-server"
   # OPENROUTER_API_KEY is already exported via `set -a; source .env` above.
-  USE_LLM=true \
   OPENROUTER_MODEL="${OPENROUTER_MODEL:-deepseek/deepseek-v4-flash}" \
   LLM_DEBUG="${LLM_DEBUG:-true}" \
-  exec uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000
+  exec uv run uvicorn tm_llm.app:app --host 0.0.0.0 --port 8000
 ) >> "${AI_LOG}" 2>&1 &
 AI_PID=$!
 echo "${AI_PID}" >> "${PID_FILE}"

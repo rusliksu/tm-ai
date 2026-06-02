@@ -110,9 +110,8 @@ echo "▶ starting AI server (OpenRouter / multi-model, log: ${AI_LOG})"
   cd "${TM_AI_DIR}/tm-ai-server"
   # API keys are already exported via `set -a; source .env` above — no need to
   # pass them explicitly here, which would risk exposing them in process listings.
-  USE_LLM=true \
   LLM_DEBUG="${LLM_DEBUG:-true}" \
-  exec uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000
+  exec uv run uvicorn tm_llm.app:app --host 0.0.0.0 --port 8000
 ) >> "${AI_LOG}" 2>&1 &
 AI_PID=$!
 echo "${AI_PID}" >> "${PID_FILE}"

@@ -2,48 +2,39 @@
 
 ## Goal
 
-Add AI player support to the local Terraforming Mars server (Vue 3 + Node.js):
-- `isAI` flag on the player model
-- HTTP request to an external AI server for each AI player decision
-- Real-time logging of game states and decisions (Plan B) for training
-- Historical export from the SQLite DB (Plan A) — remaining work
+Add LLM-player support to the local Terraforming Mars server (Vue 3 + Node.js) with the
+**minimal** adaption from upstream `main`:
+- an `isAI` flag on the player model,
+- an HTTP request to the external AI server for each AI decision,
+- a self-play driver API for headless all-LLM games.
 
-The existing game loop must remain intact; AI behavior is a clean extension point.
+The existing game loop stays intact; AI behavior is a clean extension point. There is no
+training-data logging and no in-game AI Trainer (both removed in the 0.2 reimplementation).
 
 ---
 
 ## Implementation Status
 
-| Component | Status | Location |
-|---|---|---|
-| `isAI` flag on `Player` | ✅ Done | `src/server/Player.ts` |
-| Auto-trigger AI on `setWaitingFor` | ✅ Done | `src/server/Player.ts` — `setWaitingFor()` |
-| `aiFallbackResponse()` (OrOptions → last SelectOption) | ✅ Done | `src/server/Player.ts` |
-| `requestAiMove()` with fallback on failure | ✅ Done | `src/server/Player.ts` |
-| `AiClient.ts` HTTP client | ✅ Done | `src/server/ai/AiClient.ts` |
-| `stateMapping.ts` — extended state (opponents, board, milestones, awards, cardsInHand, recentLog, boardName, expansions, gameVariants) | ✅ Done | `src/server/ai/stateMapping.ts` |
-| `TrainingLogger.ts` — per-game JSONL with meta/turn/result records | ✅ Done | `src/server/ai/TrainingLogger.ts` |
-| Plan B: `setWaitingFor()` captures `pendingTrainingState` for all players | ✅ Done | `src/server/Player.ts` |
-| Plan B: `process()` calls `logTrainingTurn()` for all players | ✅ Done | `src/server/Player.ts` |
-| `writeMeta()` called at game creation | ✅ Done | `src/server/routes/ApiCreateGame.ts` |
-| `writeResult()` called at game end | ✅ Done | `src/server/Game.ts` — `gotoEndGame()` |
-| `takeAction(saveBeforeTakingAction)` flag fixed | ✅ Done | `src/server/Player.ts` — gates `game.save()` correctly |
-| `isAI` flag from game creation API | ✅ Done | `src/server/routes/ApiCreateGame.ts` |
-| AI toggle in `CreateGameForm.vue` | ✅ Done | `src/client/components/create/CreateGameForm.vue` |
-| `isAI` exposed in `ServerModel` / `PlayerModel` | ✅ Done | `src/server/models/ServerModel.ts` |
-| Plan A: `export_training_data.ts` (re-run engine on DB saves) | ✅ Done | `src/server/tools/export_training_data.ts` |
-| Self-play `POST /api/ai/new-game` + `/api/ai/step` | ✅ Done | `src/server/routes/ApiAiSelfPlay.ts` |
-| `game.isSelfPlay` flag (suppresses auto AI trigger) | ✅ Done | `src/server/Game.ts`, `IGame.ts`, `Player.ts` |
-| `requestAiMove` retry on `process()` failure (up to 2×, sends `last_error`) | ✅ Done | `src/server/Player.ts` |
-| `extract_card_db.ts` — renderData traversal for prelude/CEO descriptions | ✅ Done | `src/server/tools/extract_card_db.ts` |
-| AI server `POST /player/register` — assign model to player before game | ✅ Done | `tm-ai-server/src/tm_ai_server/main.py` |
-| AI server `POST /game-done` — flush per-player token/cost summary | ✅ Done | `tm-ai-server/src/tm_ai_server/main.py` |
+| Component | Location |
+|---|---|
+| `isAI` flag on `Player` | `src/server/Player.ts` |
+| Auto-trigger AI on `setWaitingFor` (when `isAI && !isSelfPlay`) | `src/server/Player.ts` |
+| `aiFallbackResponse()` (OrOptions → last SelectOption) | `src/server/Player.ts` |
+| `requestAiMove()` with retry + `last_error` feedback, fallback on failure | `src/server/Player.ts` |
+| `AiClient.ts` HTTP client (`requestMove`) | `src/server/ai/AiClient.ts` |
+| `stateMapping.ts` — full state (player + opponents + board + boardSpaces + milestones/awards + recentLog + config) | `src/server/ai/stateMapping.ts` |
+| `isAI` from game-creation API + UI checkbox | `src/server/routes/ApiCreateGame.ts`, `src/client/components/create/CreateGameForm.vue` |
+| `isAI` exposed in `ServerModel` / `PlayerModel` | `src/server/models/ServerModel.ts` |
+| Self-play `POST /api/ai/new-game` + `/api/ai/step` | `src/server/routes/ApiAiSelfPlay.ts` |
+| `game.isSelfPlay` flag (suppresses auto AI trigger) | `src/server/Game.ts`, `IGame.ts`, `Player.ts` |
+| `extract_card_db.ts` — renderData traversal for prelude/CEO descriptions | `src/server/tools/extract_card_db.ts` |
 
 ---
 
 ## API Format
 
-The TM server uses a **`provide_input` paradigm**: it sends the full `PlayerInputModel` decision tree to the AI server, which returns a raw `InputResponse`.
+The TM server uses a **`provide_input` paradigm**: it sends the full `PlayerInputModel`
+decision tree to the AI server, which returns a raw `InputResponse`.
 
 ### Request (TM Server → AI Server)
 
@@ -52,45 +43,34 @@ The TM server uses a **`provide_input` paradigm**: it sends the full `PlayerInpu
   "game_id": "g123...",
   "player_id": "p456...",
   "state": {
-    "game": {"id": "g123...", "phase": "action", "generation": 7, "oxygen": 8, "temperature": -12, "oceanCount": 5},
-    "player": {
-      "id": "p456...", "name": "Alice", "color": "blue",
-      "terraformRating": 42, "megacredits": 25, "steel": 3, "titanium": 1,
-      "plants": 5, "energy": 2, "heat": 6, "handSize": 4,
-      "production": {"megacredits": 4, "steel": 1, "titanium": 0, "plants": 2, "heat": 0, "energy": 1},
-      "tags": {"science": 2, "building": 3, "space": 1},
-      "isAI": true, "playedCards": [...], "corporations": [...]
-    },
-    "opponents": [{"id": "p2", "terraformRating": 38, ...}],
-    "board": [{"id": "H05", "x": 3, "y": 2, "tileType": 0, "playerColor": "blue"}, ...],
-    "milestones": [{"name": "Terraformer", "playerId": "p456..."}],
-    "awards": [{"name": "Landlord", "playerId": "p456..."}],
-    "waitingFor": {"type": "or", "title": "Take action", "options": [...]}
+    "game": {"id","phase","generation","oxygen","temperature","oceanCount",
+             "boardName","expansions","availableMilestones","availableAwards",
+             "gameVariants","recentLog"},
+    "player": {"...resources/production/tags...","handSize","isAI","playedCards",
+               "corporations","cardResources","boardTiles","victoryPoints","cardsInHand"},
+    "opponents": [{"...","handSize"}],
+    "board": [{"id","x","y","tileType","playerColor"}],
+    "boardSpaces": [{"id","x","y","t","b","v?","tile?","pc?"}],
+    "milestones": [{"name","playerId"}], "awards": [{"name","playerId"}],
+    "waitingFor": {"type":"or","title":"Take action","options":[...]}
   },
-  "legal_actions": [
-    {
-      "action_id": "provide_input",
-      "type": "or",
-      "title": "Take action",
-      "payload": {"input": {"type": "or", "title": "Take action", "options": [...]}}
-    }
-  ],
-  "metadata": {"schema_version": 1}
+  "legal_actions": [{"action_id":"provide_input","type":"or","title":"Take action",
+                     "payload":{"input": {...}}}],
+  "metadata": {"schema_version": 1},
+  "last_error": "optional — set when the previous response was rejected"
 }
 ```
 
-`legal_actions` always contains exactly one entry. The `PlayerInputModel` tree is in both `state.waitingFor` and `legal_actions[0].payload.input`.
+`legal_actions` always contains exactly one entry; the tree is in both `state.waitingFor` and
+`legal_actions[0].payload.input`.
 
 ### Response (AI Server → TM Server)
 
 ```json
-{
-  "input_response": {"type": "or", "index": 2, "response": {"type": "option"}},
-  "debug": {"policy_logits": [1.2, -0.3, 0.8], "value_estimate": 0.35}
-}
+{"input_response": {"type": "or", "index": 2, "response": {"type": "option"}}, "debug": {...}}
 ```
 
-`input_response` is passed directly to `player.process()`. `debug` is optional and ignored by the game.
+`input_response` is passed directly to `player.process()`. `debug` is optional and ignored.
 
 **InputResponse wire format** (from `src/common/inputs/InputResponse.ts`):
 
@@ -110,217 +90,94 @@ The TM server uses a **`provide_input` paradigm**: it sends the full `PlayerInpu
 
 ### Error Handling
 
-- Timeout or non-OK HTTP status: fallback to `aiFallbackResponse()` (last `SelectOption` in `OrOptions`, or first option as best-effort)
-- Timeout is controlled by `AI_TIMEOUT_MS` env var (default 600000ms / 10 min). A custom `undici.Agent` is used with matching `headersTimeout`/`bodyTimeout` to prevent Node.js undici's internal 300s headers timeout from firing before `AbortController`.
-- `player.process()` failure (e.g. "you do not have enough resources"): `requestAiMove` retries up to 2× with `last_error` set in the request payload so the AI can correct its choice or payment. After 2 retries, falls back to `aiFallbackResponse()`.
-- If no fallback found: error logged, no action applied (AI player stalls)
+- Timeout / non-OK HTTP status → `aiFallbackResponse()` (last `SelectOption` in `OrOptions`,
+  else best-effort first option).
+- Timeout is `AI_TIMEOUT_MS` (default 600000ms / 10 min). A custom `undici.Agent` with matching
+  `headersTimeout`/`bodyTimeout` prevents undici's internal 300s timeout firing early.
+- `player.process()` failure (e.g. "not enough resources") → `requestAiMove` retries up to 2×
+  with `last_error` set so the AI can correct, then falls back to `aiFallbackResponse()`.
 
 ---
 
 ## State Mapping (`stateMapping.ts`)
 
-`buildAiRequestState()` extracts a full-game view via `buildPlayerSnapshot()` and `buildBoardState()`:
+`buildAiRequestState()` builds the full-game view via `buildPlayerSnapshot()`,
+`buildBoardState()`, and `buildAllBoardSpaces()`:
 
-- **`game`**: id, phase, generation, oxygen, temperature, oceanCount, boardName, expansions (string[]), availableMilestones (name+description), availableAwards (name+description), gameVariants (active rule variants), `recentLog` (string[] — serialized game log entries since the start of the current generation, capped at 60; includes player names, card names, tile types, placement bonuses resolved from enums)
-- **`player`** (active player): all resources, production, tags, handSize, isAI, playedCards (card names), corporations, `cardsInHand` (card names — only sent for the active AI player, not opponents)
-- **`opponents`** (all other players): resources, production, tags, handSize (count only — hand is secret), playedCards, corporations
-- **`board`**: placed tiles — spaceId, x, y, tileType, playerColor
-- **`milestones`**: claimed milestones — name, playerId
-- **`awards`**: funded awards — name, playerId
-- **`waitingFor`**: the full `PlayerInputModel` for the current decision
+- **`game`**: id, phase, generation, oxygen, temperature, oceanCount, boardName, expansions,
+  availableMilestones / availableAwards (name + description), gameVariants, `recentLog`
+  (serialized log since the start of the current generation, cap 25).
+- **`player`** (active): resources, production, tags, handSize, isAI, playedCards,
+  corporations, cardResources (per-card `{name:count}`), boardTiles, victoryPoints, and
+  `cardsInHand` (card names — **self only**, opponents' hands are secret).
+- **`opponents`**: same snapshot minus `cardsInHand`; `handSize` is a count only.
+- **`board`**: placed tiles — id, x, y, tileType, playerColor.
+- **`boardSpaces`**: every hex — id, x, y, `t` (spaceType), `b` (bonus names), `v?` (volcanic),
+  and `tile?`/`pc?` for occupied hexes. Drives the AI server's live-board rendering + adjacency.
+- **`milestones`** / **`awards`**: claimed/funded — name, playerId.
+- **`waitingFor`**: the full `PlayerInputModel` for the current decision.
 
-`recentLog` serialization: `serializeLogMessage` substitutes `${N}` template placeholders using per-type handlers — `PLAYER` → player name (looked up by color), `TILE_TYPE` → human-readable tile name (greenery/ocean/city/…), `SPACE_BONUS` → resource name (titanium/steel/plant/…), `CARDS` → comma-joined list, others → string value.
-
-`getRecentLog` filters entries to **opponents' moves + system messages** (the AI's own moves are dropped — they're already in the model's session memory, so showing them again wastes tokens and confuses tableau attention).
-
----
-
-## Plan B: Real-time Decision Logging
-
-Logging is wired in `Player.ts` for all players (human and AI) **except self-play games**:
-
-1. **`setWaitingFor()`** — captures `{step, state, waitingFor}` into `this.pendingTrainingState` for every player before each decision
-2. **`process()`** — calls `logTrainingTurn(input)` which pairs the captured state with the chosen `InputResponse` and appends it to the game's JSONL file. **Bails out when `game.isSelfPlay === true`** — self-play games persist to the DB only.
-3. **`ApiCreateGame.ts`** — calls `TrainingLogger.writeMeta()` at game creation to write the game_spec and player list
-4. **`Game.gotoEndGame()`** — calls `TrainingLogger.writeResult()` to write final VP and rankings. **Bails out when `game.isSelfPlay === true`**.
-
-For self-play games, the canonical training-data source is the DB. Use `export_training_data.ts` to extract JSONLs when needed (e.g. for a supervised re-training pass).
-
-### JSONL File Format
-
-One file per game: `ai_training_logs/{game_id}.jsonl` (env var: `AI_TRAINING_LOG_DIR`)
-
-Three record types, one per line:
-
-```jsonl
-{"type":"meta", "game_id":"g123", "game_spec":{"board_name":"tharsis","player_count":2,"expansions":["corpEra","venus"],"variants":{...},"created_at":"..."}, "players":[{"playerId":"p1","name":"Alice","isAI":false},...]}
-{"type":"turn", "step":0, "playerId":"p1", "generation":3, "phase":"action", "timestamp":"...", "state":{...}, "waitingFor":{...}, "input_response":{"type":"or","index":1,"response":{"type":"option"}}, "is_human":true}
-{"type":"result", "endGeneration":14, "playerResults":[{"playerId":"p1","name":"Alice","tr":67,"vp_total":95,"rank":1},...]}
-```
-
-`dataset.py` reads this format: it requires all three record types; games missing meta or result are skipped.
+`recentLog` serialization (`serializeLogMessage`) substitutes `${N}` placeholders: `PLAYER` →
+name (by color), `TILE_TYPE` → tile name, `SPACE_BONUS` → resource name, `SPACE` → `hex-<id>`,
+`CARDS` → comma-joined. `getRecentLog` **includes the AI's own moves** as well as opponents'
+and system messages — the AI is stateless per turn, so the log is how it learns what it did
+this generation.
 
 ---
 
-## Self-Play API (Phase 2)
+## Self-Play API
 
-Two endpoints for PPO self-play training, implemented in `src/server/routes/ApiAiSelfPlay.ts`.
+Two endpoints in `src/server/routes/ApiAiSelfPlay.ts` drive headless all-LLM ("death match")
+games. `game.isSelfPlay=true` suppresses the auto `requestAiMove()` trigger in
+`setWaitingFor()`; the driver advances the game explicitly. Games persist to the DB.
 
 ### `POST /api/ai/new-game`
-Creates a 2-player self-play game (both players have `isAI=true`, `game.isSelfPlay=true`).
-`isSelfPlay` suppresses the auto `requestAiMove()` trigger in `setWaitingFor()` **and** suppresses per-turn / result JSONL logging in `Player.process()` and `Game.gotoEndGame()`. The game state persists to the DB; use `export_training_data.ts` to extract training data later if needed.
-
-Request body (all optional):
-```json
-{"boardName": "tharsis", "playerCount": 2, "playerNames": ["Claude", "GPT"]}
-```
-
-Response:
-```json
-{
-  "game_id": "g...",
-  "player_id": "p...",
-  "spectator_id": "s...",
-  "state": {...},
-  "waitingFor": {...},
-  "game_spec": {...}
-}
-```
-`spectator_id` can be used to construct a browser-viewable URL: `http://localhost:8080/spectator?id=<spectator_id>`. `play_game.py` writes this URL to `/tmp/current-game.url` once the game is created; `start.sh` polls that file and opens it in Chrome.
-```
+Creates a self-play game (all players `isAI=true`, `isSelfPlay=true`).
+Request (all optional): `{"boardName":"tharsis","playerCount":2,"playerNames":["Claude","GPT"]}`.
+Response: `{game_id, player_id, spectator_id, state, waitingFor, game_spec}`.
+`spectator_id` → `http://localhost:8080/spectator?id=<spectator_id>`. `play_game.py` writes
+this URL to `/tmp/current-game.url`, which the start scripts open in Chrome.
 
 ### `POST /api/ai/step`
-Applies one player's `InputResponse`, returns the next player's state or end-of-game result.
-
-Request:
-```json
-{"game_id": "g...", "player_id": "p...", "input_response": {...}}
-```
-
-Response (mid-game):
-```json
-{"done": false, "player_id": "p...", "state": {...}, "waitingFor": {...}, "result": null}
-```
-
-Response (game over):
-```json
-{
-  "done": true, "player_id": null, "state": null, "waitingFor": null,
-  "result": {"endGeneration": 14, "playerResults": [{"playerId":"p...","tr":67,"vp_total":95,"rank":1},...]}
-}
-```
-
-The Python env (`env_tm.py`) calls these endpoints sequentially; the model plays both AI players.
+Applies one player's `InputResponse`, returns the next state or the end result.
+Request: `{game_id, player_id, input_response}`.
+- Mid-game: `{done:false, player_id, state, waitingFor, result:null}`.
+- Game over: `{done:true, player_id:null, state:null, waitingFor:null, result:{endGeneration, playerResults:[{playerId,name,tr,vp_total,rank},...]}}`.
 
 ### `scripts/play_game.py` — multi-LLM driver
-
-`play_game.py` drives a full game using the AI server for every move. Key behaviours:
-- Calls `POST /player/register` before the game starts to assign one LLM per player seat (`--models "a/m1,b/m2,..."`)
-- Writes the spectator URL to `/tmp/current-game.url` immediately after `POST /api/ai/new-game`
-- On TM server `POST /api/ai/step` rejection (HTTP 400): re-calls `POST /move` with `last_error` and retries `/step` up to `_MAX_STEP_RETRIES=2` times before aborting
-- Calls `POST /game-done` at game end to flush per-player token/cost logs
-
----
-
-## AI Trainer API
-
-Two TM-server routes for the human-facing coaching sidebar, implemented in `src/server/routes/ApiAiAdvice.ts`. Opt-in **per player** via a client-side toggle in `PlayerHome.vue` (state persisted to `localStorage` under `ai_trainer_visible:<participantId>`). No game-wide flag — any player can open their own trainer panel on demand.
-
-### `POST /api/ai/advice`
-
-Called by `AiTrainerChat.vue` when the game reaches a new decision point (or when the human asks a follow-up question). Proxies to `POST /advise` on the AI server.
-
-Request:
-```json
-{
-  "game_id": "g...",
-  "player_id": "p...",
-  "user_question": "Should I play Nuclear Power now?"
-}
-```
-
-Response:
-```json
-{
-  "advice_text": "Holding off on Nuclear Power this turn lets you...",
-  "recommendation": {"type": "or", "index": 2, "response": {"type": "option"}}
-}
-```
-
-### `POST /api/ai/play-recommendation`
-
-Submits the AI's recommended `input_response` on behalf of the human player (via `player.process()`), exactly as if the human had chosen that action manually.
-
-Request:
-```json
-{
-  "game_id": "g...",
-  "player_id": "p...",
-  "input_response": {"type": "or", "index": 2, "response": {"type": "option"}}
-}
-```
-
-Response: `{"success": true}`. On success the client triggers `window.location.reload()` so the next decision renders identically to the regular Play-button path.
-
-### Per-player UI toggle
-
-- `PlayerHome.vue` exposes a fixed 🤖 button (bottom-right) that toggles `aiTrainerVisible` for the current participant
-- State is persisted to `localStorage[ai_trainer_visible:<participantId>]`
-- When visible, the trainer sidebar mounts `AiTrainerChat` and per-decision advice fetches start
-- The AI server's session namespace is `trainer:<player_id>`, so two players in the same game get isolated trainer sessions
-
-### Hotkey isolation
-
-`PlayerHome.vue:navigatePage` now skips global single-key shortcuts when the keydown target is `<input>`, `<textarea>`, or any `contentEditable` element. Previously only `<input>` was checked, which let keys like `s` / `d` jump the page mid-chat in the trainer's `<textarea>` input.
-
----
-
-## Plan A: Re-run Engine on DB Saves
-
-**Goal:** Extract training tuples from the 82 existing historical games in the SQLite DB.
-
-**Approach:** `Game.deserialize()` re-triggers `player.setWaitingFor()` automatically, so the `waitingFor` tree is available after loading any save. Consecutive save pairs (N, N+1) reveal what decision was made by diffing the game log messages between saves.
-
-**Key prerequisite already done:** `takeAction(saveBeforeTakingAction=false)` is now respected — the export tool can load saves without writing spurious DB entries.
-
-**Steps for `export_training_data.ts`:**
-1. Iterate all games from the DB
-2. **Skip games whose `${gameId}.jsonl` already exists in the output dir** (idempotent re-runs are now cheap)
-3. For each game, iterate consecutive save pairs (saveId N → N+1)
-4. Deserialize save N → `activePlayer.waitingFor` is set automatically
-5. Capture `waitingFor.toModel(player)` and state via `buildAiRequestState()`
-6. Diff game log messages between save N and N+1 to infer the chosen action
-7. Write the training turn record
-8. At the last save, compute final VP and write the result record
-
-**Remaining risks:** Inferring the chosen action from log message diffs is imprecise — some saves may be mid-deferred-action rather than clean decision points. Filter by checking if `activePlayer` or `phase` changed.
+- Calls `POST /player/register` before the game to assign one LLM per seat
+  (`--models "a/m1,b/m2,..."`).
+- Writes the spectator URL to `/tmp/current-game.url` after `POST /api/ai/new-game`.
+- On a TM-server `POST /api/ai/step` rejection (HTTP 400): re-calls `POST /move` with
+  `last_error` and retries `/step` up to `_MAX_STEP_RETRIES=2` before aborting.
+- Calls `POST /game-done` at game end to flush per-player token/cost logs.
 
 ---
 
 ## PlayerInput Model Reference
 
-The `waitingFor` object is a `PlayerInputModel` — a recursive decision tree defined in `src/common/models/PlayerInputModel.ts`.
-
-Full union of types: `OrOptions | AndOptions | SelectInitialCards | SelectOption | SelectProjectCardToPlay | SelectCard | SelectAmount | SelectColony | SelectDelegate | SelectParty | SelectPayment | SelectPlayer | SelectProductionToLose | SelectSpace | ShiftAresGlobalParameters | SelectGlobalEvent | SelectPolicy | SelectResource | SelectResources | SelectClaimedUndergroundToken`
+`waitingFor` is a `PlayerInputModel` — a recursive decision tree
+(`src/common/models/PlayerInputModel.ts`). Full union: `OrOptions | AndOptions |
+SelectInitialCards | SelectOption | SelectProjectCardToPlay | SelectCard | SelectAmount |
+SelectColony | SelectDelegate | SelectParty | SelectPayment | SelectPlayer |
+SelectProductionToLose | SelectSpace | ShiftAresGlobalParameters | SelectGlobalEvent |
+SelectPolicy | SelectResource | SelectResources | SelectClaimedUndergroundToken`.
 
 ---
 
 ## File Reference
 
-| File | Purpose | Status |
-|---|---|---|
-| `src/server/Player.ts` | isAI flag, setWaitingFor, process, requestAiMove, fallback, Plan B logging | ✅ Done |
-| `src/server/Game.ts` | writeResult at game end | ✅ Done |
-| `src/server/ai/AiClient.ts` | HTTP client to AI server; `MoveRequestPayload` includes optional `last_error?: string` | ✅ Done |
-| `src/server/ai/stateMapping.ts` | Full state: player (+ cardsInHand) + opponents + board + milestones + awards + recentLog + boardName/expansions/milestones/awards/gameVariants | ✅ Done |
-| `src/server/ai/TrainingLogger.ts` | writeMeta / appendTurn / writeResult; per-game JSONL | ✅ Done |
-| `src/server/ai/index.ts` | Re-exports | ✅ Done |
-| `src/server/routes/ApiCreateGame.ts` | isAI on player create, writeMeta at game start | ✅ Done |
-| `src/server/models/ServerModel.ts` | isAI exposed in game/player models | ✅ Done |
-| `src/common/game/NewGameConfig.ts` | isAI field on NewPlayerModel | ✅ Done |
-| `src/client/components/create/CreateGameForm.vue` | AI player checkbox in game setup UI | ✅ Done |
-| `src/server/tools/export_all_logs.ts` | Exports game display logs (not training data) | ✅ Done |
-| `src/server/tools/export_training_data.ts` | Re-run engine on DB saves (Plan A) | ✅ Done |
-| `src/server/routes/ApiAiSelfPlay.ts` | POST /api/ai/new-game + /api/ai/step | ✅ Done |
-| `src/server/IGame.ts` | `isSelfPlay: boolean` field | ✅ Done |
-| `src/common/app/paths.ts` | `API_AI_NEW_GAME` + `API_AI_STEP` path constants | ✅ Done |
+| File | Purpose |
+|---|---|
+| `src/server/Player.ts` | isAI flag, setWaitingFor trigger, process, requestAiMove + retry/fallback |
+| `src/server/Game.ts`, `src/server/IGame.ts` | `isSelfPlay` field |
+| `src/server/ai/AiClient.ts` | HTTP client (`requestMove`); `MoveRequestPayload` includes optional `last_error` |
+| `src/server/ai/stateMapping.ts` | Full state payload (see above) |
+| `src/server/ai/index.ts` | Re-exports (`AiClient`, `stateMapping`) |
+| `src/server/routes/ApiAiSelfPlay.ts` | `POST /api/ai/new-game` + `/api/ai/step` |
+| `src/server/routes/ApiCreateGame.ts` | `isAI` on player create |
+| `src/server/models/ServerModel.ts` | `isAI` exposed in game/player models |
+| `src/common/game/NewGameConfig.ts` | `isAI` field on NewPlayerModel |
+| `src/client/components/create/CreateGameForm.vue` | AI player checkbox in game setup |
+| `src/server/tools/extract_card_db.ts` | Extract card DB (descriptions/tags) into `tm-ai/data/card_db.json` |
+| `src/common/app/paths.ts` | `API_AI_NEW_GAME` + `API_AI_STEP` path constants |

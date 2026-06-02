@@ -1,43 +1,54 @@
-# TM-AI — Terraforming Mars AI Agent
+# TM-AI — Terraforming Mars LLM Agent
 
-A two-repo project that plays Terraforming Mars: a Python AI server makes the moves, and a custom fork of the open-source TM server (`bafolts/terraforming-mars`) drives the game.
+A two-repo project that plays Terraforming Mars with LLMs: a Python AI server makes the
+moves, and a custom fork of the open-source TM server (`bafolts/terraforming-mars`) drives
+the game.
 
-The agent can play in three modes:
-1. **Neural net** — a trained policy/value network (supervised pretrain + PPO self-play).
-2. **LLM** — any OpenRouter model (cloud, e.g. Claude/GPT/Gemini/DeepSeek) or Ollama (local). Reads the game state and picks moves with chain-of-thought. The provider is derived from the model name: `vendor/model` → OpenRouter, `bare:tag` → Ollama.
-3. **AI Trainer** — same LLM, but it *coaches a human* via a chat sidebar instead of playing.
+Any OpenRouter model (Claude, GPT, Gemini, DeepSeek, Grok, …) can play. The agent reads the
+full game state each turn and picks a move with chain-of-thought reasoning. It runs in two
+contexts:
+
+1. **UI game** — create a game in the browser and tick "AI player?" for a seat; the TM
+   server calls the AI server for every decision.
+2. **Death match** — a headless driver runs an all-LLM game (one model per seat) and a
+   spectator URL lets you watch.
+
+> The earlier neural-net/PPO training stack, supervised pipeline, Ollama provider, and
+> in-game AI Trainer were removed in the 0.2 reimplementation. This is now LLM-only and
+> OpenRouter-only.
 
 ## Repo layout
 
 ```
 ~/workspace/
-  tm-ai/                    # this repo (Python, FastAPI, PyTorch)
-    tm-ai-server/           # AI server (port 8000); /move, /advise, /health
-    specs/                  # TM-AI.md + TM-adaption.md (canonical specs)
-    logs/training/          # Plan B per-turn JSONL (human games only)
-    logs/llm-test/          # archived LLM-play game logs for analysis
-    models/                 # checkpoint_best.pt, checkpoint_latest.pt
+  tm-ai/                    # this repo (Python, FastAPI)
+    tm-ai-server/           # AI server (port 8000); /move, /player/register, /game-done, /health
+      src/tm_llm/           # the LLM player package
+    specs/                  # TM-AI.md + TM-adaption.md + LLM-state-persistence.md
     data/card_db.json       # 970-card DB extracted from the TM server
-    ai-model-design.md      # Option C design rationale (blog source)
+    logs/llm-test/          # death-match session logs (_latest → newest)
+    logs/llm-state/         # per-player durable state across server restarts
+    scripts/play_game.py    # death-match driver
+    start.sh / start-deathmatch.sh / stop.sh
 
-  terraforming-mars/        # sibling repo, branch feat/ai-player
-                            # (Node.js TM server fork with AI integration)
+  terraforming-mars/        # sibling repo, branch feat/ai-player (Node.js TM server fork)
 ```
 
-Both repos must be cloned side-by-side. The TM server expects to call `http://localhost:8000` for moves; the AI server reads card data from `../terraforming-mars` via a regenerable JSON.
+Both repos must be cloned side-by-side. The TM server calls `http://localhost:8000` for
+moves; the AI server reads card data from `data/card_db.json` (regenerated from the TM repo).
 
 ## Setup — first time
 
 ```bash
-# 1. Clone both repos
-git clone <tm-ai-fork>          ~/workspace/tm-ai
-git clone <tm-fork>             ~/workspace/terraforming-mars
+# 1. Clone both repos side by side
+git clone <tm-ai-fork>  ~/workspace/tm-ai
+git clone <tm-fork>     ~/workspace/terraforming-mars
 cd ~/workspace/terraforming-mars && git checkout feat/ai-player
 
 # 2. AI server (Python via uv)
 cd ~/workspace/tm-ai/tm-ai-server
-uv sync                          # installs torch, fastapi, sb3-contrib, openai…
-uv run pytest tests/             # 46 tests, ~1s
+uv sync                # installs fastapi, uvicorn, pydantic, requests, openai
+uv run pytest tests/   # 19 tests, <1s
 
 # 3. TM server (Node 20+)
 cd ~/workspace/terraforming-mars
@@ -49,180 +60,147 @@ cp ~/workspace/tm-ai/.env.example ~/workspace/tm-ai/.env  # then edit
 source ~/workspace/tm-ai/.env                              # never read .env directly
 ```
 
-`.env` is the only place secrets live. The TM server reads `AI_TRAINING_LOG_DIR` (where Plan B JSONLs land) and `AI_SERVER_URL`. The AI server reads `OPENROUTER_API_KEY`, `MODEL_PATH`, etc.
+`.env` is the only place secrets live. The AI server needs `OPENROUTER_API_KEY`; the TM
+server reads `AI_SERVER_URL` and `AI_TIMEOUT_MS`.
 
 ## Running the stack
 
-Three TM-server / AI-server combos, depending on what you want:
-
-### A. Play vs. a trained neural net
+### A. Play vs. an LLM in the browser
 
 ```bash
-# Terminal 1 — AI server (neural net)
-cd ~/workspace/tm-ai/tm-ai-server
-MODEL_PATH=../models/checkpoint_best.pt \
-  uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000
+source ~/workspace/tm-ai/.env
 
-# Terminal 2 — TM server
+# AI server (any OpenRouter model id)
+cd ~/workspace/tm-ai/tm-ai-server
+OPENROUTER_MODEL=anthropic/claude-sonnet-4-6 LLM_DEBUG=true \
+  uv run uvicorn tm_llm.app:app --host 0.0.0.0 --port 8000
+
+# TM server (separate terminal)
 cd ~/workspace/terraforming-mars
 node build/src/server/server.js
 ```
 
-Open `http://localhost:8080`, create a game, tick "AI player?" for the bot. The TM server calls `POST /move` for every decision.
+Open `http://localhost:8080`, create a game, tick "AI player?" for the bot. The TM server
+calls `POST /move` for every decision.
 
-### D. Run a multi-LLM death match (4 models, OpenRouter)
+### B. Multi-LLM death match
 
 ```bash
 source ~/workspace/tm-ai/.env   # must have OPENROUTER_API_KEY
 
 cd ~/workspace/tm-ai
-./start.sh --death-match        # starts AI server (OpenRouter) + TM server + 4-player game
-# Opens the spectator URL in Chrome; follow the game in real time.
-# Logs: /tmp/ai-server.log, /tmp/tm-server.log, /tmp/death-match.log
+./start-deathmatch.sh           # AI server + TM server + an all-LLM game; opens spectator URL
 
 # Override the default lineup
 DEATH_MATCH_MODELS="anthropic/claude-sonnet-4-6,openai/gpt-4o-mini,google/gemini-2.5-flash,deepseek/deepseek-chat" \
-  ./start.sh --death-match
+  ./start-deathmatch.sh
 
-# Stop everything when done
-./stop.sh
+./stop.sh                       # stop everything
+./stop.sh --clean-db            # also remove self-play games from the TM SQLite DB
 ```
 
-Default lineup: Claude Sonnet 4-6, GPT-4o-mini, Gemini 2.5 Flash, DeepSeek Chat. See `logs/llm-test/` for archived game logs and analysis.
-
-### B. Play vs. a single LLM (OpenRouter or Ollama)
-
-The provider is chosen by the model name — no `LLM_PROVIDER` flag.
+Or start just the servers and drive a game manually:
 
 ```bash
-source ~/workspace/tm-ai/.env
-
-# OpenRouter (cloud; needs OPENROUTER_API_KEY). Any vendor/model id works,
-# e.g. anthropic/claude-sonnet-4-6, openai/gpt-4o-mini, google/gemini-2.5-flash-lite.
-cd ~/workspace/tm-ai/tm-ai-server
-USE_LLM=true OPENROUTER_MODEL=google/gemini-2.5-flash-lite LLM_DEBUG=true \
-  uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000
-
-# Ollama (local, free; needs `ollama serve` running with the model pulled)
-USE_LLM=true OLLAMA_MODEL=qwen3:4b LLM_DEBUG=true \
-  uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000
+./start.sh                                          # AI + TM servers (single default model)
+uv run python scripts/play_game.py --players 4 \
+  --models "anthropic/claude-sonnet-4-6,openai/gpt-4o-mini,google/gemini-2.5-flash,deepseek/deepseek-chat"
+# --board tharsis|hellas|elysium (default random); --verbose for full state JSON
 ```
 
-### C. Human play with AI Trainer coaching
+Logs land in `./logs/llm-test/<session>/` (`_latest` symlinks the newest). The spectator URL
+is written to `/tmp/current-game.url`. A per-player token/cost summary is logged at game end
+via `POST /game-done`.
 
-Start any AI server with `USE_LLM=true` (B above), then open a game in the browser. Click the floating 🤖 button (bottom-right) on a player's page to open the coaching sidebar — auto-fetches advice on each new decision, accepts follow-up questions, has a "Play Recommendation" button. Each player has their own toggle and isolated trainer session (namespace `trainer:<game_id>:<player_id>`).
+## How the LLM player works
 
-No game-creation checkbox to set; the toggle is per-player and per-game, persisted in `localStorage`.
-
-## Training pipeline
-
-```bash
-# Phase 1 — supervised pretrain from Plan B JSONLs
-cd ~/workspace/tm-ai/tm-ai-server
-uv run python -m tm_ai_server.training.train_supervised \
-  --data-dir ../logs/training --output-dir ../models --epochs 50
-
-# Phase 2 — PPO self-play (needs TM server running)
-uv run python -m tm_ai_server.training.train_ppo \
-  --checkpoint ../models/checkpoint_best.pt \
-  --output-dir ../models --log-dir ../logs/selfplay \
-  --total-steps 5_000_000 --checkpoint-interval 100
-```
-
-PPO self-play games persist to the TM-server DB only — no JSONL is written. To produce training-data JSONLs from those games later, run `export_training_data.ts` against the DB (see TM-adaption.md). PPO run artifacts (`manifest.json`, `metrics.jsonl`, model checkpoints) live in `logs/selfplay/<run_id>/` / `models/selfplay/<run_id>/`.
-
-For cloud GPU training, see `specs/TM-AI.md` Phase 2 — Vast.ai 3090 spot (~$0.20/h) or GCE Spot T4 (~$0.50/h); 5M-step run is ~5h / ~€2–3 per attempt.
-
-## Re-exporting training data from the TM server DB
-
-```bash
-cd ~/workspace/terraforming-mars
-npx tsx src/server/tools/export_training_data.ts ~/workspace/tm-ai/logs/training
-```
-
-The tool skips any game whose JSONL already exists in the output dir, so re-runs are idempotent and fast. After the May-2026 DB purge, 62 human games / 8235 turns export cleanly.
+- **OpenRouter only**, one model per player (assigned via `POST /player/register`). Model
+  capabilities (prompt caching, extended thinking) come from a static table with safe
+  defaults — no runtime probing.
+- **Stateless turns + two-part memory.** Each `/move` is one self-contained completion:
+  a cached system prompt (rules + condensed strategy primer + game config + board layout)
+  plus a per-turn user prompt (current state, compact hand, live board, candidate-hex
+  adjacency on placements, opponents, milestone/award status, log, and the player's own
+  `STRATEGY` + `TACTICAL` notes). The player rewrites those notes each turn / each
+  generation, so no chat history is kept.
+- **Validation + retry.** Before submitting, the server checks the response has a `CHOICE:`
+  line and an affordable `PAYMENT:`; if not, it resends with an error banner (≤2 retries).
+  TM-server rejections come back as `last_error` and are surfaced to the model.
+- **Durable state.** On graceful shutdown, each in-flight player's memory is saved to
+  `logs/llm-state/<player_id>.json` and restored on the next `/move` (see
+  `specs/LLM-state-persistence.md`).
 
 ## Development
 
 ```bash
 # AI server
 cd ~/workspace/tm-ai/tm-ai-server
-uv run pytest tests/                                         # 46 tests, ~1s
-uv run pytest tests/test_encoding.py::test_flatten_or_options -v
+uv run pytest tests/                                  # 19 tests
+uv run pytest tests/test_board.py -v
 
 # TM server
 cd ~/workspace/terraforming-mars
-npm run build:server                                         # tsc + tsc-alias
-npm run build:client                                         # webpack (slow)
+npm run build:server                                  # tsc + tsc-alias
+npm run build:client                                  # webpack (slow)
 ```
 
-Claude Code permissions for both repos live in `tm-ai/.claude/settings.json` (gitignored — local to your machine, not committed). The canonical specs (`specs/TM-AI.md`, `specs/TM-adaption.md`) live in this repo only — there's no copy under `terraforming-mars/`.
-
----
-
-# Sibling repo: `terraforming-mars` (TM server fork)
-
-A fork of `bafolts/terraforming-mars` on branch `feat/ai-player`. Adds the AI-integration points listed below; the rest of the codebase is upstream and inherits its GPLv3 license.
-
-## Key integration files (relative to `terraforming-mars/src/`)
-
-| File | What it adds |
-|---|---|
-| `server/Player.ts` | `isAI` flag, `requestAiMove()` with retry+last_error feedback, `_aiMoveInProgress` guard, per-turn `logTrainingTurn()` (skipped for self-play games) |
-| `server/Game.ts` | `isSelfPlay` field, `writeResult()` at game end (skipped for self-play) |
-| `server/IGame.ts` | `isSelfPlay: boolean` in the interface |
-| `server/ai/stateMapping.ts` | `buildAiRequestState()` — full state payload incl. cardsInHand, recentLog (opponents-only filter), boardSpaces, milestones/awards, gameVariants |
-| `server/ai/TrainingLogger.ts` | writeMeta / appendTurn / writeResult; per-game JSONL into `AI_TRAINING_LOG_DIR` |
-| `server/ai/AiClient.ts` | HTTP client to AI server (`/move`, `/advise`); `MoveRequestPayload` includes optional `last_error` |
-| `server/routes/ApiAiSelfPlay.ts` | `POST /api/ai/new-game` + `/api/ai/step` for PPO self-play; response includes `spectator_id` |
-| `server/routes/ApiAiAdvice.ts` | `POST /api/ai/advice` + `/api/ai/play-recommendation` for the AI Trainer; per-player, no game-wide gate |
-| `server/tools/export_training_data.ts` | Replays the engine on DB saves to produce Plan-B-format JSONLs; skip-if-exists for idempotent re-runs |
-| `server/tools/extract_card_db.ts` | Walks the card renderer to extract all 970 cards into `tm-ai/data/card_db.json` |
-| `client/components/PlayerHome.vue` | Per-player 🤖 trainer toggle, hotkey isolation in chat input |
-| `client/components/ai/AiTrainerChat.vue` | Coaching sidebar (chat + Play Recommendation) |
-
-## Running just the TM server
-
-```bash
-cd ~/workspace/terraforming-mars
-npm install
-npm run build:server
-node build/src/server/server.js >> /tmp/tm-server.log 2>&1 &
-```
-
-Default `http://localhost:8080`. SQLite DB at `db/game.db` (set `LOCAL_FS_DB` or `POSTGRES_HOST` to swap backends; see `src/server/database/Database.ts`).
-
-## Environment variables (TM server)
-
-| Variable | Default | Description |
-|---|---|---|
-| `AI_SERVER_URL` | `http://localhost:8000` | Where to send `/move` and `/advise` |
-| `AI_TIMEOUT_MS` | `600000` | HTTP timeout for AI calls (10 min — LLMs can be slow) |
-| `AI_TRAINING_LOG_DIR` | `ai_training_logs` | Per-game JSONL output dir (set this to `tm-ai/logs/training`) |
-| `POSTGRES_HOST` | — | Use Postgres instead of SQLite if set |
-| `LOCAL_FS_DB` | — | Use a flat-file DB if set |
+Claude Code permissions for both repos live in `tm-ai/.claude/settings.json` (gitignored).
+The canonical specs (`specs/`) live in this repo only.
 
 ## Regenerating the card database
 
-The AI server depends on `~/workspace/tm-ai/data/card_db.json` for card descriptions, tags, and the vocabulary used by the (planned) embedding table. Regenerate after card content changes:
+The AI server reads `data/card_db.json` for card descriptions and tags. Regenerate after
+card content changes:
 
 ```bash
 cd ~/workspace/terraforming-mars
 npx tsx src/server/tools/extract_card_db.ts > ~/workspace/tm-ai/data/card_db.json
 ```
 
-The tool traverses `CardRenderer.renderData` to pull descriptions for prelude / CEO / event cards that lack a plain `description` string.
+---
+
+# Sibling repo: `terraforming-mars` (TM server fork)
+
+A fork of `bafolts/terraforming-mars` on branch `feat/ai-player`. It adds the minimal AI
+integration points below; the rest is upstream and inherits its GPLv3 license.
+
+| File (under `terraforming-mars/src/`) | What it adds |
+|---|---|
+| `server/Player.ts` | `isAI` flag; `requestAiMove()` with retry + `last_error` feedback; `_aiMoveInProgress` guard; auto-trigger on new `waitingFor` |
+| `server/Game.ts`, `server/IGame.ts` | `isSelfPlay` field (suppresses auto-move during driver games) |
+| `server/ai/stateMapping.ts` | `buildAiRequestState()` — full state incl. `cardsInHand`, `recentLog`, `board`, `boardSpaces`, milestones/awards, variants |
+| `server/ai/AiClient.ts` | HTTP client to the AI server (`/move`) |
+| `server/routes/ApiAiSelfPlay.ts` | `POST /api/ai/new-game` + `/api/ai/step` (death-match driver); response includes `spectator_id` |
+| `server/tools/extract_card_db.ts` | Extracts all 970 cards into `tm-ai/data/card_db.json` |
+
+## Running just the TM server
+
+```bash
+cd ~/workspace/terraforming-mars
+npm install && npm run build:server
+node build/src/server/server.js >> /tmp/tm-server.log 2>&1 &
+```
+
+Default `http://localhost:8080`; SQLite DB at `db/game.db`.
+
+## Environment variables (TM server)
+
+| Variable | Default | Description |
+|---|---|---|
+| `AI_SERVER_URL` | `http://localhost:8000` | Where to send `/move` |
+| `AI_TIMEOUT_MS` | `600000` | HTTP timeout for AI calls (10 min — LLMs can be slow) |
+| `POSTGRES_HOST` / `LOCAL_FS_DB` | — | Swap the DB backend if set |
 
 ## License
 
-The TM server fork inherits GPLv3 from upstream. The AI server in `tm-ai/tm-ai-server/` is the same license unless otherwise noted.
+The TM server fork inherits GPLv3 from upstream. The AI server in `tm-ai/tm-ai-server/` is
+the same license unless otherwise noted.
 
 ---
 
-## Specifications and design docs
+## Specifications
 
-- [`specs/TM-AI.md`](specs/TM-AI.md) — AI server: API contract, state encoding, model architecture (current + planned Option C), training pipeline, LLM provider comparison, cloud cost analysis
-- [`specs/TM-adaption.md`](specs/TM-adaption.md) — TM-server integration: state mapping, Plan A/B training data, self-play API, AI Trainer routes
-- [`ai-model-design.md`](ai-model-design.md) — Option C design rationale (card embeddings + spatial board + per-option scoring), tensor layouts, rejected alternatives. Blog-post source.
-- [`CLAUDE.md`](CLAUDE.md) — operational quick reference for Claude Code sessions
-- [`TODO.md`](TODO.md) — checklist by phase
+- [`specs/TM-AI.md`](specs/TM-AI.md) — AI server: API contract, prompt design, LLM player.
+- [`specs/TM-adaption.md`](specs/TM-adaption.md) — TM-server integration: state mapping, self-play API.
+- [`specs/LLM-state-persistence.md`](specs/LLM-state-persistence.md) — durable per-player state.
+- [`CLAUDE.md`](CLAUDE.md) — operational quick reference for Claude Code sessions.

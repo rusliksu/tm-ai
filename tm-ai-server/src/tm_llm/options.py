@@ -1,5 +1,8 @@
-"""
-State encoding and action space handling.
+"""Decision-tree handling — enumerate selectable choices and build InputResponses.
+
+These are pure, NN-free functions lifted from the original encoding.py. They turn a
+TM `waitingFor` (PlayerInputModel) node into a flat list of options the LLM picks from,
+and turn a picked option back into a valid InputResponse for `player.process()`.
 
 InputResponse wire format (from TM server InputResponse.ts):
   OrOptions:    {type:'or',   index:N, response:<InputResponse>}
@@ -15,160 +18,15 @@ InputResponse wire format (from TM server InputResponse.ts):
   SelectParty:  {type:'party',  partyName:<PartyName>}
   SelectResource: {type:'resource', resourceType:<ResourceType>}
 """
-
 from __future__ import annotations
-import numpy as np
-from .config import (
-    PHASES, BOARDS, EXPANSION_FLAGS, TAG_TYPES,
-    CARD_RESOURCE_VOCAB, CARD_RESOURCE_CAP,
-    RESOURCE_CAPS, PRODUCTION_CAPS,
-    ACTION_SPACE_SIZE, STATE_DIM,
-)
+import re
+
+# Upper bound on enumerated options for a single decision.
+MAX_OPTIONS = 200
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _cap(value: float | int | None, cap: float) -> float:
-    return min(float(value or 0), cap) / cap
-
-
-def _encode_player(vec: np.ndarray, pos: int, p: dict) -> int:
-    """Encode a player snapshot into vec starting at pos. Returns new pos."""
-
-    # Resources (7) — including terraformRating
-    vec[pos] = _cap(p.get("terraformRating", 20), RESOURCE_CAPS["terraformRating"])
-    pos += 1
-    for res in ("megacredits", "steel", "titanium", "plants", "energy", "heat"):
-        vec[pos] = _cap(p.get(res, 0), RESOURCE_CAPS[res])
-        pos += 1
-
-    # Production (6)
-    prod = p.get("production", {})
-    mc_prod = prod.get("megacredits", 0) or 0
-    cap_mc = PRODUCTION_CAPS["megacredits"]
-    vec[pos] = (mc_prod + 5) / (cap_mc + 5)   # -5..+60 → 0..1
-    pos += 1
-    for res in ("steel", "titanium", "plants", "energy", "heat"):
-        cap = PRODUCTION_CAPS[res]
-        vec[pos] = min(float(prod.get(res, 0) or 0), cap) / cap
-        pos += 1
-
-    # Tags (13)
-    tags = p.get("tags", {})
-    for tag in TAG_TYPES:
-        vec[pos] = _cap(tags.get(tag) or 0, 20)
-        pos += 1
-
-    # Hand size (1) — visible to all players
-    vec[pos] = _cap(p.get("handSize", 0), 10)
-    pos += 1
-
-    # Per-card resource counts (199) — one slot per card in vocab
-    card_res = p.get("cardResources", {})
-    for card_name in CARD_RESOURCE_VOCAB:
-        vec[pos] = _cap(card_res.get(card_name, 0), CARD_RESOURCE_CAP)
-        pos += 1
-
-    # Played card count (1)
-    vec[pos] = _cap(p.get("playedCardCount", len(p.get("playedCards", []))), 30)
-    pos += 1
-
-    # Board tiles (3): greenery, city, special
-    bt = p.get("boardTiles", {})
-    vec[pos] = _cap(bt.get("greenery", 0), 10)
-    pos += 1
-    vec[pos] = _cap(bt.get("city", 0), 10)
-    pos += 1
-    vec[pos] = _cap(bt.get("special", 0), 10)
-    pos += 1
-
-    return pos
-
-
-# ---------------------------------------------------------------------------
-# State encoding
-# ---------------------------------------------------------------------------
-
-def encode_state(state: dict, game_spec: dict | None = None) -> np.ndarray:
-    """Encode game state dict to float32 vector of shape (STATE_DIM,)."""
-    vec = np.zeros(STATE_DIM, dtype=np.float32)
-    pos = 0
-
-    game = state.get("game", {})
-    player = state.get("player", {})
-
-    # --- Global (9 dims) ---
-    vec[pos] = (game.get("generation", 1) or 1) / 20.0
-    pos += 1
-    vec[pos] = ((game.get("temperature", -30) or -30) + 30) / 38.0  # -30..+8 → 0..1
-    pos += 1
-    vec[pos] = (game.get("oxygen", 0) or 0) / 14.0
-    pos += 1
-    vec[pos] = (game.get("oceanCount", 0) or 0) / 9.0
-    pos += 1
-    phase = game.get("phase", "action")
-    if phase in PHASES:
-        vec[pos + PHASES.index(phase)] = 1.0
-    pos += len(PHASES)
-
-    # --- Active player (230 dims) ---
-    pos = _encode_player(vec, pos, player)
-
-    # --- One opponent slot (230 dims) ---
-    from .config import _PLAYER_DIMS
-    opponents = state.get("opponents", [])
-    if opponents:
-        # Use the strongest opponent (highest TR) as the representative
-        opp = max(opponents, key=lambda o: o.get("terraformRating", 0) or 0)
-        pos = _encode_player(vec, pos, opp)
-    else:
-        pos += _PLAYER_DIMS  # all zeros — solo or no opponent data
-
-    # --- Milestones / Awards (4 dims) ---
-    player_id = player.get("id", "")
-    milestones = state.get("milestones", [])
-    awards = state.get("awards", [])
-    ms_self = sum(1 for m in milestones if m.get("playerId") == player_id)
-    ms_total = len(milestones)
-    aw_self = sum(1 for a in awards if a.get("playerId") == player_id)
-    aw_total = len(awards)
-    vec[pos] = ms_self / 3.0      # max 3 milestones per player
-    pos += 1
-    vec[pos] = ms_total / 5.0     # max 5 milestones total
-    pos += 1
-    vec[pos] = aw_self / 3.0
-    pos += 1
-    vec[pos] = aw_total / 5.0
-    pos += 1
-
-    # --- Game config (19 dims) ---
-    if game_spec:
-        vec[pos] = (game_spec.get("player_count", 1) or 1) / 4.0
-        pos += 1
-        board = game_spec.get("board_name", "tharsis")
-        if board in BOARDS:
-            vec[pos + BOARDS.index(board)] = 1.0
-        pos += len(BOARDS)
-        expansions = set(game_spec.get("expansions", []))
-        for exp in EXPANSION_FLAGS:
-            vec[pos] = 1.0 if exp in expansions else 0.0
-            pos += 1
-    else:
-        pos += 1 + len(BOARDS) + len(EXPANSION_FLAGS)
-
-    assert pos == STATE_DIM, f"encode_state: wrote {pos} dims, expected {STATE_DIM}"
-    return vec
-
-
-# ---------------------------------------------------------------------------
-# Action space
-# ---------------------------------------------------------------------------
-
-def flatten_options(waiting_for: dict, max_actions: int = ACTION_SPACE_SIZE) -> list[dict]:
-    """
-    Enumerate the immediate selectable choices from a PlayerInputModel node.
+def flatten_options(waiting_for: dict, max_actions: int = MAX_OPTIONS) -> list[dict]:
+    """Enumerate the immediate selectable choices from a PlayerInputModel node.
 
     Each returned dict has:
       - title: display string (parent-prefixed for expanded nested ORs)
@@ -177,13 +35,9 @@ def flatten_options(waiting_for: dict, max_actions: int = ACTION_SPACE_SIZE) -> 
                to build the nested InputResponse
       - node:  the leaf node for this choice (for card/desc extraction)
 
-    Nested OR options whose children are all leaf 'option' types are expanded
-    inline so the LLM picks the specific sub-choice directly. Without this
-    expansion the heuristic `_default_response` auto-fills the sub-decision
-    (e.g. it would pick the first/last award for a "Fund an award" OR even
-    though the AI's reasoning was about a different one). Common cases:
-      • "Fund an award (X M€)" → "Benefactor", "Desert Settler", ...
-      • "Standard projects"    → "Power Plant:SP", "Asteroid:SP", ...
+    Nested OR options whose children are all leaf 'option' types are expanded inline so
+    the LLM picks the specific sub-choice directly (e.g. a specific award under "Fund an
+    award", a specific standard project under "Standard projects").
     """
     node_type = waiting_for.get("type", "")
     options: list[dict] = []
@@ -198,14 +52,6 @@ def flatten_options(waiting_for: dict, max_actions: int = ACTION_SPACE_SIZE) -> 
         for i, opt in enumerate(waiting_for.get("options", [])):
             if len(options) >= max_actions:
                 break
-
-            # Expand a nested OR-of-leaf-options inline so the LLM sees each
-            # sub-choice individually rather than having one auto-picked by the
-            # heuristic in _default_response. Only safe when every sub-option
-            # is a bare "option" leaf — deeper nesting falls through to the
-            # default behaviour (let `_default_response` pick a placeholder
-            # for the sub-decision; downstream waitingFors will let the LLM
-            # refine the rest of the choice).
             child_opts = opt.get("options") or []
             if (
                 opt.get("type") == "or"
@@ -225,7 +71,6 @@ def flatten_options(waiting_for: dict, max_actions: int = ACTION_SPACE_SIZE) -> 
     elif node_type == "card":
         cards = waiting_for.get("cards", [])
         if not cards or waiting_for.get("max", 1) == 0:
-            # No selection possible (empty list or max=0 notification like "You cannot afford any cards")
             _emit(waiting_for.get("title", "OK") or "OK", [0], {})
         else:
             for i, card in enumerate(cards):
@@ -282,31 +127,16 @@ def flatten_options(waiting_for: dict, max_actions: int = ACTION_SPACE_SIZE) -> 
             _emit(str(res), [i], {"resourceType": res})
 
     else:
-        # Leaf node (option, payment, etc.) — single choice
         _emit(_node_title(waiting_for, 0), [0], waiting_for)
 
     return options
 
 
-def build_mask(num_valid: int, max_size: int = ACTION_SPACE_SIZE) -> np.ndarray:
-    """Bool array of shape (max_size,) with first num_valid slots True."""
-    mask = np.zeros(max_size, dtype=bool)
-    mask[:min(num_valid, max_size)] = True
-    return mask
-
-
 def index_to_response(waiting_for: dict, index) -> dict:
     """Construct a valid InputResponse for choosing option at `index`.
 
-    `index` may be either:
-      • an int — picks index at the top level (single-level decision)
-      • a list[int] — a path through nested decisions; element 0 picks at
-        the top level, element 1 picks inside the chosen sub-OR, etc.
-        Used when `flatten_options` expanded a nested OR-of-leaf-options so
-        the LLM could directly pick the specific sub-choice (e.g. a specific
-        award instead of the generic "Fund an award" OR).
+    `index` may be an int (top-level pick) or a list[int] path through nested decisions.
     """
-    # Normalise to a path. A bare int is treated as a one-element path.
     if isinstance(index, (list, tuple)):
         path = list(index)
     else:
@@ -319,10 +149,7 @@ def index_to_response(waiting_for: dict, index) -> dict:
     if node_type == "or":
         options = waiting_for.get("options", [])
         chosen = options[head] if head < len(options) else {}
-        if rest:
-            sub_response = index_to_response(chosen, rest)
-        else:
-            sub_response = _default_response(chosen)
+        sub_response = index_to_response(chosen, rest) if rest else _default_response(chosen)
         return {"type": "or", "index": head, "response": sub_response}
 
     elif node_type == "initialCards":
@@ -339,7 +166,6 @@ def index_to_response(waiting_for: dict, index) -> dict:
             return {"type": "card", "cards": []}
         min_count = max(waiting_for.get("min", 1), 1)
         n = len(cards)
-        # Pick min_count cards starting at head, wrapping around
         selected = [cards[(head + i) % n].get("name", "") for i in range(min(min_count, n))]
         return {"type": "card", "cards": selected}
 
@@ -347,7 +173,7 @@ def index_to_response(waiting_for: dict, index) -> dict:
         cards = waiting_for.get("cards", [])
         chosen = cards[head] if head < len(cards) else {}
         cost = chosen.get("calculatedCost", 0)
-        return {"type": "projectCard", "card": chosen.get("name", ""), "payment": _mc_payment(cost)}
+        return {"type": "projectCard", "card": chosen.get("name", ""), "payment": mc_payment(cost)}
 
     elif node_type == "space":
         spaces = waiting_for.get("spaces", [])
@@ -383,72 +209,6 @@ def index_to_response(waiting_for: dict, index) -> dict:
         return _default_response(waiting_for)
 
 
-def response_to_index(waiting_for: dict, input_response: dict) -> int | None:
-    """Extract chosen option index from an input_response (used in training)."""
-    node_type = waiting_for.get("type", "")
-    resp_type = input_response.get("type", "")
-
-    if node_type == "or" and resp_type == "or":
-        return input_response.get("index")
-
-    elif node_type == "card" and resp_type == "card":
-        chosen = input_response.get("cards", [])
-        if not chosen:
-            return None
-        name = chosen[0]
-        for i, card in enumerate(waiting_for.get("cards", [])):
-            if card.get("name") == name:
-                return i
-
-    elif node_type == "projectCard" and resp_type == "projectCard":
-        name = input_response.get("card", "")
-        for i, card in enumerate(waiting_for.get("cards", [])):
-            if card.get("name") == name:
-                return i
-
-    elif node_type == "space" and resp_type == "space":
-        space_id = input_response.get("spaceId", "")
-        spaces = waiting_for.get("spaces", [])
-        if space_id in spaces:
-            return spaces.index(space_id)
-
-    elif node_type == "amount" and resp_type == "amount":
-        return max(0, input_response.get("amount", 0) - waiting_for.get("min", 0))
-
-    elif node_type == "player" and resp_type == "player":
-        color = input_response.get("player", "")
-        players = waiting_for.get("players", [])
-        if color in players:
-            return players.index(color)
-
-    elif node_type in ("option", "payment") and resp_type == node_type:
-        return 0
-
-    elif node_type == "colony" and resp_type == "colony":
-        name = input_response.get("colonyName", "")
-        for i, c in enumerate(waiting_for.get("coloniesModel", [])):
-            if c.get("name") == name:
-                return i
-
-    elif node_type == "delegate" and resp_type == "delegate":
-        color = input_response.get("player", "")
-        players = waiting_for.get("players", [])
-        if color in players:
-            return players.index(color)
-
-    elif node_type == "party" and resp_type == "party":
-        name = input_response.get("partyName", "")
-        parties = waiting_for.get("parties", [])
-        if name in parties:
-            return parties.index(name)
-
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def _node_title(node: dict, fallback: int) -> str:
     title = node.get("title", "")
     if isinstance(title, str) and title:
@@ -457,18 +217,21 @@ def _node_title(node: dict, fallback: int) -> str:
         msg = title.get("message", f"Option {fallback}")
         data = title.get("data")
         if data and isinstance(data, list):
-            import re
             def _sub(m: re.Match) -> str:
                 idx = int(m.group(1))
                 entry = data[idx] if idx < len(data) else None
                 return str(entry.get("value", m.group(0))) if isinstance(entry, dict) else m.group(0)
-            msg = re.sub(r'\$\{(\d+)\}', _sub, msg)
+            msg = re.sub(r"\$\{(\d+)\}", _sub, msg)
         return msg
     return f"Option {fallback}"
 
 
 def _default_response(node: dict) -> dict:
-    """Heuristic: return the first/minimum valid response for any node type."""
+    """Heuristic: return the first/minimum valid response for any node type.
+
+    For OR nodes, prefer the LAST bare-option sub-option (conventionally Pass) to mirror
+    TM's own aiFallbackResponse — picking option 0 historically produced junk moves.
+    """
     t = node.get("type", "option")
 
     if t == "option":
@@ -477,13 +240,9 @@ def _default_response(node: dict) -> dict:
         opts = node.get("options", [])
         if not opts:
             return {"type": "or", "index": 0, "response": {"type": "option"}}
-        # Match TM's aiFallbackResponse: prefer the LAST option-type sub-option
-        # (conventionally Pass). Picking option 0 historically caused garbage
-        # moves like "play first project card" that TM then rejects.
         for i in range(len(opts) - 1, -1, -1):
             if opts[i].get("type") == "option":
                 return {"type": "or", "index": i, "response": {"type": "option"}}
-        # No bare option found — fall back to the first sub-option's default.
         return {"type": "or", "index": 0, "response": _default_response(opts[0])}
     elif t == "initialCards":
         opts = node.get("options", [])
@@ -498,7 +257,7 @@ def _default_response(node: dict) -> dict:
         cards = node.get("cards", [])
         if cards:
             c = cards[0]
-            return {"type": "projectCard", "card": c.get("name", ""), "payment": _mc_payment(c.get("calculatedCost", 0))}
+            return {"type": "projectCard", "card": c.get("name", ""), "payment": mc_payment(c.get("calculatedCost", 0))}
         return {"type": "option"}
     elif t == "space":
         spaces = node.get("spaces", [])
@@ -506,7 +265,7 @@ def _default_response(node: dict) -> dict:
     elif t == "amount":
         return {"type": "amount", "amount": node.get("min", 0)}
     elif t == "payment":
-        return {"type": "payment", "payment": _mc_payment(node.get("amount", 0))}
+        return {"type": "payment", "payment": mc_payment(node.get("amount", 0))}
     elif t == "player":
         players = node.get("players", [])
         return {"type": "player", "player": players[0] if players else ""}
@@ -531,7 +290,8 @@ def _default_response(node: dict) -> dict:
         return {"type": t}
 
 
-def _mc_payment(amount: int) -> dict:
+def mc_payment(amount: int) -> dict:
+    """A megacredits-only payment dict covering `amount`."""
     return {
         "megacredits": max(0, amount),
         "steel": 0, "titanium": 0, "heat": 0, "plants": 0,
