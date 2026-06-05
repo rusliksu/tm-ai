@@ -206,6 +206,7 @@ written to `/tmp/current-game.url` (the death-match script tries to open it).
 |-----|---------|-------------|
 | `OPENROUTER_API_KEY` | — | Required for all model calls |
 | `OPENROUTER_MODEL` | `anthropic/claude-opus-4-7` | Default model (per-player override via `/player/register`) |
+| `OPENROUTER_THINKING` | `auto` | Global reasoning override: `auto` (per-model table), `off` (force off — faster), `on` (force on) |
 | `OPENROUTER_THINKING_BUDGET` | `1024` | Thinking tokens for setup / per-gen reflection |
 | `OPENROUTER_ACTION_THINKING_BUDGET` | `512` | Thinking tokens for action turns |
 | `OPENROUTER_MAX_OUTPUT_TOKENS` | `4096` | Max output per action (must exceed thinking budget) |

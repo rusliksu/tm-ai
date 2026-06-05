@@ -53,21 +53,32 @@ _KNOWN_CAPABILITIES: dict[str, dict] = {
 _capabilities: dict[str, dict] = {}
 
 
-def get_capabilities(model: str) -> dict:
-    """Return {caching, thinking} for a model. Unknown models default to caching for
-    anthropic/ models and thinking enabled (disabled later if the provider rejects it)."""
-    if model in _capabilities:
-        return _capabilities[model]
+def _base_capabilities(model: str) -> dict:
+    """Raw {caching, thinking} from the static table. Unknown models default to caching
+    for anthropic/ models and thinking enabled (disabled later if the provider rejects it)."""
     if model in _KNOWN_CAPABILITIES:
-        _capabilities[model] = dict(_KNOWN_CAPABILITIES[model])
-        return _capabilities[model]
+        return dict(_KNOWN_CAPABILITIES[model])
     for key, caps in _KNOWN_CAPABILITIES.items():
         if model.startswith(key) or key.startswith(model):
-            _capabilities[model] = dict(caps)
-            return _capabilities[model]
+            return dict(caps)
     caps = {"caching": model.startswith("anthropic/"), "thinking": True}
-    _capabilities[model] = caps
     logger.info("Unknown model %s — using default capabilities %s", model, caps)
+    return caps
+
+
+def get_capabilities(model: str) -> dict:
+    """Return {caching, thinking} for a model, applying the global OPENROUTER_THINKING
+    override ("on"/"off") once at cache-build time. The cached dict is also what the
+    on-error path mutates to disable a capability the provider rejected, so subsequent
+    calls keep that disable."""
+    if model in _capabilities:
+        return _capabilities[model]
+    caps = _base_capabilities(model)
+    if config.OPENROUTER_THINKING == "off":
+        caps["thinking"] = False
+    elif config.OPENROUTER_THINKING == "on":
+        caps["thinking"] = True
+    _capabilities[model] = caps
     return caps
 
 

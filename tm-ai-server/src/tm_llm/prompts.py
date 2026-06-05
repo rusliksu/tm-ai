@@ -17,7 +17,7 @@ import re
 from .knowledge import CARD_DB, format_card_context, format_config_context, format_board_layout
 from .options import _default_response, index_to_response
 from .payment import (
-    parse_payment_line, correct_payment, auto_payment_for_card,
+    parse_payment_line, correct_payment, auto_payment_for_card, label_prefix, _EMPH,
 )
 from . import board as board_mod
 
@@ -599,8 +599,17 @@ def _format_payment_section(waiting_for: dict, player: dict) -> list[str]:
 # Action response parsing
 # ---------------------------------------------------------------------------
 
+def find_choice(text: str) -> int | None:
+    """The 1-based option number from a `CHOICE: N` line, tolerating markdown emphasis
+    (e.g. `**CHOICE:** 1`), or None if absent. Case-sensitive on the label so prose like
+    "my choice: ..." in the reasoning body is not mistaken for the answer."""
+    m = re.search(label_prefix("CHOICE") + r"(\d+)", text)
+    return int(m.group(1)) if m else None
+
+
 def capture_tactical(text: str) -> str | None:
-    m = re.search(r"TACTICAL:\s*(.*?)(?=\n\s*CHOICE:|\n\s*PAYMENT:|\Z)", text, re.IGNORECASE | re.DOTALL)
+    m = re.search(label_prefix("TACTICAL") + r"(.*?)(?=\n\s*" + _EMPH + r"CHOICE|\n\s*" + _EMPH + r"PAYMENT|\Z)",
+                  text, re.IGNORECASE | re.DOTALL)
     if m:
         tactical = m.group(1).strip()
         return tactical or None
@@ -609,10 +618,10 @@ def capture_tactical(text: str) -> str | None:
 
 def parse_action_response(text: str, options: list[dict], waiting_for: dict, player_id: str,
                           player: dict | None = None) -> tuple[dict, dict]:
-    m = re.search(r"CHOICE:\s*(\d+)", text)
-    if not m:
+    choice = find_choice(text)
+    if choice is None:
         logger.warning("No CHOICE line (player=%s) — defaulting to option 1. Response: %.300s", player_id, text)
-    chosen = int(m.group(1)) - 1 if m else 0
+    chosen = (choice - 1) if choice is not None else 0
     chosen = max(0, min(chosen, len(options) - 1))
     option = options[chosen]
     logger.info("Action choice player=%s: %d. %s", player_id, chosen + 1, option["title"])
@@ -782,7 +791,7 @@ def parse_setup_response(text: str, waiting_for: dict, prior_strategy: str = "")
         buyable = [c.get("name", "") for c in (project_opt or {}).get("cards", [])]
 
         chosen_corp = corps[0] if corps else ""
-        m = re.search(r"CORPORATION:\s*(.+)", text)
+        m = re.search(label_prefix("CORPORATION") + r"(.+)", text)
         if m:
             raw = m.group(1).strip().rstrip(".")
             for c in corps:
@@ -791,7 +800,7 @@ def parse_setup_response(text: str, waiting_for: dict, prior_strategy: str = "")
                     break
 
         bought: list[str] = []
-        m = re.search(r"BUY_CARDS:\s*(.+?)(?:\nPRELUDE|\nCEO|\nSTRATEGY|\Z)", text, re.DOTALL | re.IGNORECASE)
+        m = re.search(label_prefix("BUY_CARDS") + r"(.+?)(?:\n" + _EMPH + r"PRELUDE|\n" + _EMPH + r"CEO|\n" + _EMPH + r"STRATEGY|\Z)", text, re.DOTALL | re.IGNORECASE)
         if m and m.group(1).strip().lower() not in ("none", "none.", ""):
             for raw_name in re.split(r",\s*|\n", m.group(1).strip()):
                 raw_name = raw_name.strip().lstrip("-•").strip().rstrip(".")
@@ -805,7 +814,7 @@ def parse_setup_response(text: str, waiting_for: dict, prior_strategy: str = "")
         prelude_chosen: list[str] = []
         if prelude_opt:
             preludes = [c.get("name", "") for c in prelude_opt.get("cards", [])]
-            m2 = re.search(r"PRELUDE_CARDS:\s*(.+?)(?:\nCEO|\nSTRATEGY|\Z)", text, re.DOTALL | re.IGNORECASE)
+            m2 = re.search(label_prefix("PRELUDE_CARDS") + r"(.+?)(?:\n" + _EMPH + r"CEO|\n" + _EMPH + r"STRATEGY|\Z)", text, re.DOTALL | re.IGNORECASE)
             if m2:
                 for raw_name in re.split(r",\s*|\n", m2.group(1).strip()):
                     raw_name = raw_name.strip().rstrip(".")
@@ -819,7 +828,7 @@ def parse_setup_response(text: str, waiting_for: dict, prior_strategy: str = "")
         ceo_chosen = ""
         if ceo_opt:
             ceos = [c.get("name", "") for c in ceo_opt.get("cards", [])]
-            m3 = re.search(r"CEO_CARD:\s*(.+?)(?:\nSTRATEGY|\Z)", text, re.DOTALL | re.IGNORECASE)
+            m3 = re.search(label_prefix("CEO_CARD") + r"(.+?)(?:\n" + _EMPH + r"STRATEGY|\Z)", text, re.DOTALL | re.IGNORECASE)
             if m3 and ceos:
                 raw_ceo = m3.group(1).strip().rstrip(".")
                 for c in ceos:
@@ -829,7 +838,7 @@ def parse_setup_response(text: str, waiting_for: dict, prior_strategy: str = "")
             if not ceo_chosen and ceos:
                 ceo_chosen = ceos[0]
 
-        m4 = re.search(r"STRATEGY:\s*(.*)", text, re.DOTALL)
+        m4 = re.search(label_prefix("STRATEGY") + r"(.*)", text, re.DOTALL)
         strategy = m4.group(1).strip() if m4 else text.strip()
         logger.info("Setup parsed: corp=%r buy=%r prelude=%r ceo=%r", chosen_corp, bought, prelude_chosen, ceo_chosen)
 
@@ -849,10 +858,10 @@ def parse_setup_response(text: str, waiting_for: dict, prior_strategy: str = "")
         return {"type": "initialCards", "responses": responses}, strategy
 
     elif wf_type == "prelude":
-        m = re.search(r"CHOICE:\s*(\d+)", text)
-        idx = max(0, min((int(m.group(1)) - 1 if m else 0), len(options) - 1))
+        choice = find_choice(text)
+        idx = max(0, min((choice - 1 if choice is not None else 0), len(options) - 1))
         strategy = prior_strategy or "Play balanced."
-        m2 = re.search(r"STRATEGY_UPDATE:\s*(.*)", text, re.DOTALL)
+        m2 = re.search(label_prefix("STRATEGY_UPDATE") + r"(.*)", text, re.DOTALL)
         if m2:
             upd = m2.group(1).strip()
             if upd and not upd.lower().startswith("no change"):

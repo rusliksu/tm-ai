@@ -12,6 +12,19 @@ from .knowledge import CARD_DB
 
 logger = logging.getLogger(__name__)
 
+# Models often wrap the mandatory response labels in markdown emphasis or headings
+# (e.g. "**CHOICE:** 1", "**PAYMENT**: MC=10", "### TACTICAL:", "`CHOICE:`"). _EMPH
+# matches such markers so label regexes tolerate them; label_prefix(label) matches the
+# label plus its colon with emphasis allowed around the label and after the colon.
+# Callers append their own value capture group. Kept here (the lowest-level module) so
+# both prompts.py and payment.py can share one definition without an import cycle.
+_EMPH = r"[*_`~#]*"
+
+
+def label_prefix(label: str) -> str:
+    return rf"{label}{_EMPH}\s*:{_EMPH}[ \t]*"
+
+
 # MC value of one unit of each payable resource toward a card's cost.
 PAYMENT_VALUES = {
     "steel": 2, "titanium": 3, "heat": 1, "plants": 3,
@@ -56,7 +69,7 @@ def empty_payment() -> dict:
 
 
 def parse_payment_line(text: str) -> dict | None:
-    m = re.search(r"PAYMENT:\s*(.+?)(?:\n|$)", text, re.IGNORECASE)
+    m = re.search(label_prefix("PAYMENT") + r"(.+?)(?:\n|$)", text, re.IGNORECASE)
     if not m:
         return None
     parts = re.findall(r"([A-Z_]+)\s*=\s*(\d+)", m.group(1), re.IGNORECASE)

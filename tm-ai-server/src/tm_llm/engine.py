@@ -7,7 +7,6 @@ the prompt with an error banner if CHOICE is missing or the payment is underfund
 """
 from __future__ import annotations
 import logging
-import re
 
 from . import config, prompts, registry
 from .options import flatten_options, index_to_response, _default_response
@@ -106,7 +105,7 @@ def _select_action(state: dict, waiting_for: dict, player, last_error: str | Non
         response, debug = prompts.parse_action_response(text, options, waiting_for, player.player_id, player=p)
 
         errors: list[str] = []
-        if not re.search(r"CHOICE:\s*(\d+)", text):
+        if prompts.find_choice(text) is None:
             opts_str = "  ".join(f"{i+1}. {o['title'][:40]}" for i, o in enumerate(options))
             errors.append(
                 "Your response did not include a CHOICE: N line. End with CHOICE: N on its own "

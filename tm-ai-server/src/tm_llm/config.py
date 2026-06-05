@@ -14,6 +14,12 @@ LLM_DEBUG = os.getenv("LLM_DEBUG", "false").lower() == "true"
 # --- OpenRouter ---
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "anthropic/claude-opus-4-7")
+# Global thinking/reasoning override: "auto" honours the per-model capability table,
+# "off" forces reasoning off for every model (fast — no hidden reasoning tokens that
+# dominate latency), "on" forces it on. Anything else is treated as "auto".
+OPENROUTER_THINKING = os.getenv("OPENROUTER_THINKING", "auto").strip().lower()
+if OPENROUTER_THINKING not in ("auto", "on", "off"):
+    OPENROUTER_THINKING = "auto"
 # Thinking budget for setup / per-generation reflection (deeper reasoning).
 OPENROUTER_THINKING_BUDGET = int(os.getenv("OPENROUTER_THINKING_BUDGET", "1024"))
 # Thinking budget for tactical action turns (smaller = faster for reasoning models).

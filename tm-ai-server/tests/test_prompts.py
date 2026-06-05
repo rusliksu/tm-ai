@@ -1,7 +1,7 @@
 """Tests for response parsing, payment validation, and single-sourced data in tm_llm."""
 from tm_llm.options import flatten_options
 from tm_llm.prompts import (
-    capture_tactical, parse_action_response, standard_project_cost,
+    capture_tactical, parse_action_response, standard_project_cost, find_choice,
     STANDARD_PROJECT_COSTS,
 )
 from tm_llm.payment import check_payment_valid, parse_payment_line
@@ -56,6 +56,45 @@ def test_check_payment_sufficient():
     player = {"megacredits": 12}
     err = check_payment_valid({"card": "UnknownCard", "payment": {"megacredits": 12}}, [], wf, player)
     assert err is None
+
+
+def test_find_choice_plain():
+    assert find_choice("blah\nCHOICE: 3\n") == 3
+
+
+def test_find_choice_markdown_variants():
+    # Models often wrap the label in markdown emphasis or headings; all must still parse.
+    assert find_choice("**CHOICE:** 1") == 1
+    assert find_choice("**CHOICE**: 2") == 2
+    assert find_choice("### CHOICE: 3") == 3
+    assert find_choice("`CHOICE:` 4") == 4
+    assert find_choice("- CHOICE:5") == 5
+
+
+def test_find_choice_absent():
+    assert find_choice("no decision here") is None
+
+
+def test_parse_action_markdown_choice():
+    wf = {"type": "or", "options": [
+        {"type": "option", "title": "Play card"},
+        {"type": "option", "title": "Pass"},
+    ]}
+    options = flatten_options(wf)
+    text = "Reasoning.\n**TACTICAL:** hold the line\n**CHOICE:** 2"
+    response, debug = parse_action_response(text, options, wf, "p1")
+    assert response == {"type": "or", "index": 1, "response": {"type": "option"}}
+    assert debug["llm_choice"] == 2
+
+
+def test_capture_tactical_markdown():
+    text = "Reasoning.\n**TACTICAL:** convert heat, then pass\n**CHOICE:** 2"
+    assert capture_tactical(text) == "convert heat, then pass"
+
+
+def test_payment_line_markdown():
+    p = parse_payment_line("**PAYMENT:** MC=5, STEEL=3")
+    assert p["megacredits"] == 5 and p["steel"] == 3
 
 
 def test_standard_project_cost_single_sourced():
