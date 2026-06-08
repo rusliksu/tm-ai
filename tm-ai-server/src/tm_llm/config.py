@@ -14,6 +14,11 @@ LLM_DEBUG = os.getenv("LLM_DEBUG", "false").lower() == "true"
 # --- OpenRouter ---
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "anthropic/claude-opus-4-7")
+# Pin OpenRouter to a specific upstream provider (comma-separated for an ordered preference,
+# e.g. "Cloudflare" or "Cloudflare,DeepSeek"). Empty = let OpenRouter pick by throughput.
+# Pinning keeps prompt caching warm (a provider switch resets the cache) and avoids routing to
+# a slow provider — both seen floating between SiliconFlow/Alibaba for deepseek.
+OPENROUTER_PROVIDER = os.getenv("OPENROUTER_PROVIDER", "").strip()
 # Global thinking/reasoning override: "auto" honours the per-model capability table,
 # "off" forces reasoning off for every model (fast — no hidden reasoning tokens that
 # dominate latency), "on" forces it on. Anything else is treated as "auto".

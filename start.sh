@@ -5,6 +5,8 @@
 #   ./start.sh                                      # default: deepseek/deepseek-v4-flash
 #   OPENROUTER_MODEL=anthropic/claude-sonnet-4-6 ./start.sh
 #   OPENROUTER_THINKING=off ./start.sh              # disable model reasoning (faster); auto|on|off
+#   OPENROUTER_PROVIDER=Cloudflare ./start.sh       # pin upstream provider (comma-sep order ok)
+#                                                   # defaults to Cloudflare for deepseek models
 #   LLM_DEBUG=false ./start.sh
 #   TM_AI_DIR=/path TM_DIR=/path ./start.sh
 #
@@ -102,12 +104,20 @@ done
 
 : > "${PID_FILE}"
 
+# Pin one OpenRouter provider so prompt caching stays warm and a slow/changing provider isn't
+# chosen. Default Cloudflare for deepseek models; honour an explicit OPENROUTER_PROVIDER otherwise.
+EFFECTIVE_MODEL="${OPENROUTER_MODEL:-deepseek/deepseek-v4-flash}"
+if [[ -z "${OPENROUTER_PROVIDER:-}" && "${EFFECTIVE_MODEL}" == deepseek/* ]]; then
+  OPENROUTER_PROVIDER="Cloudflare"
+fi
+
 # --- AI server ----------------------------------------------------------------
-echo "▶ starting AI server (OpenRouter, single model, log: ${AI_LOG})"
+echo "▶ starting AI server (OpenRouter, model: ${EFFECTIVE_MODEL}, provider: ${OPENROUTER_PROVIDER:-auto}, log: ${AI_LOG})"
 (
   cd "${TM_AI_DIR}/tm-ai-server"
   # OPENROUTER_API_KEY is already exported via `set -a; source .env` above.
-  OPENROUTER_MODEL="${OPENROUTER_MODEL:-deepseek/deepseek-v4-flash}" \
+  OPENROUTER_MODEL="${EFFECTIVE_MODEL}" \
+  OPENROUTER_PROVIDER="${OPENROUTER_PROVIDER:-}" \
   OPENROUTER_THINKING="${OPENROUTER_THINKING:-off}" \
   OPENROUTER_MAX_OUTPUT_TOKENS="${OPENROUTER_MAX_OUTPUT_TOKENS:-4096}" \
   LLM_DEBUG="${LLM_DEBUG:-true}" \

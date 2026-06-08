@@ -270,6 +270,22 @@ def _system_message(model: str, system: str) -> dict:
 # Main entry point
 # ---------------------------------------------------------------------------
 
+def _provider_routing(model: str) -> dict | None:
+    """OpenRouter `provider` routing block for a request, or None to let OpenRouter decide.
+
+    An explicit OPENROUTER_PROVIDER pins one provider with NO fallback so prompt caching stays
+    warm and a slow/changing provider can't be chosen — OpenRouter was otherwise floating deepseek
+    between SiliconFlow/Alibaba, resetting the cache on each switch. Without a pin, open models are
+    sorted by throughput (Anthropic/OpenAI already resolve to a single host)."""
+    if config.OPENROUTER_PROVIDER:
+        order = [pp.strip() for pp in config.OPENROUTER_PROVIDER.split(",") if pp.strip()]
+        if order:
+            return {"order": order, "allow_fallbacks": False, "require_parameters": True}
+    if not model.startswith(("anthropic/", "openai/")):
+        return {"sort": "throughput", "require_parameters": True}
+    return None
+
+
 def single_shot(model: str, system: str, user: str, *, think: bool = True,
                 thinking_budget: int | None = None,
                 max_output_tokens: int | None = None) -> tuple[str, dict]:
@@ -303,10 +319,9 @@ def single_shot(model: str, system: str, user: str, *, think: bool = True,
             existing + ",prompt-caching-2024-07-31" if existing else "prompt-caching-2024-07-31"
         )
 
-    # Non-Anthropic/OpenAI: pin highest-throughput provider so sticky routing enables
-    # the provider's automatic prompt caching (a new provider each call = zero cache hits).
-    if not model.startswith(("anthropic/", "openai/")):
-        extra_body["provider"] = {"sort": "throughput", "require_parameters": True}
+    routing = _provider_routing(model)
+    if routing:
+        extra_body["provider"] = routing
 
     if extra_headers:
         kwargs["extra_headers"] = extra_headers

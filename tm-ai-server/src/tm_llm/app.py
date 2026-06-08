@@ -37,7 +37,8 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     if config.OPENROUTER_API_KEY:
         ensure_client()
-        logger.info("OpenRouter client ready (default model: %s)", config.OPENROUTER_MODEL)
+        logger.info("OpenRouter client ready (default model: %s, provider: %s)",
+                    config.OPENROUTER_MODEL, config.OPENROUTER_PROVIDER or "auto (throughput)")
     else:
         logger.warning("OPENROUTER_API_KEY is not set — /move calls will fail")
     registry.prune_stale_state()

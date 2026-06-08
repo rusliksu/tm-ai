@@ -37,3 +37,31 @@ def test_thinking_override_leaves_caching_untouched():
     config.OPENROUTER_THINKING = "off"
     caps = openrouter.get_capabilities("anthropic/claude-sonnet-4-6")
     assert caps["thinking"] is False and caps["caching"] is True
+
+
+def test_provider_routing_pins_explicit_provider():
+    """OPENROUTER_PROVIDER pins one provider with no fallback (warm cache, no slow drift)."""
+    saved = config.OPENROUTER_PROVIDER
+    try:
+        config.OPENROUTER_PROVIDER = "Cloudflare"
+        r = openrouter._provider_routing("deepseek/deepseek-v4-flash")
+        assert r == {"order": ["Cloudflare"], "allow_fallbacks": False, "require_parameters": True}
+        # comma-separated → ordered preference; applies regardless of model vendor
+        config.OPENROUTER_PROVIDER = "Cloudflare, DeepSeek"
+        r = openrouter._provider_routing("anthropic/claude-opus-4-7")
+        assert r["order"] == ["Cloudflare", "DeepSeek"] and r["allow_fallbacks"] is False
+    finally:
+        config.OPENROUTER_PROVIDER = saved
+
+
+def test_provider_routing_default_throughput_for_open_models():
+    saved = config.OPENROUTER_PROVIDER
+    try:
+        config.OPENROUTER_PROVIDER = ""
+        assert openrouter._provider_routing("deepseek/deepseek-v4-flash") == {
+            "sort": "throughput", "require_parameters": True}
+        # Anthropic/OpenAI resolve to a single host already → no provider block
+        assert openrouter._provider_routing("anthropic/claude-opus-4-7") is None
+        assert openrouter._provider_routing("openai/gpt-4o-mini") is None
+    finally:
+        config.OPENROUTER_PROVIDER = saved
