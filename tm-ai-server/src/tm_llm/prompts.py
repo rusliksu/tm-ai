@@ -541,12 +541,15 @@ def build_action_prompt(state: dict, waiting_for: dict, options: list[dict], *,
     # Tableau (names + per-card resources; effects are passive and in the hand glossary)
     played = p.get("playedCards") or []
     corps = p.get("corporations") or []
-    if played or corps:
+    if played:
+        # Describe your own played cards (effects/tags/VP + resources stored on them) — you need
+        # to know your blue-card actions and passive effects, not just their names.
         corp_str = f"  [corp: {', '.join(corps)}]" if corps else ""
-        lines += ["", f"Your tableau ({len(played)} in play): {', '.join(played[:60]) or '(none)'}{corp_str}"]
-        card_res = p.get("cardResources") or {}
-        if card_res:
-            lines.append("  Card resources: " + ", ".join(f"{n}={v}" for n, v in card_res.items()))
+        tableau = format_card_context(
+            played, header=f"Your tableau ({len(played)} in play){corp_str}:",
+            max_cards=60, resources=p.get("cardResources"))
+        if tableau:
+            lines += ["", tableau]
 
     # Hand — compact (1 line/card via knowledge.format_card_context)
     hand_cards = p.get("cardsInHand") or []
