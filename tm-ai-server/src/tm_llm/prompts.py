@@ -539,9 +539,12 @@ def build_action_prompt(state: dict, waiting_for: dict, options: list[dict], *,
         lines.append(f"{nm}: TR:{opp.get('terraformRating', 20)}{vp}  MC:{opp.get('megacredits', 0)}{hs}{corp_str}  prod:{opp_prod}  tags:{opp_tags}")
         played = opp.get("playedCards") or []
         if played:
-            # Describe each played card (effect/tags/VP) so the model can read the opponent's
-            # engine and award/milestone threats — a bare name list is unreadable for strategy.
-            lines.append(format_card_context(played, header=f"  {nm}'s tableau ({len(played)} cards):", max_cards=40))
+            # Describe each played card (effect/tags/VP) plus resources stored on it, so the model
+            # can read the opponent's engine and award/milestone threats — a bare name list is
+            # unreadable for strategy.
+            lines.append(format_card_context(
+                played, header=f"  {nm}'s tableau ({len(played)} cards):",
+                max_cards=40, resources=opp.get("cardResources")))
 
     lines.extend(compute_milestone_status(state))
 

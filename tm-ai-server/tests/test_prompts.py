@@ -202,6 +202,19 @@ def test_card_brief(monkeypatch):
     assert knowledge.card_brief("Nonexistent Card XYZ") == ""
 
 
+def test_card_context_shows_stored_resources(monkeypatch):
+    monkeypatch.setitem(knowledge.CARD_DB, "Regolith Eaters",
+                        {"cost": 13, "tags": ["science", "microbe"], "description": "Store microbes."})
+    out = knowledge.format_card_context(
+        ["Regolith Eaters", "Unknown Animal Card"],
+        resources={"Regolith Eaters": 4, "Unknown Animal Card": 2})
+    assert "{4 on card}" in out          # known card annotated
+    assert "{2 on card}" in out          # annotated even when card is not in CARD_DB
+    # a card with no stored resources gets no marker
+    out2 = knowledge.format_card_context(["Regolith Eaters"], resources={})
+    assert "on card" not in out2
+
+
 def test_sanitize_strategy_strips_turn_artefacts():
     raw = (
         "----- PRIOR STRATEGY -----\n"

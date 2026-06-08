@@ -62,8 +62,14 @@ def card_brief(name: str) -> str:
     return body
 
 
-def format_card_context(card_names: list, header: str = "", max_cards: int = 30) -> str:
-    """Return a compact one-line-per-card block for the listed cards (from CARD_DB)."""
+def format_card_context(card_names: list, header: str = "", max_cards: int = 30,
+                        resources: dict | None = None) -> str:
+    """Return a compact one-line-per-card block for the listed cards (from CARD_DB).
+
+    `resources` maps card name → count of resources currently stored on it (microbes, animals,
+    floaters, …). When present it is appended as ' {N on card}' so the model sees accumulated
+    resources — these often drive a card's VP and are otherwise invisible."""
+    res = resources or {}
     lines = []
     shown = 0
     for name in card_names:
@@ -71,9 +77,11 @@ def format_card_context(card_names: list, header: str = "", max_cards: int = 30)
         if shown >= max_cards:
             lines.append(f"  … and {len(card_names) - max_cards} more cards")
             break
+        rcount = res.get(name)
+        res_str = f"  {{{rcount} on card}}" if rcount else ""
         entry = CARD_DB.get(name)
         if not entry:
-            lines.append(f"  {name}")
+            lines.append(f"  {name}{res_str}")
             shown += 1
             continue
         cost = entry.get("cost")
@@ -82,7 +90,7 @@ def format_card_context(card_names: list, header: str = "", max_cards: int = 30)
         tag_str = f" [{', '.join(tags)}]" if tags else ""
         desc = _trim_desc(entry.get("description", ""))
         vp = _vp_str(entry.get("victoryPoints"))
-        lines.append(f"  {name} ({cost_str}{tag_str}): {desc}{vp}")
+        lines.append(f"  {name} ({cost_str}{tag_str}): {desc}{vp}{res_str}")
         shown += 1
     if not lines:
         return ""
