@@ -1,7 +1,7 @@
 """Tests for response parsing, payment validation, and single-sourced data in tm_llm."""
 from tm_llm.options import flatten_options
 from tm_llm.prompts import (
-    capture_tactical, parse_action_response, standard_project_cost, find_choice,
+    capture_tactical, parse_action_response, standard_project_cost, find_choice, find_choices,
     STANDARD_PROJECT_COSTS, sanitize_strategy, game_end_proximity,
 )
 from tm_llm.payment import check_payment_valid, parse_payment_line
@@ -101,6 +101,47 @@ def test_standard_project_cost_single_sourced():
     assert standard_project_cost("City:SP") == STANDARD_PROJECT_COSTS["city:sp"]
     assert standard_project_cost("Standard projects: Asteroid:SP".split(":", 1)[1].strip()) == 14
     assert standard_project_cost("Sell patents") is None
+
+
+def test_find_choices_multi():
+    assert find_choices("CHOICE: 2,3") == [2, 3]
+    assert find_choices("**CHOICE:** 1 and 4") == [1, 4]
+    assert find_choices("CHOICE: 2") == [2]
+    assert find_choices("CHOICE: 1, 3, 4") == [1, 3, 4]
+    # prose after the answer must NOT be swept in (the hex number stays out)
+    assert find_choices("CHOICE: 2 and place an ocean on hex-61") == [2]
+    assert find_choices("no choice here") == []
+    # find_choice keeps returning the first number for single-select callers
+    assert find_choice("CHOICE: 2,3") == 2
+
+
+def test_parse_action_multi_card_buy():
+    # Regression: 'CHOICE: 2,3' on a multi-select card decision must buy BOTH cards, not just
+    # the first (the research-phase 'Select card(s) to buy' bug).
+    wf = {"type": "card", "title": "Select card(s) to buy", "min": 0, "max": 4,
+          "cards": [{"name": "Imported GHG"}, {"name": "Water to Venus"},
+                    {"name": "Bribed Committee"}, {"name": "Stratopolis"}]}
+    options = flatten_options(wf)
+    text = "Buy both for TR.\nTACTICAL: play them.\nCHOICE: 2,3"
+    resp, _dbg = parse_action_response(text, options, wf, "pX", player={})
+    assert resp == {"type": "card", "cards": ["Water to Venus", "Bribed Committee"]}
+
+
+def test_parse_action_card_take_none():
+    wf = {"type": "card", "title": "Select card(s) to buy", "min": 0, "max": 4,
+          "cards": [{"name": "A"}, {"name": "B"}]}
+    options = flatten_options(wf)
+    resp, _dbg = parse_action_response("Too expensive, skip.\nCHOICE: none", options, wf, "pX", player={})
+    assert resp == {"type": "card", "cards": []}
+
+
+def test_parse_action_single_card_keep_unchanged():
+    # A max=1 'keep one' draft decision still resolves to exactly the chosen card.
+    wf = {"type": "card", "title": "Select a card to keep", "min": 1, "max": 1,
+          "cards": [{"name": "A"}, {"name": "B"}]}
+    options = flatten_options(wf)
+    resp, _dbg = parse_action_response("Keep B.\nCHOICE: 2", options, wf, "pX", player={})
+    assert resp == {"type": "card", "cards": ["B"]}
 
 
 def test_sanitize_strategy_strips_turn_artefacts():

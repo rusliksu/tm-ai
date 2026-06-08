@@ -574,6 +574,16 @@ def build_action_prompt(state: dict, waiting_for: dict, options: list[dict], *,
         else:
             lines.append(f"  {idx}. {title2[:70]}{cost_tag}")
 
+    if wf_type == "card":
+        cmax = waiting_for.get("max", 1) or 1
+        cmin = waiting_for.get("min", 0)
+        if cmax > 1:
+            none_hint = " — or CHOICE: none to take none" if cmin <= 0 else ""
+            lines.append(
+                f"(You may pick up to {cmax}: list EVERY chosen number on the CHOICE line, "
+                f"e.g. CHOICE: 1,3{none_hint}.)"
+            )
+
     if wf_type in ("projectCard", "payment"):
         lines += _format_payment_section(waiting_for, p)
 
@@ -606,12 +616,37 @@ def _format_payment_section(waiting_for: dict, player: dict) -> list[str]:
 # Action response parsing
 # ---------------------------------------------------------------------------
 
+# Matches the CHOICE line's value: one number, or a list joined by commas / 'and' / '&' / '+'
+# / '/'. The list only extends while each separator is followed by another number, so prose
+# after the answer (e.g. "CHOICE: 2 and place an ocean on hex-61") is NOT swept in.
+_CHOICE_LIST = re.compile(
+    label_prefix("CHOICE") + r"(\d+(?:\s*(?:,|and|&|\+|/)\s*\d+)*)",
+    re.IGNORECASE,
+)
+
+
+def find_choices(text: str) -> list[int]:
+    """All 1-based option numbers on the `CHOICE:` line, in order, de-duplicated.
+
+    Multi-select decisions (research-phase 'buy card(s)', 'keep N cards') let the model pick
+    several, e.g. `CHOICE: 2,3` → [2, 3]. Single decisions just yield one element."""
+    m = _CHOICE_LIST.search(text)
+    if not m:
+        return []
+    out: list[int] = []
+    for n in re.findall(r"\d+", m.group(1)):
+        v = int(n)
+        if v not in out:
+            out.append(v)
+    return out
+
+
 def find_choice(text: str) -> int | None:
-    """The 1-based option number from a `CHOICE: N` line, tolerating markdown emphasis
+    """The first 1-based option number from a `CHOICE: N` line, tolerating markdown emphasis
     (e.g. `**CHOICE:** 1`), or None if absent. Case-sensitive on the label so prose like
     "my choice: ..." in the reasoning body is not mistaken for the answer."""
-    m = re.search(label_prefix("CHOICE") + r"(\d+)", text)
-    return int(m.group(1)) if m else None
+    choices = find_choices(text)
+    return choices[0] if choices else None
 
 
 def capture_tactical(text: str) -> str | None:
@@ -647,17 +682,44 @@ def sanitize_strategy(text: str) -> str:
 
 def parse_action_response(text: str, options: list[dict], waiting_for: dict, player_id: str,
                           player: dict | None = None) -> tuple[dict, dict]:
-    choice = find_choice(text)
-    if choice is None:
+    wf_type = waiting_for.get("type", "")
+    p = player or {}
+
+    choices = find_choices(text)
+    if not choices:
         logger.warning("No CHOICE line (player=%s) — defaulting to option 1. Response: %.300s", player_id, text)
+    choice = choices[0] if choices else None
     chosen = (choice - 1) if choice is not None else 0
     chosen = max(0, min(chosen, len(options) - 1))
     option = options[chosen]
+
+    # Card decisions can be multi-select (research-phase 'buy card(s)', 'keep N cards') or allow
+    # selecting nothing (min 0). The model expresses these as 'CHOICE: 2,3' or 'CHOICE: none'.
+    if wf_type == "card":
+        cmax = waiting_for.get("max", 1) or 1
+        cmin = waiting_for.get("min", 0)
+        positive = [c for c in choices if c > 0]
+        wants_none = (cmin <= 0 and not positive
+                      and re.search(label_prefix("CHOICE") + r"(?:0\b|none)", text, re.IGNORECASE))
+        if wants_none:
+            logger.info("Action card player=%s: take none", player_id)
+            return {"type": "card", "cards": []}, {"llm_choice": "none", "llm_option": "(none)"}
+        if cmax > 1 and len(positive) > 1:
+            picked: list[str] = []
+            for c in positive:
+                idx = c - 1
+                if 0 <= idx < len(options):
+                    nm = (options[idx].get("node") or {}).get("name", "")
+                    if nm and nm not in picked:
+                        picked.append(nm)
+            picked = picked[:cmax]
+            if picked:
+                logger.info("Action multi-card player=%s: %s", player_id, picked)
+                return ({"type": "card", "cards": picked},
+                        {"llm_choice": ",".join(map(str, positive)), "llm_option": ", ".join(picked)})
+
     logger.info("Action choice player=%s: %d. %s", player_id, chosen + 1, option["title"])
     response = index_to_response(waiting_for, option["path"])
-
-    wf_type = waiting_for.get("type", "")
-    p = player or {}
 
     if wf_type in ("projectCard", "payment"):
         payment = parse_payment_line(text)
