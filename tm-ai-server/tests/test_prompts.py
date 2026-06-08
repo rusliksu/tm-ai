@@ -4,7 +4,7 @@ import tm_llm.knowledge as knowledge
 from tm_llm.prompts import (
     capture_tactical, parse_action_response, standard_project_cost, find_choice, find_choices,
     STANDARD_PROJECT_COSTS, sanitize_strategy, game_end_proximity, compute_award_standings,
-    _option_card_name,
+    _option_card_name, _annotate_colors,
 )
 from tm_llm.payment import check_payment_valid, parse_payment_line
 
@@ -213,6 +213,19 @@ def test_card_context_shows_stored_resources(monkeypatch):
     # a card with no stored resources gets no marker
     out2 = knowledge.format_card_context(["Regolith Eaters"], resources={})
     assert "on card" not in out2
+
+
+def test_annotate_colors_names_players():
+    c2n = {"orange": "Sandra", "black": "Peter", "blue": "Kai"}
+    assert _annotate_colors("Remove 1 plants from orange", c2n) == "Remove 1 plants from orange (Sandra)"
+    assert (_annotate_colors("Select a card to keep and pass the rest to black", c2n)
+            == "Select a card to keep and pass the rest to black (Peter)")
+    # bare colour (player-select option)
+    assert _annotate_colors("orange", c2n) == "orange (Sandra)"
+    # a card name that merely starts with a colour word is left alone
+    assert _annotate_colors("Black Polar Dust", c2n) == "Black Polar Dust"
+    # an unknown colour is untouched
+    assert _annotate_colors("Remove from purple", c2n) == "Remove from purple"
 
 
 def test_sanitize_strategy_strips_turn_artefacts():

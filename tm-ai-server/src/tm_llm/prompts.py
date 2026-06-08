@@ -180,6 +180,33 @@ def _node_title(node: dict, fallback: int) -> str:
     return f"Option {fallback}"
 
 
+def _color_to_name(state: dict) -> dict[str, str]:
+    """Map each player's color → display name, so option/decision titles that identify a player
+    only by colour (e.g. 'Remove 1 plants from orange') can name them."""
+    out: dict[str, str] = {}
+    p = state.get("player", {})
+    if p.get("color"):
+        out[str(p["color"]).lower()] = p.get("name", "you")
+    for o in state.get("opponents") or []:
+        if o.get("color"):
+            out[str(o["color"]).lower()] = o.get("name", "opp")
+    return out
+
+
+def _annotate_colors(text: str, color_to_name: dict[str, str]) -> str:
+    """Append the player name after a bare colour in a title — 'from orange' → 'from orange
+    (Sandra)', or a bare 'orange' player-select option → 'orange (Sandra)'. Only known player
+    colours are touched, and (outside the bare case) only after a preposition, so card names
+    like 'Black Polar Dust' are left alone."""
+    if not text or not color_to_name:
+        return text
+    if text.strip().lower() in color_to_name:
+        return f"{text} ({color_to_name[text.strip().lower()]})"
+    colors = "|".join(re.escape(c) for c in sorted(color_to_name, key=len, reverse=True))
+    pat = re.compile(rf"\b(from|to|against|for|by)\s+({colors})\b", re.IGNORECASE)
+    return pat.sub(lambda m: f"{m.group(1)} {m.group(2)} ({color_to_name[m.group(2).lower()]})", text)
+
+
 # ---------------------------------------------------------------------------
 # Milestone / award helpers
 # ---------------------------------------------------------------------------
@@ -590,7 +617,8 @@ def build_action_prompt(state: dict, waiting_for: dict, options: list[dict], *,
             lines += ["TACTICAL PLAN:", tactical]
 
     # Decision + options
-    title = _format_message(waiting_for.get("title")).strip() or "Select action"
+    color_to_name = _color_to_name(state)
+    title = _annotate_colors(_format_message(waiting_for.get("title")).strip() or "Select action", color_to_name)
     lines += ["", f"Decision: {title}", "Options:"]
 
     card_names_in_decision = _extract_card_names(waiting_for)
@@ -599,7 +627,7 @@ def build_action_prompt(state: dict, waiting_for: dict, options: list[dict], *,
     hand_shown = bool(hand_cards) and wf_type not in ("space", "payment", "amount")
     for opt in options:
         idx = opt["index"] + 1
-        title2 = str(opt["title"])
+        title2 = _annotate_colors(str(opt["title"]), color_to_name)
         desc = _get_card_desc_for_option(opt)
         sp_cost = standard_project_cost(
             title2.split(":", 1)[1].strip() if title2.lower().startswith("standard projects:") else title2
