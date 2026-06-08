@@ -109,7 +109,7 @@ echo "▶ starting AI server (OpenRouter, single model, log: ${AI_LOG})"
   # OPENROUTER_API_KEY is already exported via `set -a; source .env` above.
   OPENROUTER_MODEL="${OPENROUTER_MODEL:-deepseek/deepseek-v4-flash}" \
   OPENROUTER_THINKING="${OPENROUTER_THINKING:-off}" \
-  OPENROUTER_MAX_OUTPUT_TOKENS="${OPENROUTER_MAX_OUTPUT_TOKENS:-8192}" \
+  OPENROUTER_MAX_OUTPUT_TOKENS="${OPENROUTER_MAX_OUTPUT_TOKENS:-4096}" \
   LLM_DEBUG="${LLM_DEBUG:-true}" \
   exec uv run uvicorn tm_llm.app:app --host 0.0.0.0 --port 8000
 ) >> "${AI_LOG}" 2>&1 &
