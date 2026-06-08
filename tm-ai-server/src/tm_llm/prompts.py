@@ -51,11 +51,14 @@ _MILESTONE_RACE_GAP = 3
 def standard_project_cost(title: str) -> int | None:
     if not title:
         return None
-    t = title.lower().strip()
-    if t in STANDARD_PROJECT_COSTS:
-        return STANDARD_PROJECT_COSTS[t]
-    t2 = re.sub(r"\s*\(\d+ ?m€\)\s*$", "", t)
-    return STANDARD_PROJECT_COSTS.get(t2)
+    t = re.sub(r"\s*\(\d+ ?m€\)\s*$", "", title.lower().strip())
+    # Keys are all suffixed ':sp', but TM only adds that suffix to standard projects whose name
+    # collides with a real card (Power Plant:SP, Asteroid:SP); others arrive bare (Aquifer,
+    # Greenery, City...). Match either form so every standard project gets a cost tag.
+    for candidate in (t, f"{t}:sp", t[:-3] if t.endswith(":sp") else t):
+        if candidate in STANDARD_PROJECT_COSTS:
+            return STANDARD_PROJECT_COSTS[candidate]
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -677,7 +680,13 @@ def sanitize_strategy(text: str) -> str:
     if not text:
         return text
     kept = [ln for ln in text.splitlines() if not _STRATEGY_DROP.match(ln)]
-    return "\n".join(kept).strip()
+    out = "\n".join(kept).strip()
+    # Safety net: the model sometimes parrots the meta-instruction labels inline (one paragraph,
+    # so line-filtering above can't catch them). Drop the obvious echoes.
+    out = re.sub(r"\*{0,3}\s*PROSE[ -]?ONLY\b\.?\*{0,3}", "", out, flags=re.IGNORECASE)
+    out = re.sub(r"\*{0,3}\s*DEFERRAL(?: CHECK)?\s*:?\*{0,3}", "", out, flags=re.IGNORECASE)
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    return out.strip()
 
 
 def parse_action_response(text: str, options: list[dict], waiting_for: dict, player_id: str,
@@ -1009,14 +1018,15 @@ def build_pergen_prompt(state: dict, prior_strategy: str, generation: int) -> st
         "----- PRIOR STRATEGY -----\n"
         f"{prior_strategy or '(none yet — first strategy update)'}\n"
         "--------------------------\n\n"
-        "Rewrite your strategy in ~120 words, dense prose, covering:\n"
+        "Reply with ONLY your rewritten strategy: ~120 words of dense prose. No CHOICE/PAYMENT "
+        "lines, no option numbers, and do NOT echo any instruction label (e.g. 'DEFERRAL', "
+        "'PROSE ONLY') — those are directions to you, not content. Cover, in order:\n"
         "1. STANDING: VP/TR vs each opponent — ahead, level, or behind?\n"
         "2. ENGINE (PRIMARY): your path to victory and how you score each gen.\n"
         "3. MILESTONE TARGET: a still-available one (never ✗); if you already meet a ✓, claim it FIRST this gen.\n"
         "4. AWARD TARGET: only one you can win 1st/close-2nd; else 'none'.\n"
-        "5. NEXT-GEN PRIORITY: ordered actions; convert spare heat/plants FIRST.\n"
-        "6. BACKUP PLAN + SWITCH: keep primary, or switch (mandatory if >20 VP behind late).\n"
-        "DEFERRAL CHECK: re-do an undone goal FIRST only if it's actually offered this gen; if it's "
-        "not in your options (a one-time setup perk, a 'free' placement you no longer have), DROP it.\n"
-        "PROSE ONLY — no CHOICE/PAYMENT lines or option numbers; this is memory, not a move."
+        "5. NEXT-GEN PRIORITY: ordered actions; convert spare heat/plants FIRST. Re-do an undone "
+        "goal from last gen only if it's actually offered this gen — drop one-time setup perks or a "
+        "'free' placement you no longer have.\n"
+        "6. BACKUP PLAN + SWITCH: keep primary, or switch (mandatory if >20 VP behind late)."
     )

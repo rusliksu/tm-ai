@@ -103,6 +103,29 @@ def test_standard_project_cost_single_sourced():
     assert standard_project_cost("Sell patents") is None
 
 
+def test_standard_project_cost_suffix_insensitive():
+    # TM tags some SP names with ':SP' (Power Plant:SP) and leaves others bare (Aquifer);
+    # both forms must resolve so every standard project shows its cost.
+    assert standard_project_cost("Power Plant:SP") == 11
+    assert standard_project_cost("Aquifer") == 18
+    assert standard_project_cost("Greenery") == 23
+    assert standard_project_cost("City") == 25
+    assert standard_project_cost("Air Scrapping") == 15
+    assert standard_project_cost("Unknown Thing") is None
+
+
+def test_sanitize_strategy_strips_inline_meta_echoes():
+    # The per-gen reflection writes one paragraph and parrots the prompt's meta-labels; line
+    # filtering can't catch those, so the inline strip must.
+    raw = ("**STANDING:** ahead on TR. **NEXT-GEN:** place a greenery. "
+           "**DEFERRAL:** no undone goals; drop the free-city myth. **PROSE ONLY.**")
+    out = sanitize_strategy(raw)
+    assert "PROSE ONLY" not in out
+    assert "DEFERRAL" not in out
+    assert "ahead on TR" in out
+    assert "place a greenery" in out
+
+
 def test_find_choices_multi():
     assert find_choices("CHOICE: 2,3") == [2, 3]
     assert find_choices("**CHOICE:** 1 and 4") == [1, 4]
