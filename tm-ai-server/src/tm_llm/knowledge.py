@@ -306,19 +306,14 @@ def format_config_context(game: dict) -> str:
             lines.append(f"  [{key}] {desc}" if desc else f"  [{key}] = {val}")
 
     if milestones:
-        lines.append("\nMilestones available (5 VP to claim; costs 8 MC; max 3 per game):")
+        lines.append("\nMilestones this game (5 VP, 8 MC, max 3):")
         for m in milestones:
             lines.append(f"  • {m.get('name', '?')}: {m.get('description', '')}")
-        lines.append("  Tip: claim as soon as you meet the requirement — being blocked loses 5 VP.")
 
     if awards:
-        lines.append("\nAwards available (5 VP 1st / 2 VP 2nd; fund costs 8/14/20 MC; max 3 per game):")
+        lines.append("\nAwards this game (5/2 VP, fund 8/14/20 MC, max 3):")
         for a in awards:
             lines.append(f"  • {a.get('name', '?')}: {a.get('description', '?')}")
-        lines.append(
-            "  Tip: fund only an award you are already winning, before opponents fund it. "
-            "Multiple awards can be won by the same player."
-        )
 
     lines.append("=== END GAME CONFIGURATION ===")
     return "\n".join(lines)
@@ -360,10 +355,7 @@ def format_board_layout(board_spaces: list[dict]) -> str:
             bonus_land.append(f"  hex-{sid}({x},{y}): {bonus_str}")
 
     lines = ["=== BOARD LAYOUT (static) ===",
-             "Space IDs: hex-NN where NN is the ID shown during tile placement.",
-             "Position (x,y): x=column (0=leftmost in row), y=row (0=top).",
-             "Greenery MUST be placed adjacent to your own tile if possible.",
-             "City CANNOT be adjacent to another city.",
+             "hex-NN = the ID shown during placement; (x,y): x=column (0=leftmost), y=row (0=top).",
              ""]
 
     if ocean_spaces:

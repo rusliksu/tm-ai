@@ -37,7 +37,9 @@ def flatten_options(waiting_for: dict, max_actions: int = MAX_OPTIONS) -> list[d
 
     Nested OR options whose children are all leaf 'option' types are expanded inline so
     the LLM picks the specific sub-choice directly (e.g. a specific award under "Fund an
-    award", a specific standard project under "Standard projects").
+    award"). Nested projectCard menus (a "Standard projects" list, or an inline "Play a
+    card" list) are likewise expanded into one option per card, so the LLM names the
+    specific project instead of the engine silently defaulting to the first card.
     """
     node_type = waiting_for.get("type", "")
     options: list[dict] = []
@@ -53,6 +55,7 @@ def flatten_options(waiting_for: dict, max_actions: int = MAX_OPTIONS) -> list[d
             if len(options) >= max_actions:
                 break
             child_opts = opt.get("options") or []
+            child_cards = opt.get("cards") or []
             if (
                 opt.get("type") == "or"
                 and child_opts
@@ -65,6 +68,20 @@ def flatten_options(waiting_for: dict, max_actions: int = MAX_OPTIONS) -> list[d
                     child_title = _node_title(child, j)
                     full_title = f"{parent_title}: {child_title}" if parent_title else child_title
                     _emit(full_title, [i, j], child)
+            elif opt.get("type") == "projectCard" and len(child_cards) > 1:
+                # A nested project-card menu (e.g. "Standard projects" listing every standard
+                # project, or an inline "Play a card" listing the hand). Expand each card into
+                # its own option so the LLM picks the specific one — otherwise the engine
+                # silently defaults to the FIRST card (historically always Power Plant). The
+                # parent projectCard node is kept as `node` so payment auto-generation and
+                # validation can still resolve each card's cost from its `.cards`.
+                parent_title = _node_title(opt, i).strip()
+                for j, card in enumerate(child_cards):
+                    if len(options) >= max_actions:
+                        break
+                    cname = card.get("name", f"Card {j}")
+                    full_title = f"{parent_title}: {cname}" if parent_title else cname
+                    _emit(full_title, [i, j], opt)
             else:
                 _emit(_node_title(opt, i), [i], opt)
 

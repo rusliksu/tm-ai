@@ -63,108 +63,81 @@ def standard_project_cost(title: str) -> int | None:
 # ---------------------------------------------------------------------------
 
 TM_RULES = f"""
-=== TERRAFORMING MARS — RULES REFERENCE ===
+=== TERRAFORMING MARS — RULES ===
+GOAL: most VP at game end. VP = 1/TR + 1/greenery + 1 per greenery adjacent to a city (any
+owner) + milestones (5) + awards (5 for 1st, 2 for 2nd) + card VP.
 
-OBJECTIVE: most Victory Points (VP) at game end wins.
-VP sources: Terraform Rating (1 VP/TR), greenery tiles (1 VP each),
-city tiles (1 VP per adjacent greenery of ANY owner), milestones (5 VP, 8 MC to claim,
-max 3 claimed in the whole game), awards (5 VP 1st / 2 VP 2nd, max 3 funded), card VP.
+GLOBAL PARAMETERS — game ENDS when temperature, oxygen AND oceans are all maxed; each step
+raised = +1 TR (= +1 income AND +1 VP):
+  • Temperature −30→+8°C (2°/step). Raise: 8 heat, Asteroid SP, cards.
+  • Oxygen 0→14%. Raise: place greenery, cards.
+  • Oceans 0→9 tiles. Place: Aquifer SP, cards.
+  • Venus (Venus Next only) 0→30% (2%/step). Raise: Venus cards/SPs. Does NOT end the game.
+THRESHOLDS (one-time, to the trigger): temp −24/−20°C → +1 heat prod; temp 0°C → 1 ocean;
+O₂ 8% → temp +1 step; Venus 8% → draw card, 16% → +1 TR. Hitting a threshold yourself ≈ 10 MC.
 
-GLOBAL PARAMETERS (game ends when temperature, oxygen and oceans are all maxed):
-  • Temperature: −30°C → +8°C (+2°C per step, 20 steps). Raise: 8 heat, Asteroid SP, cards.
-  • Oxygen:       0% → 14% (14 steps). Raise: place greenery, or cards.
-  • Oceans:       0 → 9 tiles. Place: Aquifer SP or cards.
-  • Venus (Venus Next only): 0% → 30% (+2% per step, 15 steps). Raise: Venus cards/SPs.
-  Each step raised = +1 TR (= +1 income AND +1 VP).
+RESOURCES (gained each production phase): MC — income = TR + MC-prod (MC-prod may go to −5,
+other prods ≥0); Steel pays BUILDING-tag cards @2 MC/cube; Titanium pays SPACE-tag cards
+@3 MC/cube; 8 Plants → greenery (+1 O₂ +1 TR); 8 Heat → +1 temp (+1 TR); spare Energy → Heat.
 
-GLOBAL-PARAMETER THRESHOLD BONUSES (one-time, to the player who triggers the step):
-  • Temperature −24°C and −20°C: +1 heat production each.
-  • Temperature 0°C: place 1 ocean tile.
-  • Oxygen 8%: temperature rises +1 step automatically (free TR for the raiser).
-  • Venus 8%: draw 1 card.   Venus 16%: +1 TR.
-  Timing a step to hit a threshold yourself is worth ~10 MC of value.
+CARDS: GREEN (one-time effect, tag stays), BLUE (ongoing effect or 1×/gen action), RED event
+(one-time, tag counts only when played).
 
-RESOURCES (collected each production phase):
-  • MegaCredits (MC): currency. INCOME each generation = TR + MC-production.
-  • Steel: pays for BUILDING-tag cards at 2 MC/cube.   Titanium: SPACE-tag cards at 3 MC/cube.
-  • Plants: 8 → greenery tile (+1 O₂, +1 TR).   Energy: leftover converts to heat each gen.
-  • Heat: 8 → raise temperature +1 step (+1 TR).   MC production may be negative (min −5);
-    all other productions never go below 0.
+EACH GENERATION: research (draw 4, buy any @3 MC) → actions (1–2 per turn until all pass) →
+production.
 
-CARD TYPES: GREEN (automated, one-time effect, tag persists), BLUE (active: ongoing effect
-or a once-per-generation action), RED event (one-time, tag counts only when played).
-Steel discounts building-tag cards; titanium discounts space-tag cards.
+ACTIONS: play a card; standard project; claim a milestone (8 MC, max 3/game — claim the
+instant you qualify, opponents race you); fund an award (8/14/20 MC); blue-card action
+(1×/gen); 8 plants→greenery; 8 heat→temp. AWARDS score ONLY at game END (1st=5, 2nd=2) — fund
+only one you will still lead at the end; funding a lead you won't hold = 0 VP.
 
-TURN STRUCTURE each generation: player order rotates; research phase (draw 4, buy any at
-3 MC); action phase (each player takes 1–2 actions per turn until all pass); production phase.
+STANDARD PROJECTS: Sell patents (free, discard N cards→N MC — almost always bad); Power Plant
+({STANDARD_PROJECT_COSTS['power plant:sp']} MC, +1 energy prod); Asteroid ({STANDARD_PROJECT_COSTS['asteroid:sp']} MC, +1 temp); Aquifer ({STANDARD_PROJECT_COSTS['aquifer:sp']} MC, ocean);
+Greenery ({STANDARD_PROJECT_COSTS['greenery:sp']} MC, greenery); City ({STANDARD_PROJECT_COSTS['city:sp']} MC, city +1 MC prod).
 
-ACTIONS (1–2 per turn): play a card; use a standard project; claim a milestone (8 MC + meet
-requirement); fund an award (8/14/20 MC); use a blue card's action (once/gen); convert 8
-plants → greenery; convert 8 heat → +1 temperature.
-  AWARD RULE: you only SCORE an award if you place 1st (5 VP) or 2nd (2 VP) at game END.
-  Funding an award you are not winning = paying MC for 0 VP. Only fund what you lead.
+TILE PLACEMENT: ocean only on reserved blue spaces (adjacent owners get +2 MC); greenery must
+go next to your own tile if possible; city can't touch another city.
 
-STANDARD PROJECTS (always available):
-  • Sell patents (free): discard N cards → N MC. Almost always bad — cards are worth far more.
-  • Power Plant ({STANDARD_PROJECT_COSTS['power plant:sp']} MC): +1 energy production. Weak; skip once you convert heat regularly.
-  • Asteroid ({STANDARD_PROJECT_COSTS['asteroid:sp']} MC): +1 temperature (+1 TR). Good value.
-  • Aquifer ({STANDARD_PROJECT_COSTS['aquifer:sp']} MC): place ocean (+1 TR + placement bonus). Good.
-  • Greenery ({STANDARD_PROJECT_COSTS['greenery:sp']} MC): place greenery (+1 O₂, +1 TR).
-  • City ({STANDARD_PROJECT_COSTS['city:sp']} MC): place city + 1 MC production. High value — TR + income + board VP.
+PLAYABILITY: the options below are already filtered to legal AND affordable moves — never
+re-check requirements/affordability; pick the best and pay.
 
-PLAYABILITY: the option list below already contains ONLY cards/projects you can legally play
-AND currently afford. You never need to check requirements or affordability yourself — if it
-is listed, it is playable. Pick the best option; pay with PAYMENT.
+PAYMENT: cover the cost in MC, optionally substituting steel/titanium per the tags above; no
+MC overpay, surplus cubes are lost.
 
-TILE PLACEMENT: ocean only on reserved blue spaces (adjacent tile owners get +2 MC); greenery
-must go next to your own tile if possible; cities cannot be adjacent to another city. At game
-end greenery = 1 VP, city = 1 VP per adjacent greenery.
+RESPONSE FORMAT (every turn — terse and dense, no markdown headings, do not restate the state):
+  <1–2 sentence reason tied to your strategy>
+  TACTICAL: <ordered next steps for the rest of this gen — your ONLY memory to your next move; rewrite each turn>
+  CHOICE: N   (option number, own line)
+  PAYMENT: MC=<n>[, STEEL=<n>][, TITANIUM=<n>][, HEAT=<n>]   (only when playing a card; total ≥ shown cost)
 
-PAYMENT: pay a card's cost in MC, optionally substituting steel (building, 2 MC/cube) or
-titanium (space, 3 MC/cube). You cannot overpay in MC; surplus steel/titanium is lost.
-
-RESPONSE FORMAT — MANDATORY every turn:
-  1. One or two sentences of reasoning tied to your strategy.
-  2. TACTICAL: <your updated ordered next-steps for the rest of this generation — this is the
-     ONLY note you carry to your next move; rewrite it from what just happened>.
-  3. CHOICE: N   (the option number, on its own line)
-  4. PAYMENT: MC=<n>[, STEEL=<n>][, TITANIUM=<n>][, HEAT=<n>]   (only when playing a card)
-  Steel only counts for building-tag cards, titanium only for space-tag cards; PAYMENT must
-  total at least the displayed cost.
-
-SERVER AUTHORITY: the game server enforces all rules and is always correct. If it rejects a
-move, read the error, pick a DIFFERENT valid option, and never repeat the invalid move.
-=== END RULES REFERENCE ===
+SERVER AUTHORITY: the server is always right; on rejection, read the error and pick a
+DIFFERENT valid option.
+=== END RULES ===
 """
 
 # Strategy guidance — condensed from the original essays. Cached alongside the rules.
 STRATEGY_PRIMER = """
 === STRATEGY PRIMER ===
-• TR is income AND VP: terraforming is your primary objective, not an afterthought. Each +1
-  TR pays back every remaining generation. Convert spare heat/plants before passing — ≥8 heat
-  (temp < 8°C) or ≥8 plants (O₂ < 14%) is a free +1 TR; never waste it.
-• Build MC production early — it compounds. City SP and production cards beat one-off effects.
-• Card throughput wins: aim to play 2–4 project cards per generation. A fat hand with low MC
-  means a stalled engine — use steel/titanium discounts and cheap synergy cards to unstall.
-• Match draft buys to your resources: titanium → buy space cards, steel → buy building cards.
-  Stockpiled resources with no matching cards are wasted production.
-• Milestones are exceptional value (5 VP for 8 MC) and capped at 3 — claim the moment you
-  qualify; opponents can race you. Awards: only fund ones you are winning, and not too early.
-• City + greenery geometry: place greeneries adjacent to YOUR cities (each adjacency = +1 VP);
-  two cities two hexes apart share a 3-VP greenery hex. Never place greenery next to an
-  opponent's city. Place your first city by ~gen 3–4.
-• Pace: if you out-score opponents per generation, slow terraforming; if you are ahead on TR
-  but behind on VP, accelerate to end the game before their engines mature.
-• Read opponents from their tableau, funded awards, and claimed milestones — block and race.
+• TR is income AND VP — terraform actively; never pass with ≥8 spare heat/plants unconverted.
+• Build MC production early; it compounds. City SP and production cards beat one-off effects.
+• Throughput wins: 2–4 cards/gen. Fat hand + low MC = stalled engine; use steel/titanium
+  discounts and cheap synergy cards. Buy drafts to match resources (titanium→space, steel→building);
+  stockpiles with no matching cards are wasted.
+• Greenery geometry: place greeneries next to YOUR cities (each adjacency = +1 VP); two cities
+  two hexes apart share a 3-VP hex; never feed an opponent's city. First city by ~gen 3–4.
+• Pace: ahead per gen → slow terraforming; ahead on TR but behind on VP → rush the game end
+  before their engines mature. Read opponents (tableau/production/awards/milestones) — block and race.
+• One-time setup perks (starting free city/tile, starting resources, preludes) already happened
+  at game start — NOT recurring. Never plan a "free city" mid-game; only pursue moves listed in
+  your options this turn, and drop any planned move that isn't listed.
 === END STRATEGY PRIMER ===
 """
 
 _ACTION_SYSTEM_SUFFIX = (
-    "\n\nYou are an expert Terraforming Mars player. Each turn you receive the COMPLETE game "
-    "state plus YOUR OWN MEMORY (a coarse STRATEGY and a short TACTICAL plan). There is NO chat "
-    "history — those two notes are all you remember between turns, so keep them accurate and act "
-    "on them. Always answer in the mandatory RESPONSE FORMAT (reasoning, TACTICAL, CHOICE, "
-    "PAYMENT)."
+    "\n\nYou are an expert Terraforming Mars player. Each turn you get the COMPLETE state plus "
+    "YOUR MEMORY (STRATEGY + TACTICAL) — no chat history, so those notes are all you remember; "
+    "keep them accurate. Answer in the RESPONSE FORMAT, terse and dense: brief reasoning, no "
+    "markdown headers, no restating the state back."
 )
 
 
@@ -247,10 +220,8 @@ def _milestone_advisory(state: dict, options: list[dict]) -> list[str]:
     opponents = state.get("opponents") or []
     lines = [
         "",
-        "⚠ MILESTONE CLAIM AVAILABLE: a 'Claim milestone' option means you already meet the "
-        "requirement and can afford 8 MC. 5 VP for 8 MC, capped at 3 per game — default CLAIM IT "
-        "NOW. Postpone only if every opponent is far from every unclaimed milestone AND you have "
-        "an >5-VP play this turn.",
+        "⚠ MILESTONE CLAIMABLE (5 VP for 8 MC, max 3/game): default CLAIM IT NOW. Postpone only if "
+        "no opponent is near any unclaimed milestone AND you have a >5-VP play this turn.",
     ]
     for idx, ms_name in ms_opts:
         ms_lower = ms_name.lower()
@@ -380,6 +351,29 @@ def compute_award_standings(state: dict) -> list[str]:
     return lines
 
 
+def game_end_proximity(game: dict) -> str | None:
+    """A banner when ≥2 of the 3 game-ending parameters are maxed — the game may end imminently
+    (possibly on an opponent's turn), so unspent resources are wasted. Venus does NOT gate game
+    end and is excluded."""
+    temp = game.get("temperature", -30)
+    oxygen = game.get("oxygen", 0)
+    oceans = game.get("oceanCount", 0)
+    done = [
+        ("temperature", temp >= 8, f"{temp}/8°C"),
+        ("oxygen", oxygen >= 14, f"{oxygen}/14%"),
+        ("oceans", oceans >= 9, f"{oceans}/9"),
+    ]
+    n_done = sum(1 for _, ok, _ in done if ok)
+    if n_done < 2:
+        return None
+    remaining = ", ".join(f"{name} {cur}" for name, ok, cur in done if not ok) or "none — ends now"
+    return (
+        f"⚠ GAME-END IMMINENT: {n_done}/3 ending parameters maxed (rising: {remaining}). The game may "
+        "end THIS gen — even on an opponent's turn. Spend ALL MC/plants/heat on VP now (greeneries, "
+        "VP cards, any TR step); bank NOTHING for next gen."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Option/card helpers
 # ---------------------------------------------------------------------------
@@ -446,8 +440,7 @@ def build_action_prompt(state: dict, waiting_for: dict, options: list[dict], *,
 
     lines += [
         f"Gen {g.get('generation', 1)} | Temp:{temp}°C O₂:{oxygen}% Oceans:{oceans}/9",
-        f'You are "{own_name}" (color={own_color}). In the event log, lines starting '
-        f'"You ({own_name})" are your own past actions.',
+        f'You are "{own_name}" ({own_color}); log lines "You ({own_name})" are your own past actions.',
         f"You: TR:{tr} VP:{p.get('victoryPoints', '?')}  MC:{mc}(income:{mc_income})  "
         f"Steel:{p.get('steel', 0)} Ti:{p.get('titanium', 0)}  "
         f"Plants:{p.get('plants', 0)} Energy:{p.get('energy', 0)} Heat:{p.get('heat', 0)}",
@@ -456,15 +449,18 @@ def build_action_prompt(state: dict, waiting_for: dict, options: list[dict], *,
     # Conditional one-line advisories (only when actionable)
     heat_now, plants_now = p.get("heat", 0), p.get("plants", 0)
     if heat_now >= 8 and temp < 8:
-        lines.append(f">> {heat_now} heat (≥8), temp not maxed — 'Convert 8 heat' = free +1 TR. Do it before passing.")
+        lines.append(f">> {heat_now} heat ≥8 — Convert 8 heat = free +1 TR before passing.")
     if plants_now >= 8 and oxygen < 14:
-        lines.append(f">> {plants_now} plants (≥8), O₂ not maxed — 'Convert 8 plants' = greenery +1 TR +1 VP.")
+        lines.append(f">> {plants_now} plants ≥8 — Convert 8 plants = greenery, +1 TR +1 VP.")
     elif plants_now >= 8 and oxygen >= 14:
-        lines.append(f">> {plants_now} plants — O₂ maxed, but each greenery still scores +1 VP if land is free.")
+        lines.append(f">> {plants_now} plants — O₂ maxed, but each greenery still scores +1 VP.")
     if temp >= 8:
-        lines.append("⚠ Temperature maxed (8°C) — do NOT Convert Heat.")
+        lines.append("⚠ Temp maxed — do NOT Convert Heat.")
     if oceans >= 9:
         lines.append("⚠ All 9 oceans placed.")
+    end_banner = game_end_proximity(g)
+    if end_banner:
+        lines.append(end_banner)
 
     lines.extend(_milestone_advisory(state, options))
 
@@ -495,14 +491,22 @@ def build_action_prompt(state: dict, waiting_for: dict, options: list[dict], *,
     if hand_cards and wf_type not in ("space", "payment", "amount"):
         lines += ["", format_card_context(hand_cards, header=f"Your hand ({len(hand_cards)} cards):", max_cards=30)]
 
-    # Opponents
+    # Opponents — include corporation + their played tableau so the model can read each engine
+    # (recurring income/VP cards, award threats) instead of guessing from tags alone.
     for i, opp in enumerate(opponents, 1):
         opp_prod = {k: v for k, v in opp.get("production", {}).items() if v}
         opp_tags = {k: v for k, v in opp.get("tags", {}).items() if v}
         nm = opp.get("name", f"Opponent{i}")
         vp = f" VP:{opp['victoryPoints']}" if opp.get("victoryPoints") is not None else ""
         hs = f"  hand:{opp['handSize']}" if opp.get("handSize") is not None else ""
-        lines.append(f"{nm}: TR:{opp.get('terraformRating', 20)}{vp}  MC:{opp.get('megacredits', 0)}{hs}  prod:{opp_prod}  tags:{opp_tags}")
+        corp = opp.get("corporations") or []
+        corp_str = f"  corp:{','.join(corp)}" if corp else ""
+        lines.append(f"{nm}: TR:{opp.get('terraformRating', 20)}{vp}  MC:{opp.get('megacredits', 0)}{hs}{corp_str}  prod:{opp_prod}  tags:{opp_tags}")
+        played = opp.get("playedCards") or []
+        if played:
+            shown = ", ".join(played[:18])
+            extra = f" (+{len(played) - 18} more)" if len(played) > 18 else ""
+            lines.append(f"  {nm} played: {shown}{extra}")
 
     lines.extend(compute_milestone_status(state))
 
@@ -512,7 +516,10 @@ def build_action_prompt(state: dict, waiting_for: dict, options: list[dict], *,
     else:
         standings = compute_award_standings(state)
         if standings:
-            lines.append("Unfunded award standings (fund only if 1st or close 2nd):")
+            lines.append(
+                "Unfunded awards (scored at GAME END; leads erode as opponents grow). Fund only a "
+                "1st-place lead you'll hold to the end, rarely before ~gen 8; never to protect a thin lead:"
+            )
             lines.extend(standings)
 
     # Live board (compact) on non-placement turns; full candidate adjacency on space turns
@@ -614,6 +621,28 @@ def capture_tactical(text: str) -> str | None:
         tactical = m.group(1).strip()
         return tactical or None
     return None
+
+
+# A strategy doc is long-term PROSE memory, but the per-gen reflection sometimes answers in the
+# turn format (CHOICE:/PAYMENT:) or echoes the prompt's "----- PRIOR STRATEGY -----" framing.
+# Saving those verbatim pollutes every later prompt with stale, meaningless option numbers
+# (the observed "CHOICE: 15"). Drop those lines before persisting the strategy.
+_STRATEGY_DROP = re.compile(
+    r"^\s*(?:"
+    + _EMPH + r"(?:CHOICE|PAYMENT)" + _EMPH + r"\s*:.*"   # turn-answer lines
+    r"|-{3,}.*?-{3,}"                                       # ----- PRIOR STRATEGY ----- banners
+    r"|-{3,}"                                               # plain divider rules
+    r")\s*$",
+    re.IGNORECASE,
+)
+
+
+def sanitize_strategy(text: str) -> str:
+    """Strip action-format artefacts and template banners the model leaks into a strategy doc."""
+    if not text:
+        return text
+    kept = [ln for ln in text.splitlines() if not _STRATEGY_DROP.match(ln)]
+    return "\n".join(kept).strip()
 
 
 def parse_action_response(text: str, options: list[dict], waiting_for: dict, player_id: str,
@@ -755,9 +784,12 @@ def build_setup_prompt(state: dict, waiting_for: dict) -> str:
             lines.append("CEO_CARD: <exact name of 1 CEO>")
         lines += [
             "STRATEGY:",
-            "<150-250 words: engine type (PRIMARY plan), priority tags, milestone/award targets,",
-            " key synergies, pace plan. End with a BACKUP PLAN: one sentence naming an alternative",
-            " engine/scoring path to pivot to if the primary stalls.>",
+            "<150-250 words: engine type (PRIMARY plan), priority tags, key synergies, pace plan.",
+            " MILESTONE TARGET: name ONE specific milestone from the list above you will go for,",
+            " the tag/tile/TR count it needs, and the generation you plan to claim it by (claim the",
+            " moment you qualify — only 3 are ever claimed and opponents race you). AWARD TARGET:",
+            " one award you can realistically win 1st by game end, or 'none'. End with a BACKUP",
+            " PLAN: one sentence naming an alternative engine/scoring path if the primary stalls.>",
         ]
 
     elif wf_type == "prelude":
@@ -890,6 +922,9 @@ def build_pergen_prompt(state: dict, prior_strategy: str, generation: int) -> st
     if oceans >= 9:
         status.append("all oceans placed")
     status_line = ("⚠ Global: " + "; ".join(status) + "\n") if status else ""
+    end_banner = game_end_proximity(g)
+    if end_banner:
+        status_line += end_banner + "\n"
 
     heat_now, plants_now = p.get("heat", 0), p.get("plants", 0)
     notes = [f"Income this gen: MC {mc_income} (TR {tr} + prod {mc_prod:+d})."]
@@ -908,21 +943,18 @@ def build_pergen_prompt(state: dict, prior_strategy: str, generation: int) -> st
         + " ".join(notes) + "\n"
         + ("\n".join(ms_status) + "\n" if ms_status else "")
         + ("Unfunded award standings:\n" + "\n".join(aw_status) + "\n" if aw_status else "")
-        + "\nYour strategy notes from last generation (ALL you remember — state is supplied fresh each turn):\n"
+        + "\nLast gen's strategy notes (ALL you remember — state is supplied fresh each turn):\n"
         "----- PRIOR STRATEGY -----\n"
         f"{prior_strategy or '(none yet — first strategy update)'}\n"
         "--------------------------\n\n"
-        "Rewrite your strategy for this generation in ~150-200 words:\n"
-        "1. STANDING: your VP/TR vs each opponent — ahead, level, or behind?\n"
+        "Rewrite your strategy in ~120 words, dense prose, covering:\n"
+        "1. STANDING: VP/TR vs each opponent — ahead, level, or behind?\n"
         "2. ENGINE (PRIMARY): your path to victory and how you score each gen.\n"
-        "3. MILESTONE TARGET: pick a still-available milestone from the status above (never one "
-        "marked ✗). If you ALREADY meet one (✓), claim it as your FIRST action this generation.\n"
+        "3. MILESTONE TARGET: a still-available one (never ✗); if you already meet a ✓, claim it FIRST this gen.\n"
         "4. AWARD TARGET: only one you can win 1st/close-2nd; else 'none'.\n"
-        "5. NEXT-GEN PRIORITY: concrete ordered actions. Convert spare heat/plants FIRST.\n"
-        "6. BACKUP PLAN: one-sentence alternative engine/scoring path.\n"
-        "7. SWITCH DECISION: 'Keep primary' or 'Switch: <reason>'. If >20 VP behind with few "
-        "generations left, you MUST switch to an aggressive catch-up plan.\n"
-        "DEFERRAL CHECK: if a goal you wrote last gen is still undone (same city count, milestone "
-        "still unclaimed, card still in hand), name it and execute it as your FIRST action — do "
-        "not write the same plan again without acting on it."
+        "5. NEXT-GEN PRIORITY: ordered actions; convert spare heat/plants FIRST.\n"
+        "6. BACKUP PLAN + SWITCH: keep primary, or switch (mandatory if >20 VP behind late).\n"
+        "DEFERRAL CHECK: re-do an undone goal FIRST only if it's actually offered this gen; if it's "
+        "not in your options (a one-time setup perk, a 'free' placement you no longer have), DROP it.\n"
+        "PROSE ONLY — no CHOICE/PAYMENT lines or option numbers; this is memory, not a move."
     )

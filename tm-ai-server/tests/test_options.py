@@ -30,6 +30,44 @@ def test_flatten_expands_nested_or_of_leaf_options():
     assert banker["path"] == [0, 0]
 
 
+def test_flatten_expands_standard_projects_project_card_menu():
+    # "Standard projects" is a single projectCard node listing every SP. It must expand to one
+    # option per project so the LLM can pick e.g. Aquifer — not silently get the first (Power
+    # Plant). Regression for the gen-10 "wanted an ocean, got a power plant" bug.
+    wf = {"type": "or", "options": [
+        {"type": "option", "title": "Pass"},
+        {"type": "projectCard", "title": "Standard projects", "cards": [
+            {"name": "Power Plant:SP", "calculatedCost": 11},
+            {"name": "Aquifer:SP", "calculatedCost": 18},
+            {"name": "City:SP", "calculatedCost": 25},
+        ]},
+    ]}
+    opts = flatten_options(wf)
+    titles = [o["title"] for o in opts]
+    assert "Standard projects: Aquifer:SP" in titles
+    assert "Standard projects: City:SP" in titles
+    aquifer = next(o for o in opts if o["title"].endswith("Aquifer:SP"))
+    assert aquifer["path"] == [1, 1]
+    # The parent projectCard node is retained so payment resolution can find the cost.
+    assert aquifer["node"].get("type") == "projectCard"
+    # Picking Aquifer resolves to the Aquifer card, not the first one.
+    resp = index_to_response(wf, aquifer["path"])
+    assert resp == {"type": "or", "index": 1,
+                    "response": {"type": "projectCard", "card": "Aquifer:SP",
+                                 "payment": resp["response"]["payment"]}}
+    assert resp["response"]["payment"]["megacredits"] == 18
+
+
+def test_flatten_keeps_single_card_project_node_collapsed():
+    # A projectCard child with only one card need not be expanded (nothing to choose).
+    wf = {"type": "or", "options": [
+        {"type": "option", "title": "Pass"},
+        {"type": "projectCard", "title": "Sell patents", "cards": [{"name": "X", "calculatedCost": 0}]},
+    ]}
+    opts = flatten_options(wf)
+    assert [o["title"] for o in opts] == ["Pass", "Sell patents"]
+
+
 def test_index_to_response_or_nested():
     wf = {"type": "or", "options": [
         {"type": "or", "title": "Fund", "options": [

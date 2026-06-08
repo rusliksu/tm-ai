@@ -140,23 +140,35 @@ def render_space_choices(state: dict, options: list[dict]) -> str:
             continue
         bonuses = space.get("b") or []
         bonus_str = ("+".join(bonuses)) if bonuses else "none"
-        adj_desc: list[str] = []
-        own_cities = own_greeneries = opp_cities = adj_oceans = 0
+        own_cities = own_greeneries = opp_cities = opp_greeneries = adj_oceans = 0
+        specials: list[str] = []
         for adj in index.neighbours(space):
             t = adj.get("tile")
             if t is None:
                 continue
+            try:
+                tid = int(t)
+            except (TypeError, ValueError):
+                tid = -1
             name = _tile_name(t)
             owner = labels.get(adj.get("pc"), "")
+            who = "YOUR" if owner == "YOU" else (f"{owner}'s" if owner else "neutral")
             if name == "ocean":
                 adj_oceans += 1
-            elif int(t) in _CITY_TYPES:
+            elif tid in _CITY_TYPES:
                 if owner == "YOU":
                     own_cities += 1
                 else:
                     opp_cities += 1
-            elif name == "greenery" and owner == "YOU":
-                own_greeneries += 1
+            elif name == "greenery":
+                if owner == "YOU":
+                    own_greeneries += 1
+                else:
+                    opp_greeneries += 1
+            else:
+                # Special tiles (nuclear zone, natural preserve, etc.) — name + owner so the
+                # model can read placement restrictions and adjacency value for either side.
+                specials.append(f"{who} {name}")
         parts = []
         if own_cities:
             parts.append(f"YOUR city ×{own_cities}")
@@ -164,8 +176,11 @@ def render_space_choices(state: dict, options: list[dict]) -> str:
             parts.append(f"YOUR greenery ×{own_greeneries}")
         if opp_cities:
             parts.append(f"opponent city ×{opp_cities}")
+        if opp_greeneries:
+            parts.append(f"opponent greenery ×{opp_greeneries}")
         if adj_oceans:
             parts.append(f"ocean ×{adj_oceans}")
+        parts.extend(specials)
         adj_str = "; ".join(parts) if parts else "no adjacent tiles"
         lines.append(f"  hex-{sid}: bonus={bonus_str}; adjacent → {adj_str}")
     return "\n".join(lines) if len(lines) > 1 else ""

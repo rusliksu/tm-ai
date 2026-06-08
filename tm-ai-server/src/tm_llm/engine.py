@@ -50,8 +50,8 @@ def _select_setup(state: dict, waiting_for: dict, player, last_error: str | None
     logger.info("Setup response (player=%s):\n%s", player.player_id, text[:1000])
 
     input_response, strategy = prompts.parse_setup_response(text, waiting_for, prior_strategy=player.strategy)
-    player.strategy = strategy
-    logger.info("Player %s strategy stored:\n%s", player.player_id, strategy)
+    player.strategy = prompts.sanitize_strategy(strategy)
+    logger.info("Player %s strategy stored:\n%s", player.player_id, player.strategy)
     return input_response, {"llm_phase": "setup", "strategy": strategy[:300]}
 
 
@@ -67,7 +67,7 @@ def _maybe_per_generation_update(player, generation: int, state: dict) -> None:
         try:
             strategy = player.single_shot(player.action_system, prompt,
                                           thinking_budget=config.OPENROUTER_THINKING_BUDGET)
-            player.strategy = strategy.strip()
+            player.strategy = prompts.sanitize_strategy(strategy)
             logger.info("Per-gen strategy (player=%s gen=%d):\n%s", player.player_id, generation, player.strategy)
         except Exception as exc:
             logger.warning("Per-gen update failed (player=%s gen=%d): %s", player.player_id, generation, exc)

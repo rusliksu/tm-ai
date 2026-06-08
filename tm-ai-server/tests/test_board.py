@@ -61,6 +61,30 @@ def test_render_space_choices_flags_own_city():
     assert "plant" in out
 
 
+def test_render_space_choices_flags_opponent_greenery_and_special():
+    # Regression: opponent greeneries and special tiles must be described, not dropped as
+    # "no adjacent tiles" (the bug that hid Peter's greenery next to candidate hexes).
+    spaces = _grid()
+    for s in spaces:
+        if s["id"] == "4-4":          # neighbour of 3-4: opponent greenery
+            s["tile"], s["pc"] = 0, "green"
+        if s["id"] == "3-3":          # neighbour of 3-4: opponent special (natural preserve)
+            s["tile"], s["pc"] = 11, "green"
+        if s["id"] == "2-4":          # neighbour of 3-4: your greenery
+            s["tile"], s["pc"] = 0, "red"
+    state = {
+        "player": {"color": "red", "name": "Me"},
+        "opponents": [{"color": "green", "name": "Foe"}],
+        "boardSpaces": spaces,
+    }
+    options = [{"index": 0, "title": "3-4", "node": {"spaceId": "3-4"}}]
+    out = render_space_choices(state, options)
+    assert "opponent greenery" in out
+    assert "YOUR greenery" in out
+    assert "natural preserve" in out
+    assert "no adjacent tiles" not in out
+
+
 def test_render_live_board_groups_by_owner():
     spaces = _grid()
     for s in spaces:

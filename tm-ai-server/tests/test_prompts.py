@@ -2,7 +2,7 @@
 from tm_llm.options import flatten_options
 from tm_llm.prompts import (
     capture_tactical, parse_action_response, standard_project_cost, find_choice,
-    STANDARD_PROJECT_COSTS,
+    STANDARD_PROJECT_COSTS, sanitize_strategy, game_end_proximity,
 )
 from tm_llm.payment import check_payment_valid, parse_payment_line
 
@@ -101,3 +101,31 @@ def test_standard_project_cost_single_sourced():
     assert standard_project_cost("City:SP") == STANDARD_PROJECT_COSTS["city:sp"]
     assert standard_project_cost("Standard projects: Asteroid:SP".split(":", 1)[1].strip()) == 14
     assert standard_project_cost("Sell patents") is None
+
+
+def test_sanitize_strategy_strips_turn_artefacts():
+    raw = (
+        "----- PRIOR STRATEGY -----\n"
+        "**Reasoning:** Build an MC engine and target Builder.\n"
+        "**TACTICAL:** Play Research Network, then a city.\n"
+        "**CHOICE:** 15\n"
+        "**PAYMENT:** MC=8\n"
+        "--------------------------"
+    )
+    out = sanitize_strategy(raw)
+    assert "CHOICE" not in out
+    assert "PAYMENT" not in out
+    assert "PRIOR STRATEGY" not in out
+    assert "-----" not in out
+    assert "MC engine" in out
+    assert "Research Network" in out
+
+
+def test_game_end_proximity_banner():
+    # 0/3 and 1/3 maxed → no banner; ≥2/3 → banner that names what is still rising.
+    assert game_end_proximity({"temperature": -10, "oxygen": 3, "oceanCount": 2}) is None
+    assert game_end_proximity({"temperature": 8, "oxygen": 3, "oceanCount": 2}) is None
+    banner = game_end_proximity({"temperature": 8, "oxygen": 14, "oceanCount": 7})
+    assert banner is not None
+    assert "GAME-END IMMINENT" in banner
+    assert "oceans 7/9" in banner
