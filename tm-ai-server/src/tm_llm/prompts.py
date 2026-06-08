@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import re
 
-from .knowledge import CARD_DB, format_card_context, format_config_context, format_board_layout
+from .knowledge import CARD_DB, card_brief, format_card_context, format_config_context, format_board_layout
 from .options import _default_response, index_to_response
 from .payment import (
     parse_payment_line, correct_payment, auto_payment_for_card, label_prefix, _EMPH,
@@ -312,12 +312,25 @@ def compute_milestone_status(state: dict) -> list[str]:
 
 
 def compute_award_standings(state: dict) -> list[str]:
+    """Every available award with its funded status (and funder) plus the current standings, so
+    the model can both decide what to fund AND see where it stands on already-funded awards (it
+    can still score 1st/2nd at game end)."""
     g, p = state.get("game", {}), state.get("player", {})
     opps = state.get("opponents") or []
-    funded_names = {a["name"] for a in state.get("awards", [])}
     available = g.get("availableAwards") or []
     if not available:
         return []
+
+    my_id, my_name = p.get("id"), p.get("name", "You")
+    id_to_name = {my_id: f"you ({my_name})"} if my_id else {}
+    for opp in opps:
+        if opp.get("id"):
+            id_to_name[opp["id"]] = opp.get("name", "Opp")
+    funded_by: dict[str, str] = {}
+    for a in state.get("awards", []):
+        nm = a.get("name") if isinstance(a, dict) else None
+        if nm:
+            funded_by[nm] = id_to_name.get(a.get("playerId"), "?")
 
     def _val(entity: dict, award_name: str) -> int:
         nl = award_name.lower()
@@ -336,21 +349,21 @@ def compute_award_standings(state: dict) -> list[str]:
             return sum(bt.values()) if isinstance(bt, dict) else 0
         return -1
 
-    my_name = p.get("name", "You")
     lines: list[str] = []
     for award_info in available:
         aname = award_info.get("name", "?")
-        if aname in funded_names:
-            continue
+        status = f"FUNDED by {funded_by[aname]}" if aname in funded_by else "unfunded"
         my_v = _val(p, aname)
         if my_v < 0:
+            # Metric not modelled (e.g. a fan/randomised award) — still surface funded status.
+            lines.append(f"  {aname} [{status}]")
             continue
         entries = [(my_name, my_v)] + [(o.get("name", "Opp"), _val(o, aname)) for o in opps]
         entries.sort(key=lambda x: x[1], reverse=True)
         rank = next((i + 1 for i, (n, _) in enumerate(entries) if n == my_name), len(entries))
         rank_str = {1: "1st", 2: "2nd", 3: "3rd"}.get(rank, f"{rank}th")
         standings = ", ".join(f"{n}={v}" for n, v in entries)
-        lines.append(f"  {aname}: you are {rank_str} ({standings})")
+        lines.append(f"  {aname} [{status}]: you are {rank_str} ({standings})")
     return lines
 
 
@@ -387,6 +400,25 @@ def _get_card_desc_for_option(opt: dict) -> str:
         return ""
     desc = CARD_DB.get(name, {}).get("description", "")
     return f"Use {name} action — {desc}" if desc else f"Use {name} action"
+
+
+def _option_card_name(opt: dict) -> str:
+    """The card name an option resolves to, if it maps to a single known card.
+
+    Handles both a card-type option (node is the card dict) and an expanded projectCard menu
+    option (node is the parent projectCard node; the card sits at the last path index)."""
+    node = opt.get("node")
+    if not isinstance(node, dict):
+        return ""
+    if node.get("name"):
+        return node["name"]
+    cards = node.get("cards")
+    path = opt.get("path") or []
+    if cards and path:
+        j = path[-1]
+        if isinstance(j, int) and 0 <= j < len(cards):
+            return cards[j].get("name", "")
+    return ""
 
 
 def _extract_card_names(waiting_for: dict, max_depth: int = 3) -> list[str]:
@@ -507,23 +539,24 @@ def build_action_prompt(state: dict, waiting_for: dict, options: list[dict], *,
         lines.append(f"{nm}: TR:{opp.get('terraformRating', 20)}{vp}  MC:{opp.get('megacredits', 0)}{hs}{corp_str}  prod:{opp_prod}  tags:{opp_tags}")
         played = opp.get("playedCards") or []
         if played:
-            shown = ", ".join(played[:18])
-            extra = f" (+{len(played) - 18} more)" if len(played) > 18 else ""
-            lines.append(f"  {nm} played: {shown}{extra}")
+            # Describe each played card (effect/tags/VP) so the model can read the opponent's
+            # engine and award/milestone threats — a bare name list is unreadable for strategy.
+            lines.append(format_card_context(played, header=f"  {nm}'s tableau ({len(played)} cards):", max_cards=40))
 
     lines.extend(compute_milestone_status(state))
 
-    n_funded = len(aw) if aw else 0
-    if n_funded >= 3:
-        lines.append(f"Awards ({n_funded}/3 funded — FUNDING PHASE OVER).")
-    else:
-        standings = compute_award_standings(state)
-        if standings:
-            lines.append(
-                "Unfunded awards (scored at GAME END; leads erode as opponents grow). Fund only a "
-                "1st-place lead you'll hold to the end, rarely before ~gen 8; never to protect a thin lead:"
-            )
-            lines.extend(standings)
+    standings = compute_award_standings(state)
+    if standings:
+        n_funded = len(aw) if aw else 0
+        header = (f"Awards ({n_funded}/3 funded; scored at GAME END — you can still place 1st/2nd "
+                  "on an already-funded award, so keep competing).")
+        if n_funded >= 3:
+            header += " FUNDING PHASE OVER — do not try to fund more."
+        else:
+            header += (" Leads erode as opponents grow: fund only a 1st-place lead you'll hold to "
+                       "the end, rarely before ~gen 8, never a thin one.")
+        lines.append(header)
+        lines.extend(standings)
 
     # Live board (compact) on non-placement turns; full candidate adjacency on space turns
     if wf_type == "space":
@@ -559,6 +592,8 @@ def build_action_prompt(state: dict, waiting_for: dict, options: list[dict], *,
 
     card_names_in_decision = _extract_card_names(waiting_for)
     is_hand_decision = _is_card_decision_about_hand(card_names_in_decision, hand_cards)
+    hand_name_set = {c if isinstance(c, str) else c.get("name", "") for c in hand_cards}
+    hand_shown = bool(hand_cards) and wf_type not in ("space", "payment", "amount")
     for opt in options:
         idx = opt["index"] + 1
         title2 = str(opt["title"])
@@ -570,12 +605,20 @@ def build_action_prompt(state: dict, waiting_for: dict, options: list[dict], *,
         if sp_cost is not None:
             cost_tag = (f"  [{sp_cost} MC — NOT AFFORDABLE, you have {mc} MC]" if sp_cost > mc
                         else f"  [{sp_cost} MC; you have {mc} MC]")
+        # Append the card's description unless it's already in the hand glossary above (avoids
+        # repeating it) so every choosable card — drafts, buyable cards — explains itself.
+        brief = ""
+        cname = _option_card_name(opt)
+        if cname and not (hand_shown and cname in hand_name_set):
+            b = card_brief(cname)
+            if b:
+                brief = f"  — {b}"
         if wf_type == "card" and is_hand_decision and card_names_in_decision:
             lines.append(f"  {idx}. {title2[:70]} (see hand above){cost_tag}")
         elif desc:
-            lines.append(f"  {idx}. {desc}{cost_tag}")
+            lines.append(f"  {idx}. {desc}{cost_tag}{brief}")
         else:
-            lines.append(f"  {idx}. {title2[:70]}{cost_tag}")
+            lines.append(f"  {idx}. {title2[:70]}{cost_tag}{brief}")
 
     if wf_type == "card":
         cmax = waiting_for.get("max", 1) or 1

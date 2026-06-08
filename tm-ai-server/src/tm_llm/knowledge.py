@@ -44,6 +44,24 @@ def _vp_str(vp) -> str:
     return " [VP]"
 
 
+def card_brief(name: str) -> str:
+    """One-line '(cost MC) [tags]: description [VP]' for a known card, or '' if unknown.
+
+    Used to annotate option lines for cards that are NOT in the hand glossary (drafted/buyable
+    cards), so the model always sees what a card does before choosing it."""
+    entry = CARD_DB.get(name)
+    if not entry:
+        return ""
+    cost = entry.get("cost")
+    cost_str = f"({cost} MC) " if cost else ""
+    tags = entry.get("tags") or []
+    tag_str = f"[{', '.join(tags)}] " if tags else ""
+    desc = _trim_desc(entry.get("description", ""))
+    vp = _vp_str(entry.get("victoryPoints"))
+    body = f"{cost_str}{tag_str}{desc}{vp}".strip()
+    return body
+
+
 def format_card_context(card_names: list, header: str = "", max_cards: int = 30) -> str:
     """Return a compact one-line-per-card block for the listed cards (from CARD_DB)."""
     lines = []

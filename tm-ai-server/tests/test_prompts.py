@@ -1,8 +1,10 @@
 """Tests for response parsing, payment validation, and single-sourced data in tm_llm."""
 from tm_llm.options import flatten_options
+import tm_llm.knowledge as knowledge
 from tm_llm.prompts import (
     capture_tactical, parse_action_response, standard_project_cost, find_choice, find_choices,
-    STANDARD_PROJECT_COSTS, sanitize_strategy, game_end_proximity,
+    STANDARD_PROJECT_COSTS, sanitize_strategy, game_end_proximity, compute_award_standings,
+    _option_card_name,
 )
 from tm_llm.payment import check_payment_valid, parse_payment_line
 
@@ -165,6 +167,39 @@ def test_parse_action_single_card_keep_unchanged():
     options = flatten_options(wf)
     resp, _dbg = parse_action_response("Keep B.\nCHOICE: 2", options, wf, "pX", player={})
     assert resp == {"type": "card", "cards": ["B"]}
+
+
+def test_award_standings_shows_funded_and_unfunded():
+    # Funded awards must appear (with funder + standings), not be hidden — you can still score
+    # 1st/2nd at game end.
+    state = {
+        "game": {"availableAwards": [{"name": "Banker"}, {"name": "Thermalist"}]},
+        "player": {"id": "me", "name": "Kai", "production": {"megacredits": 5}, "heat": 4},
+        "opponents": [{"id": "p1", "name": "Peter", "production": {"megacredits": 8}, "heat": 7}],
+        "awards": [{"name": "Thermalist", "playerId": "p1"}],
+    }
+    joined = "\n".join(compute_award_standings(state))
+    assert "Banker [unfunded]" in joined
+    assert "Thermalist [FUNDED by Peter]" in joined
+    assert "Kai=5" in joined and "Peter=8" in joined
+    assert "you are 2nd" in joined
+
+
+def test_option_card_name_resolution():
+    # card-type option: node is the card dict
+    assert _option_card_name({"node": {"name": "Soil Factory"}, "path": [0]}) == "Soil Factory"
+    # expanded projectCard menu: node is the parent, card at the last path index
+    parent = {"type": "projectCard", "cards": [{"name": "A"}, {"name": "B"}, {"name": "C"}]}
+    assert _option_card_name({"node": parent, "path": [1, 2]}) == "C"
+    assert _option_card_name({"node": {}, "path": [0]}) == ""
+
+
+def test_card_brief(monkeypatch):
+    monkeypatch.setitem(knowledge.CARD_DB, "Testium",
+                        {"cost": 12, "tags": ["building"], "description": "Do a thing.", "victoryPoints": 1})
+    b = knowledge.card_brief("Testium")
+    assert "(12 MC)" in b and "[building]" in b and "Do a thing." in b and "[1 VP]" in b
+    assert knowledge.card_brief("Nonexistent Card XYZ") == ""
 
 
 def test_sanitize_strategy_strips_turn_artefacts():
