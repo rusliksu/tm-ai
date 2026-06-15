@@ -36,6 +36,7 @@ _KNOWN_CAPABILITIES: dict[str, dict] = {
     "anthropic/claude-sonnet-4-5": {"caching": True,  "thinking": True},
     "anthropic/claude-haiku-4-5":  {"caching": True,  "thinking": False},
     "openai/gpt-5.5":              {"caching": False, "thinking": False},
+    "openai/gpt-5-nano":           {"caching": False, "thinking": True},
     "openai/gpt-4o":               {"caching": False, "thinking": False},
     "openai/gpt-4o-mini":          {"caching": False, "thinking": False},
     "openai/o3":                   {"caching": False, "thinking": False},
@@ -300,6 +301,26 @@ def _provider_routing(model: str) -> dict | None:
     return None
 
 
+def _thinking_config(model: str, think: bool, can_think: bool, budget: int) -> tuple[dict, str]:
+    """Return (extra_body_fragment, anthropic-beta header) controlling reasoning.
+
+    Wanting thinking ON → Anthropic gets an enabled budget + interleaved-thinking beta;
+    OpenAI (gpt-5) reasoning is token-uncontrollable, so we cap effort at "minimal"; others
+    get a `reasoning.max_tokens` budget. Wanting it OFF → Anthropic and OpenAI need nothing
+    (Anthropic defaults off; OpenAI o-/gpt-5 reasoning can't be fully disabled), but
+    Gemini/Qwen/etc. reason BY DEFAULT, so omitting the param leaves thinking on — we must
+    send `reasoning.enabled=false` to actually turn it off (was the gemini-3.1-flash-lite bug)."""
+    if think and can_think:
+        if model.startswith("anthropic/"):
+            return {"thinking": {"type": "enabled", "budget_tokens": budget}}, "interleaved-thinking-2025-05-14"
+        if model.startswith("openai/"):
+            return {"reasoning": {"effort": "minimal"}}, ""
+        return {"reasoning": {"max_tokens": budget}}, ""
+    if not model.startswith(("anthropic/", "openai/")):
+        return {"reasoning": {"enabled": False}}, ""
+    return {}, ""
+
+
 def single_shot(model: str, system: str, user: str, *, think: bool = True,
                 thinking_budget: int | None = None,
                 max_output_tokens: int | None = None) -> tuple[str, dict]:
@@ -319,13 +340,11 @@ def single_shot(model: str, system: str, user: str, *, think: bool = True,
     extra_headers: dict = {}
     extra_body: dict = {}
 
-    if think and caps.get("thinking"):
-        budget = thinking_budget or config.OPENROUTER_THINKING_BUDGET
-        if model.startswith("anthropic/"):
-            extra_body["thinking"] = {"type": "enabled", "budget_tokens": budget}
-            extra_headers["anthropic-beta"] = "interleaved-thinking-2025-05-14"
-        else:
-            extra_body["reasoning"] = {"max_tokens": budget}
+    budget = thinking_budget or config.OPENROUTER_THINKING_BUDGET
+    body_frag, beta = _thinking_config(model, think, caps.get("thinking", False), budget)
+    extra_body.update(body_frag)
+    if beta:
+        extra_headers["anthropic-beta"] = beta
 
     if caps.get("caching"):
         existing = extra_headers.get("anthropic-beta", "")

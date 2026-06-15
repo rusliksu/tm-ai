@@ -99,3 +99,34 @@ def test_gemini_3_1_flash_lite_thinking_off():
     config.OPENROUTER_THINKING = "auto"
     caps = openrouter.get_capabilities("google/gemini-3.1-flash-lite")
     assert caps["thinking"] is False and caps["caching"] is False
+
+
+def test_thinking_config_gemini_off_disables_reasoning():
+    """Gemini reasons by default, so disabling thinking must send reasoning.enabled=false —
+    merely omitting the param (the old behaviour) left it thinking."""
+    body, beta = openrouter._thinking_config("google/gemini-3.1-flash-lite", True, False, 512)
+    assert body == {"reasoning": {"enabled": False}} and beta == ""
+
+
+def test_thinking_config_non_anthropic_on_sends_budget():
+    body, beta = openrouter._thinking_config("deepseek/deepseek-v4-flash", True, True, 512)
+    assert body == {"reasoning": {"max_tokens": 512}} and beta == ""
+
+
+def test_thinking_config_openai_on_caps_effort_minimal():
+    """gpt-5 reasoning is token-uncontrollable; keep it on but at minimal effort, not a budget."""
+    body, beta = openrouter._thinking_config("openai/gpt-5-nano", True, True, 512)
+    assert body == {"reasoning": {"effort": "minimal"}} and beta == ""
+
+
+def test_thinking_config_anthropic_on_enables_with_beta():
+    body, beta = openrouter._thinking_config("anthropic/claude-haiku-4.5", True, True, 1024)
+    assert body == {"thinking": {"type": "enabled", "budget_tokens": 1024}}
+    assert beta == "interleaved-thinking-2025-05-14"
+
+
+def test_thinking_config_anthropic_and_openai_off_send_nothing():
+    """Anthropic defaults off; OpenAI o-/gpt-5 reasoning can't be disabled — neither needs a
+    disable flag, which would be a no-op or rejected."""
+    assert openrouter._thinking_config("anthropic/claude-haiku-4.5", True, False, 512) == ({}, "")
+    assert openrouter._thinking_config("openai/gpt-5-nano", False, True, 512) == ({}, "")
