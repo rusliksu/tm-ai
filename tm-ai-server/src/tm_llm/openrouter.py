@@ -44,6 +44,7 @@ _KNOWN_CAPABILITIES: dict[str, dict] = {
     "google/gemini-2.5-pro":       {"caching": False, "thinking": True},
     "google/gemini-2.5-flash":     {"caching": False, "thinking": True},
     "google/gemini-2.5-flash-lite": {"caching": False, "thinking": False},
+    "google/gemini-3.1-flash-lite": {"caching": False, "thinking": False},
     "deepseek/deepseek-v4-pro":    {"caching": False, "thinking": True},
     "deepseek/deepseek-v4-flash":  {"caching": False, "thinking": True},
     "deepseek/deepseek-r1":        {"caching": False, "thinking": True},
@@ -270,17 +271,30 @@ def _system_message(model: str, system: str) -> dict:
 # Main entry point
 # ---------------------------------------------------------------------------
 
+# Per-model upstream pin (order = preference). Stops OpenRouter floating a model across
+# providers, which resets prompt caching each switch — a global OPENROUTER_PROVIDER can't do
+# this in a multi-model death match (one provider rarely serves every model). Picked by
+# price + cache-read rate + context: deepseek-v4-flash on GMICloud/Baidu beats the throughput
+# default (which floated Baidu/Fireworks, so only some calls hit a warm cache).
+_MODEL_PROVIDER: dict[str, list[str]] = {
+    "deepseek/deepseek-v4-flash": ["GMICloud", "Baidu"],
+}
+
+
 def _provider_routing(model: str) -> dict | None:
     """OpenRouter `provider` routing block for a request, or None to let OpenRouter decide.
 
-    An explicit OPENROUTER_PROVIDER pins one provider with NO fallback so prompt caching stays
-    warm and a slow/changing provider can't be chosen — OpenRouter was otherwise floating deepseek
-    between SiliconFlow/Alibaba, resetting the cache on each switch. Without a pin, open models are
-    sorted by throughput (Anthropic/OpenAI already resolve to a single host)."""
+    Precedence: an explicit OPENROUTER_PROVIDER pins one provider with NO fallback (applies to
+    every model); else a per-model pin from _MODEL_PROVIDER keeps that model on a warm-cache
+    provider while still allowing fallback if it's down; else open models are sorted by
+    throughput (Anthropic/OpenAI already resolve to a single host)."""
     if config.OPENROUTER_PROVIDER:
         order = [pp.strip() for pp in config.OPENROUTER_PROVIDER.split(",") if pp.strip()]
         if order:
             return {"order": order, "allow_fallbacks": False, "require_parameters": True}
+    pin = _MODEL_PROVIDER.get(model)
+    if pin:
+        return {"order": list(pin), "allow_fallbacks": True, "require_parameters": True}
     if not model.startswith(("anthropic/", "openai/")):
         return {"sort": "throughput", "require_parameters": True}
     return None

@@ -58,10 +58,44 @@ def test_provider_routing_default_throughput_for_open_models():
     saved = config.OPENROUTER_PROVIDER
     try:
         config.OPENROUTER_PROVIDER = ""
-        assert openrouter._provider_routing("deepseek/deepseek-v4-flash") == {
+        # an open model with no per-model pin falls back to throughput sorting
+        assert openrouter._provider_routing("deepseek/deepseek-v4-pro") == {
             "sort": "throughput", "require_parameters": True}
         # Anthropic/OpenAI resolve to a single host already → no provider block
         assert openrouter._provider_routing("anthropic/claude-opus-4-7") is None
         assert openrouter._provider_routing("openai/gpt-4o-mini") is None
     finally:
         config.OPENROUTER_PROVIDER = saved
+
+
+def test_provider_routing_per_model_pin():
+    """A model in _MODEL_PROVIDER is pinned (with fallback) so its prompt cache stays warm,
+    instead of floating across providers under throughput sorting."""
+    saved = config.OPENROUTER_PROVIDER
+    try:
+        config.OPENROUTER_PROVIDER = ""
+        r = openrouter._provider_routing("deepseek/deepseek-v4-flash")
+        assert r == {"order": ["GMICloud", "Baidu"], "allow_fallbacks": True,
+                     "require_parameters": True}
+    finally:
+        config.OPENROUTER_PROVIDER = saved
+
+
+def test_explicit_provider_overrides_per_model_pin():
+    """A global OPENROUTER_PROVIDER takes precedence over a per-model pin."""
+    saved = config.OPENROUTER_PROVIDER
+    try:
+        config.OPENROUTER_PROVIDER = "Cloudflare"
+        r = openrouter._provider_routing("deepseek/deepseek-v4-flash")
+        assert r == {"order": ["Cloudflare"], "allow_fallbacks": False,
+                     "require_parameters": True}
+    finally:
+        config.OPENROUTER_PROVIDER = saved
+
+
+def test_gemini_3_1_flash_lite_thinking_off():
+    """gemini-3.1-flash-lite must match its flash-lite sibling (no reasoning), not fall through
+    to the unknown-model default of thinking=True."""
+    config.OPENROUTER_THINKING = "auto"
+    caps = openrouter.get_capabilities("google/gemini-3.1-flash-lite")
+    assert caps["thinking"] is False and caps["caching"] is False

@@ -6,7 +6,6 @@
 #   OPENROUTER_MODEL=anthropic/claude-sonnet-4-6 ./start.sh
 #   OPENROUTER_THINKING=off ./start.sh              # disable model reasoning (faster); auto|on|off
 #   OPENROUTER_PROVIDER=Cloudflare ./start.sh       # pin upstream provider (comma-sep order ok)
-#                                                   # defaults to Cloudflare for deepseek models
 #   LLM_DEBUG=false ./start.sh
 #   TM_AI_DIR=/path TM_DIR=/path ./start.sh
 #
@@ -104,12 +103,9 @@ done
 
 : > "${PID_FILE}"
 
-# Pin one OpenRouter provider so prompt caching stays warm and a slow/changing provider isn't
-# chosen. Default Cloudflare for deepseek models; honour an explicit OPENROUTER_PROVIDER otherwise.
+# Per-model provider pins (e.g. deepseek → GMICloud/Baidu) live in openrouter.py's
+# _MODEL_PROVIDER table; an explicit OPENROUTER_PROVIDER here still overrides them globally.
 EFFECTIVE_MODEL="${OPENROUTER_MODEL:-deepseek/deepseek-v4-flash}"
-if [[ -z "${OPENROUTER_PROVIDER:-}" && "${EFFECTIVE_MODEL}" == deepseek/* ]]; then
-  OPENROUTER_PROVIDER="Cloudflare"
-fi
 
 # --- AI server ----------------------------------------------------------------
 echo "▶ starting AI server (OpenRouter, model: ${EFFECTIVE_MODEL}, provider: ${OPENROUTER_PROVIDER:-auto}, log: ${AI_LOG})"
