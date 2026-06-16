@@ -31,7 +31,11 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any
+
+# Per-player persisted LLM state (model/strategy/tactical), used to resume a game.
+_DEFAULT_STATE_DIR = Path(__file__).resolve().parent.parent / "logs" / "llm-state"
 
 
 def post_json(url: str, payload: dict, timeout: int = 300) -> dict:
@@ -43,6 +47,10 @@ def post_json(url: str, payload: dict, timeout: int = 300) -> dict:
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")[:400]
         raise RuntimeError(f"HTTP {e.code} from {url}: {body}") from e
+    except (urllib.error.URLError, TimeoutError) as e:
+        # Connection refused / read timeout — convert so callers can catch + retry instead of
+        # crashing (an uncaught 300s /move TimeoutError is what ended the original game).
+        raise RuntimeError(f"network error from {url}: {e}") from e
 
 
 def _extract_server_error(raw: str) -> str:
@@ -58,6 +66,25 @@ def _extract_server_error(raw: str) -> str:
 
 
 _MAX_STEP_RETRIES = 2
+_MOVE_TIMEOUT = 300
+_MOVE_ATTEMPTS = 3
+
+
+def request_move(ai_url: str, move_req: dict) -> dict:
+    """POST /move with bounded retries. /move is stateless and the game isn't stepped until a
+    response is accepted, so re-sending after a timeout/connection error is safe — and keeps a
+    transient slow turn from ending the whole game (the original crash was an uncaught timeout)."""
+    last: Exception | None = None
+    for attempt in range(1, _MOVE_ATTEMPTS + 1):
+        try:
+            return post_json(f"{ai_url}/move", move_req, timeout=_MOVE_TIMEOUT)
+        except RuntimeError as e:
+            last = e
+            print(f"\n  ⚠ /move failed (attempt {attempt}/{_MOVE_ATTEMPTS}): {str(e)[:140]}", flush=True)
+            if attempt < _MOVE_ATTEMPTS:
+                time.sleep(2 * attempt)
+    print(f"\n  ✗ AI server error after {_MOVE_ATTEMPTS} attempts: {last}")
+    sys.exit(1)
 
 
 def build_move_request(game_id: str, player_id: str, state: dict, waiting_for: dict) -> dict:
@@ -188,6 +215,21 @@ def play_game(
         print(f"  {player_names.get(pid, pid[:8]):<14} {assigned_models.get(pid, '?')}")
     print(flush=True)
 
+    _drive_loop(tm_url, ai_url, game_id, player_id, state, wf,
+                player_names, assigned_models, verbose)
+
+
+def _drive_loop(
+    tm_url: str,
+    ai_url: str,
+    game_id: str,
+    player_id: str,
+    state: dict,
+    wf: dict,
+    player_names: dict[str, str],
+    assigned_models: dict[str, str],
+    verbose: bool,
+) -> None:
     turn = 0
     last_gen = 0
 
@@ -210,11 +252,7 @@ def play_game(
         # --- Ask AI server for a move ---
         move_req = build_move_request(game_id, player_id, state, wf)
         t0 = time.time()
-        try:
-            move_data = post_json(f"{ai_url}/move", move_req, timeout=300)
-        except RuntimeError as e:
-            print(f"\n  ✗ AI server error: {e}")
-            sys.exit(1)
+        move_data = request_move(ai_url, move_req)
         elapsed = time.time() - t0
         input_response = move_data["input_response"]
         print(f"  → {json.dumps(input_response)[:80]}  ({elapsed:.1f}s)", flush=True)
@@ -226,11 +264,7 @@ def play_game(
             if step_attempt > 0:
                 # Re-ask AI server with the rejection error
                 move_req["last_error"] = step_last_error
-                try:
-                    move_data = post_json(f"{ai_url}/move", move_req, timeout=300)
-                except RuntimeError as e:
-                    print(f"\n  ✗ AI server error on retry {step_attempt}: {e}")
-                    sys.exit(1)
+                move_data = request_move(ai_url, move_req)
                 input_response = move_data["input_response"]
                 print(f"  ↩ retry {step_attempt}/{_MAX_STEP_RETRIES}: {json.dumps(input_response)[:70]}",
                       flush=True)
@@ -250,15 +284,7 @@ def play_game(
 
         if step_data.get("done"):
             print(f"\n=== Game over (gen {gen}) ===\n")
-            result = step_data.get("result") or {}
-            for entry in sorted(result.get("playerResults", []), key=lambda r: r.get("rank", 99)):
-                rank  = entry.get("rank", "?")
-                name  = entry.get("name", "?")
-                vp    = entry.get("vp_total", "?")
-                tr    = entry.get("tr", "?")
-                model = assigned_models.get(entry.get("playerId", ""), "?")
-                print(f"  #{rank}  {name:<14}  {vp} VP  (TR {tr})  [{model}]")
-            print()
+            _print_results(step_data.get("result") or {}, assigned_models)
 
             # Flush per-player token/cost summary
             try:
@@ -278,6 +304,74 @@ def play_game(
                 player_names[pid] = p.get("name", pid[:8])
 
 
+def _print_results(result: dict, assigned_models: dict[str, str]) -> None:
+    for entry in sorted(result.get("playerResults", []), key=lambda r: r.get("rank", 99)):
+        rank  = entry.get("rank", "?")
+        name  = entry.get("name", "?")
+        vp    = entry.get("vp_total", "?")
+        tr    = entry.get("tr", "?")
+        model = assigned_models.get(entry.get("playerId", ""), "?")
+        print(f"  #{rank}  {name:<14}  {vp} VP  (TR {tr})  [{model}]")
+    print()
+
+
+def _models_from_state(state_dir: Path, game_id: str) -> dict[str, str]:
+    """Map {player_id: model} from persisted LLM state files for this game.
+
+    On resume we must NOT call /player/register (it builds a fresh LLMPlayer and discards the
+    persisted strategy/tactical); the AI server restores each player lazily on its first /move.
+    These files only feed the driver's display + final results table."""
+    assigned: dict[str, str] = {}
+    if not state_dir.is_dir():
+        return assigned
+    for f in state_dir.glob("*.json"):
+        try:
+            data = json.loads(f.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if data.get("game_id") == game_id and data.get("model"):
+            assigned[f.stem] = data["model"]
+    return assigned
+
+
+def resume_game(tm_url: str, ai_url: str, game_id: str, state_dir: Path, verbose: bool) -> None:
+    """Continue an existing (e.g. crashed) game from its persisted state.
+
+    Seeds the drive loop from /api/ai/peek (current pending decision, no move applied) instead
+    of creating a new game, and skips registration so the AI server restores each player's
+    memory from disk on first /move."""
+    print(f"Resuming game {game_id} ...", flush=True)
+    data = post_json(f"{tm_url}/api/ai/peek", {"game_id": game_id}, timeout=30)
+
+    if data.get("done"):
+        print("\n=== Game already finished ===\n")
+        _print_results(data.get("result") or {}, _models_from_state(state_dir, game_id))
+        return
+
+    player_id = data["player_id"]
+    state     = data["state"]
+    wf        = data["waitingFor"]
+
+    try:
+        Path("/tmp/current-game.id").write_text(game_id)
+    except OSError:
+        pass
+
+    assigned_models = _models_from_state(state_dir, game_id)
+    player_names: dict[str, str] = {p["id"]: p.get("name", p["id"][:8])
+                                    for p in ([state.get("player", {})] + (state.get("opponents") or []))
+                                    if p.get("id")}
+
+    print(f"\nGame {game_id}  (restored {len(assigned_models)} player states)")
+    print("\nLineup:")
+    for pid, name in player_names.items():
+        print(f"  {name:<16} {assigned_models.get(pid, '?')}")
+    print(flush=True)
+
+    _drive_loop(tm_url, ai_url, game_id, player_id, state, wf,
+                player_names, assigned_models, verbose)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Drive a TM game via the self-play API")
     parser.add_argument("--tm-url",  default="http://localhost:8080")
@@ -290,7 +384,20 @@ def main() -> None:
              "Fewer than --players → last model repeated.",
     )
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--resume", default=None, metavar="GAME_ID",
+        help="Continue an existing game from persisted state instead of creating a new one "
+             "(seeds from /api/ai/peek; skips registration so player memory is restored).",
+    )
+    parser.add_argument(
+        "--state-dir", default=str(_DEFAULT_STATE_DIR),
+        help="Per-player LLM state dir (used with --resume to map players to models).",
+    )
     args = parser.parse_args()
+
+    if args.resume:
+        resume_game(args.tm_url, args.ai_url, args.resume, Path(args.state_dir), args.verbose)
+        return
 
     models = [m.strip() for m in args.models.split(",") if m.strip()]
 
