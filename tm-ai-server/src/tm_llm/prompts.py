@@ -1085,10 +1085,27 @@ def build_pergen_prompt(state: dict, prior_strategy: str, generation: int) -> st
     aw_status = compute_award_standings(state)
     own_name = p.get("name", "?")
 
+    # Standings vs each opponent — the reflection step asks the model to assess whether it is
+    # ahead/behind, so it must see ground-truth VP/TR/engine. Without this the model confabulates
+    # a lead from its prior strategy and never switches plans. Compact one-liner per player.
+    def _standing_row(name: str, src: dict) -> str:
+        vp = src.get("victoryPoints")
+        vp_str = f"VP:{vp}" if vp is not None else "VP:?"
+        prod = {k: v for k, v in src.get("production", {}).items() if v}
+        n_tags = sum(1 for t in src.get("tags", {}).values() if t)
+        return (f"  {name}: TR:{src.get('terraformRating', 20)} {vp_str}  "
+                f"prod:{prod}  tags:{n_tags}")
+
+    standings_rows = [_standing_row(f"You ({own_name})", p)]
+    for opp in state.get("opponents") or []:
+        standings_rows.append(_standing_row(opp.get("name", "?"), opp))
+    standings_block = "Current standings (VP is the only thing that decides the game):\n" + "\n".join(standings_rows) + "\n"
+
     return (
         f"=== End of Generation {generation - 1}, start of Generation {generation} ===\n"
         f'You are "{own_name}". {status_line}'
         + " ".join(notes) + "\n"
+        + standings_block
         + ("\n".join(ms_status) + "\n" if ms_status else "")
         + ("Unfunded award standings:\n" + "\n".join(aw_status) + "\n" if aw_status else "")
         + "\nLast gen's strategy notes (ALL you remember — state is supplied fresh each turn):\n"
@@ -1098,7 +1115,8 @@ def build_pergen_prompt(state: dict, prior_strategy: str, generation: int) -> st
         "Reply with ONLY your rewritten strategy: ~120 words of dense prose. No CHOICE/PAYMENT "
         "lines, no option numbers, and do NOT echo any instruction label (e.g. 'DEFERRAL', "
         "'PROSE ONLY') — those are directions to you, not content. Cover, in order:\n"
-        "1. STANDING: VP/TR vs each opponent — ahead, level, or behind?\n"
+        "1. STANDING: read the Current standings above (do NOT trust last gen's claim) — state "
+        "your VP gap to each opponent and whether you are ahead, level, or behind on VP.\n"
         "2. ENGINE (PRIMARY): your path to victory and how you score each gen.\n"
         "3. MILESTONE TARGET: a still-available one (never ✗); if you already meet a ✓, claim it FIRST this gen.\n"
         "4. AWARD TARGET: only one you can win 1st/close-2nd; else 'none'.\n"
