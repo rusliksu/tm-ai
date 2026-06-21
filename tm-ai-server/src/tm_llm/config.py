@@ -8,6 +8,10 @@ import os
 from pathlib import Path
 
 # --- server ---
+# Bind to loopback by default: /move and /player/register are unauthenticated and spend
+# real money via OPENROUTER_API_KEY, so the server must not be exposed to untrusted networks.
+# Override HOST=0.0.0.0 only behind your own auth/firewall.
+HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "8000"))
 LLM_DEBUG = os.getenv("LLM_DEBUG", "false").lower() == "true"
 

@@ -117,7 +117,7 @@ echo "▶ starting AI server (OpenRouter, model: ${EFFECTIVE_MODEL}, provider: $
   OPENROUTER_THINKING="${OPENROUTER_THINKING:-off}" \
   OPENROUTER_MAX_OUTPUT_TOKENS="${OPENROUTER_MAX_OUTPUT_TOKENS:-4096}" \
   LLM_DEBUG="${LLM_DEBUG:-true}" \
-  exec uv run uvicorn tm_llm.app:app --host 0.0.0.0 --port 8000
+  exec uv run uvicorn tm_llm.app:app --host "${HOST:-127.0.0.1}" --port 8000
 ) >> "${AI_LOG}" 2>&1 &
 AI_PID=$!
 echo "${AI_PID}" >> "${PID_FILE}"

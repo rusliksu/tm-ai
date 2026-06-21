@@ -63,6 +63,12 @@ source ~/workspace/tm-ai/.env                              # never read .env dir
 `.env` is the only place secrets live. The AI server needs `OPENROUTER_API_KEY`; the TM
 server reads `AI_SERVER_URL` and `AI_TIMEOUT_MS`.
 
+> ⚠️ **Security — keep the AI server on localhost.** `/move` and `/player/register` are
+> unauthenticated and every call spends real money against your `OPENROUTER_API_KEY`. The
+> server binds to `127.0.0.1` by default for this reason. Do **not** expose it to an
+> untrusted network (set `HOST=0.0.0.0` only behind your own auth/firewall), and set a spend
+> limit on your OpenRouter key.
+
 ## Running the stack
 
 ### A. Play vs. an LLM in the browser
@@ -73,7 +79,7 @@ source ~/workspace/tm-ai/.env
 # AI server (any OpenRouter model id)
 cd ~/workspace/tm-ai/tm-ai-server
 OPENROUTER_MODEL=anthropic/claude-sonnet-4-6 LLM_DEBUG=true \
-  uv run uvicorn tm_llm.app:app --host 0.0.0.0 --port 8000
+  uv run uvicorn tm_llm.app:app --host 127.0.0.1 --port 8000
 
 # TM server (separate terminal)
 cd ~/workspace/terraforming-mars

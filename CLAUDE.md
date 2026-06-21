@@ -11,8 +11,8 @@ AI Trainer (all removed in the 0.2 reimplementation).
 
 ## Two-Repo Architecture
 
-- **`/home/pmunk/workspace/tm-ai`** (this repo) — Python FastAPI LLM AI server (`tm_llm`).
-- **`/home/pmunk/workspace/terraforming-mars`** (sibling, branch `feat/ai-player`) —
+- **`~/workspace/tm-ai`** (this repo) — Python FastAPI LLM AI server (`tm_llm`).
+- **`~/workspace/terraforming-mars`** (sibling, branch `feat/ai-player`) —
   TypeScript/Node.js game server fork. Minimal adaptions from `main`: an `isAI` auto-move
   path, an AI state mapping, and a self-play driver API.
 
@@ -35,7 +35,7 @@ cd tm-ai-server && uv run pytest tests/test_board.py -v
 cd tm-ai-server && uv add <package>
 ```
 
-For the TM game server (`/home/pmunk/workspace/terraforming-mars`):
+For the TM game server (`~/workspace/terraforming-mars`):
 
 ```bash
 npm run build:server                                   # build TypeScript
@@ -160,7 +160,7 @@ a full game; `POST /game-done` flushes the per-player token/cost summary.
 
 ## TM fork integration points
 
-Key files in `/home/pmunk/workspace/terraforming-mars/src/server/`:
+Key files in `~/workspace/terraforming-mars/src/server/`:
 - `Player.ts` — `isAI`; `setWaitingFor` triggers `requestAiMove` when `isAI && !isSelfPlay`;
   `requestAiMove(lastError?, retryCount)` retries up to 2× on `process()` failure (sending
   the error as `last_error`) then falls back to `aiFallbackResponse()`; `_aiMoveInProgress`
@@ -177,7 +177,7 @@ Key files in `/home/pmunk/workspace/terraforming-mars/src/server/`:
 **API keys live in `tm-ai/.env`. Always load via `source`, never read the file directly:**
 
 ```bash
-source /home/pmunk/workspace/tm-ai/.env
+source ~/workspace/tm-ai/.env
 
 # AI server + TM server (single model, default deepseek/deepseek-v4-flash)
 ./start.sh
