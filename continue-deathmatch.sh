@@ -1,35 +1,28 @@
 #!/usr/bin/env bash
-# Start the AI + TM servers in the background.
+# Start AI + TM servers and CONTINUE an existing (e.g. crashed) death-match game.
+#
+# Unlike start-deathmatch.sh this does NOT create a new game or register players: it resumes
+# the persisted game via /api/ai/peek, and the AI server restores each player's memory
+# (strategy/tactical/token usage) from logs/llm-state/ on its first /move.
 #
 # USAGE
-#   ./start.sh                                      # default: deepseek/deepseek-v4-flash
-#   OPENROUTER_MODEL=anthropic/claude-sonnet-4-6 ./start.sh
-#   OPENROUTER_THINKING=off ./start.sh              # disable model reasoning (faster); auto|on|off
-#   OPENROUTER_PROVIDER=Cloudflare ./start.sh       # pin upstream provider (comma-sep order ok)
-#   LLM_DEBUG=false ./start.sh
-#   TM_AI_DIR=/path TM_DIR=/path ./start.sh
-#
-# For multi-LLM death-match runs, use:
-#   ./start-deathmatch.sh
+#   ./continue-deathmatch.sh                 # resume the latest game (logs/llm-test/_latest)
+#   ./continue-deathmatch.sh g29e2e3c6738f   # resume a specific game id
+#   LLM_DEBUG=false ./continue-deathmatch.sh
+#   TM_AI_DIR=/path TM_DIR=/path ./continue-deathmatch.sh
 #
 # REQUIREMENTS
-#   OPENROUTER_API_KEY must be set in ${TM_AI_DIR}/.env. The AI server derives
-#   the provider from the model name: "vendor/model" → OpenRouter, "bare:tag"
-#   → local Ollama.
+#   OPENROUTER_API_KEY must be set in ${TM_AI_DIR}/.env.
+#   The game must still be in the TM DB — do NOT run `./stop.sh --clean-db` before resuming.
 #
 # PORTS
 #   8000 — AI server (FastAPI)
 #   8080 — TM server (Node)
-#   If either port is already bound the script lists the offending PIDs and
-#   asks for confirmation before killing them. Decline → script exits.
 #
 # OUTPUT
 #   Server PIDs   /tmp/tm-ai.pids
-#   Session dir   ./logs/llm-test/<timestamp>/    (created at start)
-#       ai-server.log    (AI server)
-#       tm-server.log    (TM server)
-#   The latest session is also symlinked at ./logs/llm-test/_latest for
-#   convenience (`tail -f logs/llm-test/_latest/ai-server.log`).
+#   Game PID      /tmp/death-match.pids
+#   Logs append to the game's existing dir ./logs/llm-test/<game-id>/ (symlinked at _latest).
 #
 # STOP
 #   ./stop.sh
@@ -39,15 +32,31 @@ set -euo pipefail
 TM_AI_DIR="${TM_AI_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 TM_DIR="${TM_DIR:-${TM_AI_DIR}/../terraforming-mars}"
 
-# --- session log directory ----------------------------------------------------
-SESSION_ID="$(date -u +%Y-%m-%dT%H-%M-%SZ)"
-SESSION_DIR="${TM_AI_DIR}/logs/llm-test/${SESSION_ID}"
+# --- resolve which game to resume ---------------------------------------------
+# Explicit arg wins; else the target of the _latest symlink; else /tmp/current-game.id.
+GAME_ID="${1:-}"
+if [[ -z "${GAME_ID}" && -L "${TM_AI_DIR}/logs/llm-test/_latest" ]]; then
+  GAME_ID="$(basename "$(readlink "${TM_AI_DIR}/logs/llm-test/_latest")")"
+fi
+if [[ -z "${GAME_ID}" && -f /tmp/current-game.id ]]; then
+  GAME_ID="$(< /tmp/current-game.id)"
+fi
+if [[ -z "${GAME_ID}" ]]; then
+  echo "❌ no game id to resume (pass one as \$1, or ensure logs/llm-test/_latest exists)" >&2
+  exit 1
+fi
+echo "▶ resuming game ${GAME_ID}"
+
+# --- log directory: append to the game's existing dir -------------------------
+SESSION_DIR="${TM_AI_DIR}/logs/llm-test/${GAME_ID}"
 mkdir -p "${SESSION_DIR}"
-ln -sfn "${SESSION_ID}" "${TM_AI_DIR}/logs/llm-test/_latest"
+ln -sfn "${GAME_ID}" "${TM_AI_DIR}/logs/llm-test/_latest"
 
 AI_LOG="${SESSION_DIR}/ai-server.log"
 TM_LOG="${SESSION_DIR}/tm-server.log"
+DM_LOG="${SESSION_DIR}/death-match.log"
 PID_FILE=/tmp/tm-ai.pids
+DM_PID_FILE=/tmp/death-match.pids
 
 # --- env ----------------------------------------------------------------------
 if [[ -f "${TM_AI_DIR}/.env" ]]; then
@@ -103,19 +112,12 @@ done
 
 : > "${PID_FILE}"
 
-# Per-model provider pins (e.g. deepseek → GMICloud/Baidu) live in openrouter.py's
-# _MODEL_PROVIDER table; an explicit OPENROUTER_PROVIDER here still overrides them globally.
-EFFECTIVE_MODEL="${OPENROUTER_MODEL:-deepseek/deepseek-v4-flash}"
-
 # --- AI server ----------------------------------------------------------------
-echo "▶ starting AI server (OpenRouter, model: ${EFFECTIVE_MODEL}, provider: ${OPENROUTER_PROVIDER:-auto}, log: ${AI_LOG})"
+echo "▶ starting AI server (OpenRouter / multi-model, log: ${AI_LOG})"
 (
   cd "${TM_AI_DIR}/tm-ai-server"
-  # OPENROUTER_API_KEY is already exported via `set -a; source .env` above.
-  OPENROUTER_MODEL="${EFFECTIVE_MODEL}" \
-  OPENROUTER_PROVIDER="${OPENROUTER_PROVIDER:-}" \
-  OPENROUTER_THINKING="${OPENROUTER_THINKING:-off}" \
-  OPENROUTER_MAX_OUTPUT_TOKENS="${OPENROUTER_MAX_OUTPUT_TOKENS:-4096}" \
+  # API keys are already exported via `set -a; source .env` above — no need to
+  # pass them explicitly here, which would risk exposing them in process listings.
   LLM_DEBUG="${LLM_DEBUG:-true}" \
   exec uv run uvicorn tm_llm.app:app --host 0.0.0.0 --port 8000
 ) >> "${AI_LOG}" 2>&1 &
@@ -167,12 +169,34 @@ for i in {1..30}; do
   [[ $i -eq 30 ]] && { echo "❌ TM server did not respond in 30s — see ${TM_LOG}" >&2; exit 1; }
 done
 
+# --- resume the game ----------------------------------------------------------
+echo "▶ resuming death-match game ${GAME_ID} (log: ${DM_LOG})"
+(
+  cd "${TM_AI_DIR}"
+  exec uv run python scripts/play_game.py --resume "${GAME_ID}"
+) >> "${DM_LOG}" 2>&1 &
+DM_PID=$!
+echo "${DM_PID}" > "${DM_PID_FILE}"
+echo "  PID=${DM_PID}"
+
+# Give the driver a moment; fail fast if it can't pick up the game (e.g. not in DB).
+sleep 3
+if ! kill -0 "${DM_PID}" 2>/dev/null; then
+  echo "❌ resume driver exited immediately — see ${DM_LOG}" >&2
+  tail -15 "${DM_LOG}" >&2
+  exit 1
+fi
+
 # --- done ---------------------------------------------------------------------
 echo
-echo "✅ servers up"
+echo "✅ servers up + death-match resuming"
 echo "   AI server :8000  (PID ${AI_PID})  ${AI_LOG}"
 echo "   TM server :8080  (PID ${TM_PID})  ${TM_LOG}"
+echo "   death-match      (PID ${DM_PID})  ${DM_LOG}"
 echo "   session dir      ${SESSION_DIR}"
 echo "                    symlinked at logs/llm-test/_latest"
+echo
+echo "   follow game:  tail -f ${DM_LOG}"
+echo "   follow AI:    tail -f ${AI_LOG}"
 echo
 echo "stop with:  ./stop.sh"

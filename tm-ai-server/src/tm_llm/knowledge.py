@@ -1,29 +1,37 @@
-"""
-Game knowledge database for the LLM player.
+"""Game-knowledge database and context formatting for the LLM prompts.
 
 Provides:
-  CARD_DB                     — dict[name, entry] loaded from data/card_db.json
-  format_card_context(names)  — formatted card descriptions for prompt injection
-  format_config_context(game) — comprehensive setup block: board + expansions +
-                                 game variants + actual milestones/awards for this game
+  CARD_DB                      — dict[name, entry] loaded from data/card_db.json
+  format_card_context(names)   — compact (1 line/card) descriptions for prompt injection
+  format_config_context(game)  — board + expansions + variants + this game's milestones/awards
+  format_board_layout(spaces)  — static board layout (bonuses/oceans/volcanic) for the system prompt
 """
-
 from __future__ import annotations
 import json
-from pathlib import Path
+
+from .config import CARD_DB_PATH
 
 # ---------------------------------------------------------------------------
-# Card database — loaded from extract_card_db.ts output
+# Card database
 # ---------------------------------------------------------------------------
-
-_DB_PATH = Path(__file__).parent.parent.parent.parent / "data" / "card_db.json"
 
 CARD_DB: dict[str, dict] = {}
 try:
-    with open(_DB_PATH) as f:
+    with open(CARD_DB_PATH) as f:
         CARD_DB = json.load(f)
 except Exception:
     pass  # server still works without card descriptions
+
+# Cap a single card's description length in the prompt. Full multi-sentence text every
+# turn is the main per-turn token sink; one trimmed line keeps the decision-relevant gist.
+_MAX_DESC_CHARS = 140
+
+
+def _trim_desc(desc: str) -> str:
+    desc = " ".join(desc.split())
+    if len(desc) <= _MAX_DESC_CHARS:
+        return desc
+    return desc[:_MAX_DESC_CHARS].rstrip() + "…"
 
 
 def _vp_str(vp) -> str:
@@ -36,26 +44,53 @@ def _vp_str(vp) -> str:
     return " [VP]"
 
 
-def format_card_context(card_names: list[str], header: str = "", max_cards: int = 30) -> str:
-    """Return a compact description block for the listed cards (from CARD_DB)."""
+def card_brief(name: str) -> str:
+    """One-line '(cost MC) [tags]: description [VP]' for a known card, or '' if unknown.
+
+    Used to annotate option lines for cards that are NOT in the hand glossary (drafted/buyable
+    cards), so the model always sees what a card does before choosing it."""
+    entry = CARD_DB.get(name)
+    if not entry:
+        return ""
+    cost = entry.get("cost")
+    cost_str = f"({cost} MC) " if cost else ""
+    tags = entry.get("tags") or []
+    tag_str = f"[{', '.join(tags)}] " if tags else ""
+    desc = _trim_desc(entry.get("description", ""))
+    vp = _vp_str(entry.get("victoryPoints"))
+    body = f"{cost_str}{tag_str}{desc}{vp}".strip()
+    return body
+
+
+def format_card_context(card_names: list, header: str = "", max_cards: int = 30,
+                        resources: dict | None = None) -> str:
+    """Return a compact one-line-per-card block for the listed cards (from CARD_DB).
+
+    `resources` maps card name → count of resources currently stored on it (microbes, animals,
+    floaters, …). When present it is appended as ' {N on card}' so the model sees accumulated
+    resources — these often drive a card's VP and are otherwise invisible."""
+    res = resources or {}
     lines = []
     shown = 0
     for name in card_names:
+        name = name if isinstance(name, str) else name.get("name", "")
         if shown >= max_cards:
             lines.append(f"  … and {len(card_names) - max_cards} more cards")
             break
+        rcount = res.get(name)
+        res_str = f"  {{{rcount} on card}}" if rcount else ""
         entry = CARD_DB.get(name)
         if not entry:
-            lines.append(f"  {name}")
+            lines.append(f"  {name}{res_str}")
             shown += 1
             continue
         cost = entry.get("cost")
         cost_str = f"{cost} MC" if cost else "free"
         tags = entry.get("tags") or []
         tag_str = f" [{', '.join(tags)}]" if tags else ""
-        desc = entry.get("description", "")
+        desc = _trim_desc(entry.get("description", ""))
         vp = _vp_str(entry.get("victoryPoints"))
-        lines.append(f"  {name} ({cost_str}{tag_str}): {desc}{vp}")
+        lines.append(f"  {name} ({cost_str}{tag_str}): {desc}{vp}{res_str}")
         shown += 1
     if not lines:
         return ""
@@ -65,7 +100,6 @@ def format_card_context(card_names: list[str], header: str = "", max_cards: int 
 
 # ---------------------------------------------------------------------------
 # Board descriptions — special tiles and strategic notes only
-# (Milestones/awards come from the live game state, not hardcoded here)
 # ---------------------------------------------------------------------------
 
 BOARD_INFO: dict[str, dict] = {
@@ -117,16 +151,12 @@ BOARD_INFO: dict[str, dict] = {
     },
     "vastitas borealis": {
         "display": "Vastitas Borealis",
-        "special_tiles": [
-            "Outer ring spaces have elevated placement bonuses.",
-        ],
+        "special_tiles": ["Outer ring spaces have elevated placement bonuses."],
         "notes": "Fan board focused on resource diversity and production engines.",
     },
     "t. cimmeria": {
         "display": "Terra Cimmeria",
-        "special_tiles": [
-            "Multiple mountain (restricted) spaces; bonus resources on surrounding hexes.",
-        ],
+        "special_tiles": ["Multiple mountain (restricted) spaces; bonus resources on surrounding hexes."],
         "notes": "Fan board; Gambler/Warmonger milestones/awards reward event-heavy strategies.",
     },
     "utopia planitia": {
@@ -134,27 +164,10 @@ BOARD_INFO: dict[str, dict] = {
         "special_tiles": [],
         "notes": "Balanced fan board; Metropolist award makes city building rewarding.",
     },
-    "vastitas borealis nova": {
-        "display": "Vastitas Borealis Nova",
-        "special_tiles": [],
-        "notes": "Fan board variant; rewards plant production and blue-card engines.",
-    },
-    "terra cimmeria nova": {
-        "display": "Terra Cimmeria Nova",
-        "special_tiles": [],
-        "notes": "Fan board variant.",
-    },
     "amazonis p.": {
         "display": "Amazonis Planitia",
-        "special_tiles": [
-            "Amazonis zones with extra placement bonuses.",
-        ],
+        "special_tiles": ["Amazonis zones with extra placement bonuses."],
         "notes": "Fan board; Minimalist milestone rewards playing cards quickly then going lean.",
-    },
-    "Hollandia": {
-        "display": "Hollandia",
-        "special_tiles": [],
-        "notes": "Community board with custom rules.",
     },
 }
 
@@ -165,8 +178,8 @@ BOARD_INFO: dict[str, dict] = {
 
 EXPANSION_INFO: dict[str, str] = {
     "venus": (
-        "Venus Next — adds a Venus parameter track (−20° to +10°, 49 steps); each raise = +1 TR. "
-        "New Venus-tag cards and corporations. "
+        "Venus Next — adds a Venus parameter track (0%→30%, raised in +2% steps, 15 steps); "
+        "each raise = +1 TR. New Venus-tag cards and corporations. "
         "Board tiles: Dawn City, Luna Metropolis, Maxwell Base, Stratopolis."
     ),
     "colonies": (
@@ -180,9 +193,7 @@ EXPANSION_INFO: dict[str, str] = {
         "engine head-start (production boosts, free cards, TR increases, or resources). "
         "Prelude choice dramatically shapes opening strategy."
     ),
-    "prelude2": (
-        "Prelude 2 — second set of Prelude cards, same mechanic as original Prelude."
-    ),
+    "prelude2": "Prelude 2 — second set of Prelude cards, same mechanic as original Prelude.",
     "turmoil": (
         "Turmoil — Politics track with five Parties (Mars First, Scientists, Greens, Unity, Reds). "
         "Dominant party at generation end applies a Global Event. "
@@ -190,7 +201,7 @@ EXPANSION_INFO: dict[str, str] = {
         "Ruling party bonus affects all players; Chairman position gives extra TR each generation."
     ),
     "moon": (
-        "The Moon — mini Moon board with Colony Rate / Mining Rate / Road Network tracks. "
+        "The Moon — mini Moon board with Colony Rate / Mining Rate / Logistics Rate tracks. "
         "Cards place tiles on the Moon and raise these tracks (+1 TR each). "
         "New milestones (One Giant Step, Lunarchitect) and Moon-tag cards."
     ),
@@ -206,7 +217,7 @@ EXPANSION_INFO: dict[str, str] = {
         "Ares — Hazard tiles (dust storms, erosion) that slow but reward mitigation. "
         "Improved adjacency bonuses. Networker milestone, Entrepreneur/Rugged awards."
     ),
-    "corpera": (
+    "corpEra": (
         "Corporate Era — players start at 0 production (vs 1 in Base). "
         "More cards and corporations. Strong production ramp-up is essential."
     ),
@@ -214,98 +225,76 @@ EXPANSION_INFO: dict[str, str] = {
 
 
 # ---------------------------------------------------------------------------
-# Game variant descriptions — all configuration options with strategic impact
+# Game variant descriptions
 # ---------------------------------------------------------------------------
 
 GAME_VARIANT_DESCRIPTIONS: dict[str, str] = {
     "draftVariant": (
         "Research Phase Draft — instead of drawing 4 cards and keeping any, players pass cards "
-        "around the table (like a card draft). You see all 4 cards but keep only 1 before passing. "
-        "Strategic impact: CARD DENIAL is possible — withhold cards that synergise with an "
-        "opponent's engine even if they aren't your best pick."
+        "around the table. You see 4 cards but keep only 1 before passing. CARD DENIAL is "
+        "possible — withhold cards that synergise with an opponent's engine."
     ),
     "initialDraftVariant": (
-        "Initial Cards Draft — the 10 starting project cards are drafted rather than dealt directly. "
-        "You pass cards around and pick sequentially. "
-        "Strategic impact: you can deny opponent key synergy cards; your initial hand is more curated."
+        "Initial Cards Draft — the 10 starting project cards are drafted rather than dealt. "
+        "You can deny opponent key synergy cards; your initial hand is more curated."
     ),
-    "preludeDraftVariant": (
-        "Prelude Draft — prelude cards are drafted. "
-        "Strategic impact: you can block strong engine-boosting preludes from opponents."
-    ),
-    "ceosDraftVariant": (
-        "CEO Draft — CEO cards are drafted. "
-        "Strategic impact: pick the CEO that best matches your engine; deny powerful ones."
-    ),
+    "preludeDraftVariant": "Prelude Draft — prelude cards are drafted; block strong engine preludes from opponents.",
+    "ceosDraftVariant": "CEO Draft — CEO cards are drafted; pick the CEO matching your engine, deny powerful ones.",
     "twoCorpsVariant": (
         "Two Corporations Variant — each player starts with 2 corporations (plays both). "
-        "Strategic impact: doubled starting resources and combined corporation abilities. "
-        "Synergy between the two corps is crucial — look for complementary abilities."
+        "Doubled starting resources and combined abilities — look for complementary synergy."
     ),
     "solarPhaseOption": (
-        "World Government Terraforming (Solar Phase) — at the start of each generation, "
-        "one player (rotating) acts as World Government and raises one global parameter for free "
-        "(temperature +2°C, oxygen +1%, place ocean, or raise Venus). No TR gained. "
-        "Strategic impact: SIGNIFICANTLY speeds up the game — expect 2-3 fewer generations than normal. "
-        "Accelerate your engine early; slow starts are punished heavily. "
-        "When it's your turn as World Government, raise whichever parameter benefits your strategy most."
+        "World Government Terraforming (Solar Phase) — at the start of each generation one player "
+        "(rotating) acts as World Government and raises one global parameter for free (no TR). "
+        "SIGNIFICANTLY speeds up the game — expect 2-3 fewer generations. Accelerate early; slow "
+        "starts are punished. As World Government, raise whichever parameter benefits you most."
     ),
     "soloTR": (
-        "Solo Mode (TR 63 Victory) — must reach Terraform Rating 63 by game end to win. "
-        "Standard VP scoring is replaced by a binary win/lose condition. "
-        "Strategic impact: maximise TR gain above all else; card VP matters much less."
+        "Solo Mode (TR 63 Victory) — must reach Terraform Rating 63 by game end. "
+        "Maximise TR gain above all else; card VP matters much less."
     ),
     "randomMA": (
-        "Randomized Milestones & Awards — the 5 milestones and 5 awards are randomly selected "
-        "rather than board-specific. The actual milestones and awards are listed below. "
-        "Study them carefully — your engine should target at least 1-2 milestones and compete "
-        "for 1-2 awards."
+        "Randomized Milestones & Awards — the 5 milestones and 5 awards are randomly selected. "
+        "Study the actual list below; target 1-2 milestones and compete for 1-2 awards."
     ),
     "modularMA": (
-        "Modular Milestones & Awards — milestones/awards drawn from the expanded modular pool "
-        "(broader variety including fan-designed ones). See the actual list below."
+        "Modular Milestones & Awards — milestones/awards drawn from the expanded modular pool. "
+        "See the actual list below."
     ),
     "requiresVenusTrackCompletion": (
-        "Venus Must Be Completed — the game does not end until Venus reaches +10°C (max). "
-        "Strategic impact: invest in Venus cards even if the track isn't your primary focus; "
-        "the game extends until Venus is done, giving more time for engines to develop."
+        "Venus Must Be Completed — the game does not end until Venus reaches max. "
+        "Invest in Venus cards; the game extends, giving engines more time."
     ),
     "requiresMoonTrackCompletion": (
         "Moon Tracks Must Be Completed — all three Moon tracks must be maxed before game ends. "
-        "Strategic impact: Moon investment is mandatory; plan Moon tile placement early."
+        "Moon investment is mandatory; plan Moon tile placement early."
     ),
     "politicalAgendasExtension:Random": (
-        "Political Agendas (Random) — Turmoil party bonuses and policies are randomly assigned "
-        "at the start of the game and remain fixed. "
-        "Strategic impact: study the fixed policies; some may heavily favour certain strategies "
-        "(e.g. Kelvinists policy giving +2 MC for heat production is very powerful)."
+        "Political Agendas (Random) — Turmoil party bonuses/policies randomly assigned and fixed. "
+        "Study the fixed policies; some heavily favour certain strategies."
     ),
     "politicalAgendasExtension:Chairman": (
         "Political Agendas (Chairman) — the Chairman chooses party bonuses/policies each generation. "
-        "Strategic impact: being Chairman is very powerful — compete for Chairman position."
+        "Being Chairman is very powerful — compete for it."
     ),
     "removeNegativeGlobalEventsOption": (
-        "No Negative Global Events — Turmoil Global Events only have neutral or positive effects "
-        "(negative effects are removed). "
-        "Strategic impact: less variance; global events are less threatening to your plans."
+        "No Negative Global Events — Turmoil Global Events only have neutral/positive effects. "
+        "Less variance; global events are less threatening."
     ),
-    "altVenusBoard": (
-        "Alt Venus Board — an alternative Venus parameter arrangement. "
-        "Standard strategic principles still apply for Venus-tag engines."
-    ),
+    "altVenusBoard": "Alt Venus Board — an alternative Venus parameter arrangement. Standard Venus principles apply.",
 }
 
 
 # ---------------------------------------------------------------------------
-# Main format functions
+# Context formatting
 # ---------------------------------------------------------------------------
 
 def format_config_context(game: dict) -> str:
-    """Return a comprehensive setup block for the initial LLM system prompt.
+    """Return a comprehensive setup block for the cached system prompt.
 
-    Includes: board (special tiles + notes), active expansions with descriptions,
-    game variant settings, and the ACTUAL milestones/awards for this specific game
-    (which may differ from board defaults if randomised).
+    Includes board (special tiles + notes), active expansions with descriptions, game
+    variant settings, and this game's actual milestones/awards (may differ if randomised).
     """
     board_key = game.get("boardName", "tharsis")
     expansions = game.get("expansions") or []
@@ -317,7 +306,6 @@ def format_config_context(game: dict) -> str:
 
     lines = ["=== GAME CONFIGURATION ==="]
 
-    # --- Board ---
     board_display = board_info.get("display", str(board_key))
     lines.append(f"Board: {board_display}")
     special = board_info.get("special_tiles") or []
@@ -329,7 +317,6 @@ def format_config_context(game: dict) -> str:
     if note:
         lines.append(f"Board note: {note}")
 
-    # --- Active expansions ---
     if expansions:
         lines.append(f"\nExpansions active: {', '.join(expansions)}")
         for e in expansions:
@@ -337,56 +324,32 @@ def format_config_context(game: dict) -> str:
             if desc:
                 lines.append(f"  [{e}] {desc}")
 
-    # --- Game variants ---
     if variants:
         lines.append("\nGame variants / rule changes:")
         for key, val in variants.items():
-            # Build a lookup key — for politicalAgendasExtension include the value
-            if key == "politicalAgendasExtension":
-                lookup_key = f"{key}:{val}"
-            else:
-                lookup_key = key
+            lookup_key = f"{key}:{val}" if key == "politicalAgendasExtension" else key
             desc = GAME_VARIANT_DESCRIPTIONS.get(lookup_key) or GAME_VARIANT_DESCRIPTIONS.get(key)
-            if desc:
-                lines.append(f"  [{key}] {desc}")
-            else:
-                lines.append(f"  [{key}] = {val}")
+            lines.append(f"  [{key}] {desc}" if desc else f"  [{key}] = {val}")
 
-    # --- Milestones ---
     if milestones:
-        lines.append("\nMilestones available (5 VP to claim; costs 8 MC; max 3 per game):")
+        lines.append("\nMilestones this game (5 VP, 8 MC, max 3):")
         for m in milestones:
-            name = m.get("name", "?")
-            desc = m.get("description", "")
-            lines.append(f"  • {name}: {desc}")
-        lines.append(
-            "  Tip: claim early if you meet the requirement — being blocked costs 0 MC "
-            "but losing 5 VP is enormous."
-        )
+            lines.append(f"  • {m.get('name', '?')}: {m.get('description', '')}")
 
-    # --- Awards ---
     if awards:
-        lines.append("\nAwards available (5 VP 1st / 2 VP 2nd; fund costs 8/14/20 MC; max 3 per game):")
+        lines.append("\nAwards this game (5/2 VP, fund 8/14/20 MC, max 3):")
         for a in awards:
-            name = a.get("name", "?")
-            desc = a.get("description", "?")
-            lines.append(f"  • {name}: {desc}")
-        lines.append(
-            "  Tip: fund an award you are already winning, before opponents can fund it. "
-            "Funding late is wasteful (20 MC for 3rd). "
-            "Multiple awards can be won by the same player."
-        )
+            lines.append(f"  • {a.get('name', '?')}: {a.get('description', '?')}")
 
     lines.append("=== END GAME CONFIGURATION ===")
     return "\n".join(lines)
 
 
 def format_board_layout(board_spaces: list[dict]) -> str:
-    """Generate a compact board layout for the initial LLM system prompt.
+    """Static board layout for the system prompt — ocean / volcanic / bonus-land spaces.
 
-    board_spaces is the boardSpaces array from the AI request state — each entry has:
-      id, x, y, t (spaceType), b (bonus names list), v (volcanic bool, optional),
-      tile (placed tile type, optional), pc (playerColor, optional).
+    This is the unchanging map (placement bonuses, ocean-reserved spaces). The LIVE tile
+    state and adjacency are rendered separately each turn by board.py.
     """
     if not board_spaces:
         return ""
@@ -398,7 +361,6 @@ def format_board_layout(board_spaces: list[dict]) -> str:
         "energy production": "EP", "temperature": "Tp",
     }
 
-    # Separate spaces by type
     ocean_spaces: list[str] = []
     volcanic_spaces: list[str] = []
     bonus_land: list[str] = []
@@ -411,67 +373,32 @@ def format_board_layout(board_spaces: list[dict]) -> str:
         bonus_str = "+".join(BONUS_ABBREV.get(b, b) for b in bonuses) if bonuses else ""
 
         if stype in ("ocean", "cove"):
-            tag = f"{bonus_str}" if bonus_str else "—"
-            ocean_spaces.append(f"  hex-{sid}({x},{y}):{tag}")
+            ocean_spaces.append(f"  hex-{sid}({x},{y}):{bonus_str or '—'}")
         elif s.get("v"):
             tag = f" [{bonus_str}]" if bonus_str else ""
             volcanic_spaces.append(f"  hex-{sid}({x},{y}){tag}")
         elif bonuses:
             bonus_land.append(f"  hex-{sid}({x},{y}): {bonus_str}")
 
-    lines = ["=== BOARD LAYOUT ===",
-             "Space IDs: hex-NN where NN is the ID shown during tile placement.",
-             "Position (x,y): x=column (0=leftmost in row), y=row (0=top).",
-             "Hex adjacency: spaces are adjacent if they share an edge (differ by at most 1 in",
-             "  x and y, following the offset hex grid pattern).",
-             "Greenery MUST be placed adjacent to your own tile if possible.",
-             "City CANNOT be adjacent to another city.",
+    lines = ["=== BOARD LAYOUT (static) ===",
+             "hex-NN = the ID shown during placement; (x,y): x=column (0=leftmost), y=row (0=top).",
              ""]
 
     if ocean_spaces:
-        lines.append(f"Ocean-only spaces ({len(ocean_spaces)} total) — format: hex-ID(x,y):placement_bonuses:")
-        # Show in rows for readability
+        lines.append(f"Ocean-only spaces ({len(ocean_spaces)} total) — hex-ID(x,y):placement_bonuses:")
         row_size = 6
         for i in range(0, len(ocean_spaces), row_size):
             lines.append("  " + "  ".join(ocean_spaces[i:i + row_size]).replace("  hex-", " hex-"))
         lines.append("  → Placing ocean gives +1 TR and +2 MC to each adjacent tile owner.")
 
     if volcanic_spaces:
-        lines.append(f"\nVolcanic spaces — targeted by volcanic-event cards (Lava Flows etc.):")
+        lines.append("\nVolcanic spaces — targeted by volcanic-event cards (Lava Flows etc.):")
         lines.append("  " + ",  ".join(volcanic_spaces))
 
     if bonus_land:
-        lines.append(f"\nLand spaces with placement bonuses — format: hex-ID(x,y): bonuses:")
-        for entry in bonus_land:
-            lines.append(entry)
+        lines.append("\nLand spaces with placement bonuses — hex-ID(x,y): bonuses:")
+        lines.extend(bonus_land)
 
     lines.append("\nBonus abbreviations: St=steel, Ti=titanium, Pl=plant, Cd=card, He=heat, MC=MC.")
     lines.append("=== END BOARD LAYOUT ===")
-    return "\n".join(lines)
-
-
-def format_game_context(board_name: str, expansions: list[str]) -> str:
-    """Legacy/fallback: board + expansions only (no milestones/awards/variants).
-
-    Prefer format_config_context(game_state) when the full game dict is available.
-    """
-    board_key = str(board_name).lower()
-    board_info = BOARD_INFO.get(board_key) or BOARD_INFO.get("tharsis", {})
-    lines = [
-        "=== GAME CONFIGURATION ===",
-        f"Board: {board_info.get('display', board_name)}",
-    ]
-    special = board_info.get("special_tiles") or []
-    for t in special:
-        lines.append(f"  • {t}")
-    note = board_info.get("notes", "")
-    if note:
-        lines.append(f"Note: {note}")
-    if expansions:
-        lines.append(f"Expansions: {', '.join(expansions)}")
-        for e in expansions:
-            desc = EXPANSION_INFO.get(e)
-            if desc:
-                lines.append(f"  [{e}] {desc}")
-    lines.append("=== END GAME CONFIGURATION ===")
     return "\n".join(lines)

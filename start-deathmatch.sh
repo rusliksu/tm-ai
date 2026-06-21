@@ -3,7 +3,7 @@
 #
 # USAGE
 #   ./start-deathmatch.sh
-#   DEATH_MATCH_MODELS="anthropic/claude-sonnet-4-6,openai/gpt-4o-mini,google/gemini-2.5-flash,deepseek/deepseek-chat" ./start-deathmatch.sh
+#   DEATH_MATCH_MODELS="deepseek/deepseek-v4-flash,google/gemini-3.1-flash-lite,openai/gpt-5-nano,qwen/qwen3.5-flash-02-23,anthropic/claude-haiku-4.5" ./start-deathmatch.sh
 #   LLM_DEBUG=false ./start-deathmatch.sh
 #   TM_AI_DIR=/path TM_DIR=/path ./start-deathmatch.sh
 #
@@ -46,8 +46,10 @@ PID_FILE=/tmp/tm-ai.pids
 DM_PID_FILE=/tmp/death-match.pids
 GAME_ID_FILE=/tmp/current-game.id
 
-# Default 4-LLM lineup (override via DEATH_MATCH_MODELS)
-DEATH_MATCH_MODELS="${DEATH_MATCH_MODELS:-anthropic/claude-sonnet-4-6,openai/gpt-4o-mini,google/gemini-2.5-flash,deepseek/deepseek-chat}"
+# Default 5-LLM lineup — four cheap/fast models (~$0.05-0.25 in / $0.20-1.50 out
+# per 1M) plus claude-haiku-4.5 ($1/$5) as Anthropic's current-gen representative.
+# Override via DEATH_MATCH_MODELS (and adjust --players below to match).
+DEATH_MATCH_MODELS="${DEATH_MATCH_MODELS:-deepseek/deepseek-v4-flash,google/gemini-3.1-flash-lite,openai/gpt-5-nano,qwen/qwen3.5-flash-02-23,anthropic/claude-haiku-4.5}"
 
 # --- env ----------------------------------------------------------------------
 if [[ -f "${TM_AI_DIR}/.env" ]]; then
@@ -110,9 +112,8 @@ echo "▶ starting AI server (OpenRouter / multi-model, log: ${AI_LOG})"
   cd "${TM_AI_DIR}/tm-ai-server"
   # API keys are already exported via `set -a; source .env` above — no need to
   # pass them explicitly here, which would risk exposing them in process listings.
-  USE_LLM=true \
   LLM_DEBUG="${LLM_DEBUG:-true}" \
-  exec uv run uvicorn tm_ai_server.main:app --host 0.0.0.0 --port 8000
+  exec uv run uvicorn tm_llm.app:app --host 0.0.0.0 --port 8000
 ) >> "${AI_LOG}" 2>&1 &
 AI_PID=$!
 echo "${AI_PID}" >> "${PID_FILE}"
@@ -168,7 +169,7 @@ echo "  models: ${DEATH_MATCH_MODELS}"
 (
   cd "${TM_AI_DIR}"
   exec uv run python scripts/play_game.py \
-    --players 4 \
+    --players 5 \
     --models "${DEATH_MATCH_MODELS}"
 ) >> "${DM_LOG}" 2>&1 &
 DM_PID=$!

@@ -1,3 +1,5 @@
+"""Pydantic models mirroring the TM server's camelCase AI request/response payloads."""
+from __future__ import annotations
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel
 
@@ -81,30 +83,15 @@ class MoveRequest(BaseModel):
     last_error: Optional[str] = None
 
 
-class MoveDebug(BaseModel):
-    policy_logits: Optional[List[float]] = None
-    value_estimate: Optional[float] = None
-
-
 class MoveResponse(BaseModel):
     input_response: Dict[str, Any]
-    debug: Optional[MoveDebug] = None
-
-
-class AdviceRequest(MoveRequest):
-    user_question: Optional[str] = None
-
-
-class AdviceResponse(BaseModel):
-    advice_text: str
-    recommendation: Dict[str, Any]
-    debug: Optional[MoveDebug] = None
+    debug: Optional[Dict[str, Any]] = None
 
 
 class PlayerRegisterRequest(BaseModel):
     player_id: str
     game_id: str
-    model: Optional[str] = None  # None → use OPENROUTER_MODEL / OLLAMA_MODEL default
+    model: Optional[str] = None  # None → use OPENROUTER_MODEL default
 
 
 class PlayerRegisterResponse(BaseModel):
