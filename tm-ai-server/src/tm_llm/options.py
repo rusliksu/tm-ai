@@ -19,10 +19,9 @@ InputResponse wire format (from TM server InputResponse.ts):
   SelectResource: {type:'resource', resourceType:<ResourceType>}
 """
 from __future__ import annotations
-import re
 
-# Upper bound on enumerated options for a single decision.
-MAX_OPTIONS = 200
+from .action_contract import MAX_OPTIONS, node_title as _node_title
+from .payment import mc_payment
 
 
 def flatten_options(waiting_for: dict, max_actions: int = MAX_OPTIONS) -> list[dict]:
@@ -235,23 +234,6 @@ def index_to_response(waiting_for: dict, index) -> dict:
         return _default_response(waiting_for)
 
 
-def _node_title(node: dict, fallback: int) -> str:
-    title = node.get("title", "")
-    if isinstance(title, str) and title:
-        return title
-    if isinstance(title, dict):
-        msg = title.get("message", f"Option {fallback}")
-        data = title.get("data")
-        if data and isinstance(data, list):
-            def _sub(m: re.Match) -> str:
-                idx = int(m.group(1))
-                entry = data[idx] if idx < len(data) else None
-                return str(entry.get("value", m.group(0))) if isinstance(entry, dict) else m.group(0)
-            msg = re.sub(r"\$\{(\d+)\}", _sub, msg)
-        return msg
-    return f"Option {fallback}"
-
-
 def _default_response(node: dict) -> dict:
     """Heuristic: return the first/minimum valid response for any node type.
 
@@ -314,14 +296,3 @@ def _default_response(node: dict) -> dict:
         return {"type": "resource", "resourceType": resources[0] if resources else "megacredits"}
     else:
         return {"type": t}
-
-
-def mc_payment(amount: int) -> dict:
-    """A megacredits-only payment dict covering `amount`."""
-    return {
-        "megacredits": max(0, amount),
-        "steel": 0, "titanium": 0, "heat": 0, "plants": 0,
-        "microbes": 0, "floaters": 0, "lunaArchivesScience": 0,
-        "seeds": 0, "graphene": 0, "kuiperAsteroids": 0,
-        "auroraiData": 0, "spireScience": 0,
-    }

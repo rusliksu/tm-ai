@@ -132,6 +132,11 @@ via `POST /game-done`.
 - **Validation + retry.** Before submitting, the server checks the response has a `CHOICE:`
   line and an affordable `PAYMENT:`; if not, it resends with an error banner (≤2 retries).
   TM-server rejections come back as `last_error` and are surfaced to the model.
+- **Structured composite actions.** `TM_AI_ACTION_CONTRACT=v2` makes every player-controlled
+  value in an `AndOptions` decision explicit through versioned `ACTION` JSON. A pure local
+  validator checks the source tree, bounds, disabled values, and response shape before the
+  unchanged TM `InputResponse` is built. `compare` keeps legacy behavior and records only a
+  safe schema summary; `legacy` remains the default during migration.
 - **Durable state.** On graceful shutdown, each in-flight player's memory is saved to
   `logs/llm-state/<player_id>.json` and restored on the next `/move` (see
   `specs/LLM-state-persistence.md`).

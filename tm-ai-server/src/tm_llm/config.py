@@ -52,5 +52,11 @@ CARD_DB_PATH = _REPO_ROOT / "data" / "card_db.json"
 # Action-phase retry budget within a single /move (validation feedback loop).
 MAX_ACTION_RETRIES = 2
 
+# Structured action migration: legacy keeps current CHOICE behavior, compare records only a
+# safe schema summary, and v2 uses explicit ACTION JSON for composite AndOptions.
+ACTION_CONTRACT_MODE = os.getenv("TM_AI_ACTION_CONTRACT", "legacy").strip().lower()
+if ACTION_CONTRACT_MODE not in ("legacy", "compare", "v2"):
+    ACTION_CONTRACT_MODE = "legacy"
+
 # Decision-tree node types that constitute the opening "setup" phase.
 SETUP_TYPES = {"initialCards", "prelude"}

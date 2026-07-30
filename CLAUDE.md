@@ -54,6 +54,7 @@ tm-ai-server/
     app.py                  # FastAPI app — /health, /version, /move, /player/register, /game-done
     config.py               # env-var defaults (model, thinking budgets, max tokens, state dir)
     schemas.py              # Pydantic models matching TM server camelCase output
+    action_contract.py      # typed candidates/slots, ACTION parser, validation + wire builder
     options.py              # flatten_options / index_to_response / _default_response (decision tree)
     payment.py              # PAYMENT parse / correct / validate / auto-generate
     knowledge.py            # CARD_DB loader + board/expansion/variant context formatting
@@ -157,6 +158,11 @@ summary and deletes the game's state files. `action_system` is not persisted (re
 **Multi-model death match:** `POST /player/register` assigns a model per seat before the
 game; `scripts/play_game.py --models "a/m1,b/m2,..."` registers one model per player and runs
 a full game; `POST /game-done` flushes the per-player token/cost summary.
+
+**Structured actions:** `TM_AI_ACTION_CONTRACT=legacy|compare|v2` stages the versioned
+`action-contract/v2` migration. `v2` currently applies only to composite `AndOptions` and
+requires explicit `ACTION` JSON values; structural failures return sanitized HTTP 422 rather
+than falling back to `_default_response`. `compare` does not change the submitted move.
 
 ## TM fork integration points
 
