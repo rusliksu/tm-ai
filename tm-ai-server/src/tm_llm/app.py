@@ -23,6 +23,7 @@ if not _app_logger.handlers:
     _app_logger.propagate = False
 
 from . import config, registry
+from .action_contract import ACTION_CONTRACT_VERSION, ActionContractError
 from .engine import select_action_llm
 from .openrouter import ensure_client
 from .schemas import (
@@ -67,7 +68,11 @@ async def version():
     return VersionResponse(
         model_version="0.2.0",
         git_commit=git_commit,
-        config={"default_model": config.OPENROUTER_MODEL},
+        config={
+            "default_model": config.OPENROUTER_MODEL,
+            "action_contract": ACTION_CONTRACT_VERSION,
+            "action_contract_mode": config.ACTION_CONTRACT_MODE,
+        },
     )
 
 
@@ -78,12 +83,18 @@ async def move(request: MoveRequest):
         raise HTTPException(status_code=400, detail="state.waitingFor is required")
 
     state = request.state.model_dump()
-    input_response, debug = select_action_llm(
-        state, waiting_for,
-        game_id=request.game_id,
-        player_id=request.player_id,
-        last_error=request.last_error,
-    )
+    try:
+        input_response, debug = select_action_llm(
+            state, waiting_for,
+            game_id=request.game_id,
+            player_id=request.player_id,
+            last_error=request.last_error,
+        )
+    except ActionContractError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"stage": "action_contract", "reason": exc.reason},
+        ) from None
     return MoveResponse(input_response=input_response, debug=debug or None)
 
 

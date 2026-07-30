@@ -44,6 +44,17 @@ PAYMENT_KEYS = {
 }
 
 
+def mc_payment(amount: int) -> dict:
+    """A megacredits-only payment dict covering ``amount``."""
+    return {
+        "megacredits": max(0, amount),
+        "steel": 0, "titanium": 0, "heat": 0, "plants": 0,
+        "microbes": 0, "floaters": 0, "lunaArchivesScience": 0,
+        "seeds": 0, "graphene": 0, "kuiperAsteroids": 0,
+        "auroraiData": 0, "spireScience": 0,
+    }
+
+
 def card_resource_values(card_name: str) -> tuple[int, int]:
     """Return (steel_value, titanium_value) for a card based on its tags.
 

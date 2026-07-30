@@ -9,6 +9,15 @@ from __future__ import annotations
 import logging
 
 from . import config, prompts, registry
+from .action_contract import (
+    ACTION_CONTRACT_VERSION,
+    ActionContractError,
+    ActionPlan,
+    build_input_response,
+    compile_action_candidates,
+    parse_action_plan,
+    render_action_contract,
+)
 from .options import flatten_options, index_to_response, _default_response
 from .payment import check_payment_valid
 
@@ -23,7 +32,17 @@ def select_action_llm(state: dict, waiting_for: dict, game_id: str, player_id: s
         if wf_type in config.SETUP_TYPES:
             return _select_setup(state, waiting_for, player, last_error)
         return _select_action(state, waiting_for, player, last_error)
+    except ActionContractError:
+        raise
     except Exception as exc:
+        if _uses_structured_action(waiting_for):
+            logger.error(
+                "Structured action selection failed (player=%s type=%s)",
+                player_id,
+                wf_type,
+                exc_info=True,
+            )
+            raise
         logger.error("LLM selection failed (player=%s type=%s): %s — using default",
                      player_id, wf_type, exc, exc_info=True)
         return _default_response(waiting_for), {"llm_error": str(exc)}
@@ -79,6 +98,9 @@ def _maybe_per_generation_update(player, generation: int, state: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def _select_action(state: dict, waiting_for: dict, player, last_error: str | None) -> tuple[dict, dict]:
+    if _uses_structured_action(waiting_for):
+        return _select_action_v2(state, waiting_for, player, last_error)
+
     options = flatten_options(waiting_for)
     if not options:
         return _default_response(waiting_for), {}
@@ -144,4 +166,132 @@ def _select_action(state: dict, waiting_for: dict, player, last_error: str | Non
     if g.get("temperature", -30) >= 8 and g.get("oxygen", 0) >= 14 and g.get("oceanCount", 0) >= 9:
         registry.log_game_token_summary(player.game_id)
 
+    if config.ACTION_CONTRACT_MODE == "compare":
+        try:
+            candidates = compile_action_candidates(waiting_for)
+            debug["action_contract_compare"] = {
+                "version": ACTION_CONTRACT_VERSION,
+                "candidateCount": len(candidates),
+                "requiredSlotCount": sum(_count_slots(candidate.slots) for candidate in candidates),
+                "parity": _compare_legacy_response(waiting_for, response, debug, candidates),
+            }
+        except ActionContractError as exc:
+            debug["action_contract_compare"] = {
+                "version": ACTION_CONTRACT_VERSION,
+                "status": "unsupported",
+                "reason": exc.reason,
+            }
+
     return response, debug
+
+
+def _uses_structured_action(waiting_for: dict) -> bool:
+    """First migration slice: v2 is active only for composite AndOptions."""
+    return config.ACTION_CONTRACT_MODE == "v2" and waiting_for.get("type") == "and"
+
+
+def _count_slots(slots) -> int:
+    count = 0
+    for slot in slots:
+        count += 1
+        for branch in slot.branches:
+            count += _count_slots(branch.slots)
+    return count
+
+
+def _compare_legacy_response(waiting_for: dict, response: dict, debug: dict, candidates) -> str:
+    """Compare only zero-slot candidates; composites need values legacy never captured."""
+    candidate = None
+    if waiting_for.get("type") == "or":
+        choice = debug.get("llm_choice")
+        if isinstance(choice, int):
+            candidate = next((item for item in candidates if item.path == (choice - 1,)), None)
+    elif len(candidates) == 1:
+        candidate = candidates[0]
+
+    if candidate is None:
+        return "not_comparable"
+    if candidate.slots:
+        return "requires_values"
+    compared = build_input_response(
+        waiting_for,
+        ActionPlan(candidate=candidate.id, values={}),
+    )
+    return "equivalent" if compared == response else "different"
+
+
+def _select_action_v2(
+    state: dict, waiting_for: dict, player, last_error: str | None
+) -> tuple[dict, dict]:
+    candidates = compile_action_candidates(waiting_for)
+    options = flatten_options(waiting_for)
+
+    if not player.action_system:
+        player.action_system = prompts.build_action_system(state)
+
+    generation = state.get("game", {}).get("generation", 1)
+    _maybe_per_generation_update(player, generation, state)
+
+    base_user = prompts.build_action_prompt(
+        state,
+        waiting_for,
+        options,
+        strategy=player.strategy,
+        tactical=player.tactical,
+        last_error=last_error,
+        structured_action_contract=render_action_contract(candidates),
+    )
+    max_out = config.OPENROUTER_MAX_OUTPUT_TOKENS
+    budget = config.OPENROUTER_ACTION_THINKING_BUDGET
+    text = player.single_shot(
+        player.action_system,
+        base_user,
+        max_output_tokens=max_out,
+        thinking_budget=budget,
+    )
+
+    response: dict | None = None
+    plan = None
+    for attempt in range(config.MAX_ACTION_RETRIES + 1):
+        try:
+            plan = parse_action_plan(text)
+            response = build_input_response(waiting_for, plan)
+            break
+        except ActionContractError as exc:
+            if attempt >= config.MAX_ACTION_RETRIES:
+                logger.error(
+                    "Structured action invalid after retries (player=%s reason=%s)",
+                    player.player_id,
+                    exc.reason,
+                )
+                raise ActionContractError("validation_retries_exhausted") from None
+            logger.warning(
+                "Structured action retry %d/%d (player=%s reason=%s)",
+                attempt + 1,
+                config.MAX_ACTION_RETRIES,
+                player.player_id,
+                exc.reason,
+            )
+            retry_user = (
+                "⚠ YOUR PREVIOUS ACTION JSON WAS INVALID — fix it and answer again:\n"
+                f"Reason: {exc.reason}\n\n{base_user}"
+            )
+            text = player.single_shot(
+                player.action_system,
+                retry_user,
+                max_output_tokens=max_out,
+                thinking_budget=budget,
+            )
+
+    if response is None or plan is None:
+        raise ActionContractError("validation_retries_exhausted")
+
+    tactical = prompts.capture_tactical(text)
+    if tactical:
+        player.tactical = tactical
+
+    return response, {
+        "llm_phase": "action",
+        "action_contract": ACTION_CONTRACT_VERSION,
+        "candidate": plan.candidate,
+    }

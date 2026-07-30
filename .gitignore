@@ -1,5 +1,6 @@
 logs/
 .claude/
+.codex/
 tm-ai-server/.venv/
 tm-ai-server/__pycache__/
 tm-ai-server/src/**/__pycache__/

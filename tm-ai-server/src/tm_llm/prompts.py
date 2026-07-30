@@ -478,7 +478,8 @@ def _is_card_decision_about_hand(card_names: list[str], cards_in_hand: list) -> 
 # ---------------------------------------------------------------------------
 
 def build_action_prompt(state: dict, waiting_for: dict, options: list[dict], *,
-                        strategy: str = "", tactical: str = "", last_error: str | None = None) -> str:
+                        strategy: str = "", tactical: str = "", last_error: str | None = None,
+                        structured_action_contract: str | None = None) -> str:
     g, p = state.get("game", {}), state.get("player", {})
     aw = state.get("awards", [])
     opponents = state.get("opponents") or []
@@ -667,6 +668,9 @@ def build_action_prompt(state: dict, waiting_for: dict, options: list[dict], *,
     if wf_type in ("projectCard", "payment"):
         lines += _format_payment_section(waiting_for, p)
 
+    if structured_action_contract:
+        lines += ["", structured_action_contract]
+
     return "\n".join(lines)
 
 
@@ -730,7 +734,7 @@ def find_choice(text: str) -> int | None:
 
 
 def capture_tactical(text: str) -> str | None:
-    m = re.search(label_prefix("TACTICAL") + r"(.*?)(?=\n\s*" + _EMPH + r"CHOICE|\n\s*" + _EMPH + r"PAYMENT|\Z)",
+    m = re.search(label_prefix("TACTICAL") + r"(.*?)(?=\n\s*" + _EMPH + r"ACTION|\n\s*" + _EMPH + r"CHOICE|\n\s*" + _EMPH + r"PAYMENT|\Z)",
                   text, re.IGNORECASE | re.DOTALL)
     if m:
         tactical = m.group(1).strip()
@@ -744,7 +748,7 @@ def capture_tactical(text: str) -> str | None:
 # (the observed "CHOICE: 15"). Drop those lines before persisting the strategy.
 _STRATEGY_DROP = re.compile(
     r"^\s*(?:"
-    + _EMPH + r"(?:CHOICE|PAYMENT)" + _EMPH + r"\s*:.*"   # turn-answer lines
+    + _EMPH + r"(?:ACTION|CHOICE|PAYMENT)" + _EMPH + r"\s*:.*"   # turn-answer lines
     r"|-{3,}.*?-{3,}"                                       # ----- PRIOR STRATEGY ----- banners
     r"|-{3,}"                                               # plain divider rules
     r")\s*$",
