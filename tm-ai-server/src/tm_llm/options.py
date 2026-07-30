@@ -68,20 +68,27 @@ def flatten_options(waiting_for: dict, max_actions: int = MAX_OPTIONS) -> list[d
                     child_title = _node_title(child, j)
                     full_title = f"{parent_title}: {child_title}" if parent_title else child_title
                     _emit(full_title, [i, j], child)
-            elif opt.get("type") == "projectCard" and len(child_cards) > 1:
+            elif opt.get("type") == "projectCard" and child_cards:
                 # A nested project-card menu (e.g. "Standard projects" listing every standard
                 # project, or an inline "Play a card" listing the hand). Expand each card into
                 # its own option so the LLM picks the specific one — otherwise the engine
                 # silently defaults to the FIRST card (historically always Power Plant). The
                 # parent projectCard node is kept as `node` so payment auto-generation and
                 # validation can still resolve each card's cost from its `.cards`.
-                parent_title = _node_title(opt, i).strip()
-                for j, card in enumerate(child_cards):
-                    if len(options) >= max_actions:
-                        break
-                    cname = card.get("name", f"Card {j}")
-                    full_title = f"{parent_title}: {cname}" if parent_title else cname
-                    _emit(full_title, [i, j], opt)
+                enabled_cards = [
+                    (j, card) for j, card in enumerate(child_cards)
+                    if card.get("isDisabled") is not True
+                ]
+                if len(child_cards) == 1 and len(enabled_cards) == 1:
+                    _emit(_node_title(opt, i), [i], opt)
+                else:
+                    parent_title = _node_title(opt, i).strip()
+                    for j, card in enabled_cards:
+                        if len(options) >= max_actions:
+                            break
+                        cname = card.get("name", f"Card {j}")
+                        full_title = f"{parent_title}: {cname}" if parent_title else cname
+                        _emit(full_title, [i, j], opt)
             else:
                 _emit(_node_title(opt, i), [i], opt)
 
@@ -99,6 +106,8 @@ def flatten_options(waiting_for: dict, max_actions: int = MAX_OPTIONS) -> list[d
         for i, card in enumerate(waiting_for.get("cards", [])):
             if len(options) >= max_actions:
                 break
+            if card.get("isDisabled") is True:
+                continue
             _emit(card.get("name", f"Card {i}"), [i], card)
 
     elif node_type == "space":

@@ -68,6 +68,48 @@ def test_flatten_keeps_single_card_project_node_collapsed():
     assert [o["title"] for o in opts] == ["Pass", "Sell patents"]
 
 
+def test_flatten_project_card_menu_excludes_disabled_cards_and_preserves_paths():
+    wf = {"type": "or", "options": [
+        {"type": "projectCard", "title": "Standard projects", "cards": [
+            {"name": "Disabled:SP", "calculatedCost": 0, "isDisabled": True},
+            {"name": "Aquifer:SP", "calculatedCost": 18, "isDisabled": False},
+            {"name": "City:SP", "calculatedCost": 25},
+        ]},
+        {"type": "projectCard", "title": "Unavailable", "cards": [
+            {"name": "Also disabled:SP", "isDisabled": True},
+        ]},
+        {"type": "option", "title": "Pass"},
+    ]}
+
+    opts = flatten_options(wf)
+
+    assert [o["title"] for o in opts] == [
+        "Standard projects: Aquifer:SP",
+        "Standard projects: City:SP",
+        "Pass",
+    ]
+    assert [o["path"] for o in opts] == [[0, 1], [0, 2], [2]]
+    assert index_to_response(wf, opts[0]["path"])["response"]["card"] == "Aquifer:SP"
+
+
+def test_flatten_top_level_project_card_excludes_only_exact_boolean_disabled():
+    wf = {"type": "projectCard", "cards": [
+        {"name": "Disabled", "isDisabled": True},
+        {"name": "Enabled false", "isDisabled": False},
+        {"name": "Enabled missing"},
+        {"name": "Enabled non-boolean", "isDisabled": 1},
+    ]}
+
+    opts = flatten_options(wf)
+
+    assert [o["title"] for o in opts] == [
+        "Enabled false",
+        "Enabled missing",
+        "Enabled non-boolean",
+    ]
+    assert [o["path"] for o in opts] == [[1], [2], [3]]
+
+
 def test_index_to_response_or_nested():
     wf = {"type": "or", "options": [
         {"type": "or", "title": "Fund", "options": [
