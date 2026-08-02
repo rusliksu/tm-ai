@@ -59,14 +59,14 @@ def card_resource_values(card_name: str) -> tuple[int, int]:
     """Return (steel_value, titanium_value) for a card based on its tags.
 
     Steel is worth 2 MC only for building-tagged cards; titanium 3 MC only for
-    space-tagged. Unknown cards are treated permissively (both enabled) to avoid
-    false rejections.
+    space-tagged. Unknown cards fail closed because the server model, not a local
+    guess, is authoritative for payment eligibility.
     """
     if not card_name:
-        return 2, 3
+        return 0, 0
     info = CARD_DB.get(card_name, {})
     if not info:
-        return 2, 3
+        return 0, 0
     tags = info.get("tags", [])
     return (2 if "building" in tags else 0), (3 if "space" in tags else 0)
 
@@ -94,61 +94,134 @@ def parse_payment_line(text: str) -> dict | None:
     return payment
 
 
+def _project_card_info(waiting_for: dict, card_name: str) -> dict:
+    cards = waiting_for.get("cards", []) if isinstance(waiting_for, dict) else []
+    card = next((c for c in cards if c.get("name") == card_name), None)
+    if card is not None:
+        return card
+    direct = waiting_for.get("card", {}) if isinstance(waiting_for, dict) else {}
+    return direct if direct.get("name") == card_name else {}
+
+
+def _payment_context(waiting_for: dict, player: dict, card_name: str) -> tuple[dict, dict, dict]:
+    """Return (allowed, available, values) for a server-shaped project-card input."""
+    card = _project_card_info(waiting_for, card_name)
+    payment_options = waiting_for.get("paymentOptions", {}) or {}
+    standard_rules = card.get("standardProjectCanPayWith")
+    entry = CARD_DB.get(card_name, {})
+    tags = set(entry.get("tags", []) if entry else [])
+
+    allowed = {field: False for field in empty_payment()}
+    allowed["megacredits"] = True
+
+    if isinstance(standard_rules, dict):
+        allowed["steel"] = standard_rules.get("steel") is True
+        allowed["titanium"] = (
+            standard_rules.get("titanium") is True
+            or payment_options.get("lunaTradeFederationTitanium") is True
+        )
+        allowed["heat"] = payment_options.get("heat") is True
+        allowed["seeds"] = standard_rules.get("seeds") is True
+        allowed["kuiperAsteroids"] = standard_rules.get("kuiperAsteroids") is True
+        allowed["auroraiData"] = True
+        allowed["spireScience"] = True
+    else:
+        allowed["steel"] = "building" in tags
+        allowed["titanium"] = (
+            "space" in tags
+            or payment_options.get("lunaTradeFederationTitanium") is True
+        )
+        allowed["heat"] = payment_options.get("heat") is True
+        allowed["plants"] = (
+            "building" in tags and payment_options.get("plants") is True
+        )
+        allowed["microbes"] = "plant" in tags
+        allowed["floaters"] = "venus" in tags
+        allowed["lunaArchivesScience"] = "moon" in tags
+        allowed["seeds"] = "plant" in tags
+        allowed["graphene"] = bool(tags.intersection({"space", "city"}))
+        allowed["kuiperAsteroids"] = "space" in tags
+
+    available = {
+        "megacredits": max(0, int(player.get("megacredits", 0) or 0)),
+        "steel": max(0, int(player.get("steel", 0) or 0)),
+        "titanium": max(0, int(player.get("titanium", 0) or 0)),
+        "heat": max(0, int(player.get("heat", 0) or 0)),
+        "plants": max(0, int(player.get("plants", 0) or 0)),
+    }
+    for field in empty_payment():
+        if field not in available:
+            available[field] = max(0, int(waiting_for.get(field, 0) or 0))
+
+    values = dict(PAYMENT_VALUES)
+    values["megacredits"] = 1
+    values["steel"] = max(0, int(player.get("steelValue", 2) or 2))
+    values["titanium"] = max(0, int(player.get("titaniumValue", 3) or 3))
+    return allowed, available, values
+
+
+def _project_card_cost(waiting_for: dict, card_name: str) -> int:
+    card = _project_card_info(waiting_for, card_name)
+    if card:
+        return max(0, int(card.get("calculatedCost", 0) or 0))
+    return max(0, int(waiting_for.get("amount", 0) or 0))
+
+
+def _legal_payment_total(payment: dict, waiting_for: dict, player: dict, card_name: str) -> int:
+    allowed, _available, values = _payment_context(waiting_for, player, card_name)
+    return sum(
+        max(0, int(payment.get(field, 0) or 0)) * values.get(field, 0)
+        for field, is_allowed in allowed.items() if is_allowed
+    )
+
+
 def correct_payment(payment: dict, waiting_for: dict, player: dict, card_name: str = "") -> dict:
     """Clamp payment fields to available resources and ensure the total covers the cost."""
-    wf_type = waiting_for.get("type", "")
-    payment = dict(payment)
+    if waiting_for.get("type", "") != "projectCard":
+        result = dict(payment)
+        result["steel"] = 0
+        result["titanium"] = 0
+        for field in ("heat", "plants"):
+            result[field] = min(
+                max(0, int(result.get(field, 0) or 0)),
+                max(0, int(player.get(field, 0) or 0)),
+            )
+        mc_avail = max(0, int(player.get("megacredits", 0) or 0))
+        result["megacredits"] = min(
+            max(0, int(result.get("megacredits", 0) or 0)), mc_avail,
+        )
+        covered = sum(
+            max(0, int(result.get(field, 0) or 0)) * value
+            for field, value in PAYMENT_VALUES.items()
+            if field not in ("steel", "titanium")
+        )
+        needed_mc = max(0, int(waiting_for.get("amount", 0) or 0) - covered)
+        if result["megacredits"] < needed_mc:
+            result["megacredits"] = min(needed_mc, mc_avail)
+        return result
 
-    mc_avail = player.get("megacredits", 0)
-    st_avail = player.get("steel", 0)
-    ti_avail = player.get("titanium", 0)
-    ht_avail = player.get("heat", 0)
-    pl_avail = player.get("plants", 0)
-
-    is_project = wf_type == "projectCard"
-    if not is_project:
-        payment["steel"] = 0
-        payment["titanium"] = 0
-    else:
-        st_val, ti_val = card_resource_values(card_name)
-        if st_val == 0:
-            payment["steel"] = 0
-        if ti_val == 0:
-            payment["titanium"] = 0
-
-    for field, available in [
-        ("steel", st_avail), ("titanium", ti_avail),
-        ("heat", ht_avail), ("plants", pl_avail),
-    ]:
-        if payment.get(field, 0) > available:
-            payment[field] = available
-
-    if payment.get("megacredits", 0) > mc_avail:
-        payment["megacredits"] = mc_avail
-
-    if is_project:
-        card_node = waiting_for.get("card", {})
-        cost = card_node.get("calculatedCost", 0) if card_node else waiting_for.get("amount", 0)
-    else:
-        cost = waiting_for.get("amount", 0)
-
-    st_val, ti_val = card_resource_values(card_name) if is_project else (0, 0)
-    covered = (
-        payment.get("steel", 0) * st_val +
-        payment.get("titanium", 0) * ti_val +
-        sum(payment.get(f, 0) * PAYMENT_VALUES.get(f, 0)
-            for f in PAYMENT_VALUES if f not in ("steel", "titanium"))
-    )
-    needed_mc = max(0, cost - covered)
-    if payment.get("megacredits", 0) < needed_mc:
-        payment["megacredits"] = min(needed_mc, mc_avail)
-        if mc_avail < needed_mc:
-            logger.warning(
-                "Payment underfunded: cost=%d covered_by_resources=%d need_mc=%d have_mc=%d",
-                cost, covered, needed_mc, mc_avail,
+    allowed, available, values = _payment_context(waiting_for, player, card_name)
+    result = empty_payment()
+    for field, is_allowed in allowed.items():
+        if is_allowed:
+            result[field] = min(
+                max(0, int(payment.get(field, 0) or 0)),
+                available.get(field, 0),
             )
 
-    return payment
+    cost = _project_card_cost(waiting_for, card_name)
+    covered = sum(
+        result[field] * values.get(field, 0)
+        for field in result if field != "megacredits"
+    )
+    needed_mc = max(0, cost - covered)
+    result["megacredits"] = min(needed_mc, available["megacredits"])
+    if available["megacredits"] < needed_mc:
+        logger.warning(
+            "Payment underfunded: cost=%d covered_by_resources=%d need_mc=%d have_mc=%d",
+            cost, covered, needed_mc, available["megacredits"],
+        )
+    return result
 
 
 def check_payment_valid(response: dict, options: list[dict], waiting_for: dict, player: dict) -> str | None:
@@ -157,21 +230,11 @@ def check_payment_valid(response: dict, options: list[dict], waiting_for: dict, 
     st = player.get("steel", 0)
     ti = player.get("titanium", 0)
 
-    def _total(payment: dict, card_name: str = "") -> int:
-        st_val, ti_val = card_resource_values(card_name)
-        return (
-            payment.get("megacredits", 0) +
-            payment.get("steel", 0) * st_val +
-            payment.get("titanium", 0) * ti_val +
-            sum(payment.get(f, 0) * PAYMENT_VALUES[f]
-                for f in PAYMENT_VALUES if f not in ("steel", "titanium") and f in payment)
-        )
-
-    def _msg(card_name: str, payment: dict, cost: int) -> str | None:
+    def _msg(card_name: str, payment: dict, cost: int, project_node: dict) -> str | None:
         if cost <= 0:
             return None
         st_val, ti_val = card_resource_values(card_name)
-        total = _total(payment, card_name)
+        total = _legal_payment_total(payment, project_node, player, card_name)
         if total >= cost:
             return None
         st_note = f"Steel={st} (×{st_val}={st*st_val} MC, building-tag only)" if st_val else f"Steel={st} (not applicable — no building tag)"
@@ -186,50 +249,51 @@ def check_payment_valid(response: dict, options: list[dict], waiting_for: dict, 
     wf_type = waiting_for.get("type", "")
 
     if wf_type == "projectCard":
-        card_node = waiting_for.get("card", {})
-        cost = card_node.get("calculatedCost", 0) if card_node else waiting_for.get("amount", 0)
         cname = response.get("card", "card")
-        return _msg(cname, response.get("payment", {}), cost)
+        return _msg(cname, response.get("payment", {}), _project_card_cost(waiting_for, cname), waiting_for)
 
     if wf_type == "payment":
         cost = waiting_for.get("amount", 0)
-        return _msg("standard project", response.get("payment", {}), cost)
+        payment = response.get("payment", {})
+        total = max(0, int(payment.get("megacredits", 0) or 0)) + sum(
+            max(0, int(payment.get(field, 0) or 0)) * value
+            for field, value in PAYMENT_VALUES.items()
+            if field not in ("steel", "titanium")
+        )
+        return None if total >= cost else (
+            f"Your payment for 'standard project' is insufficient: total {total} MC "
+            f"but card costs {cost} MC. Available resources: MC={mc}."
+        )
 
     if response.get("type") == "or":
         inner = response.get("response", {})
         if inner.get("type") == "projectCard":
             card_name = inner.get("card", "")
             payment = inner.get("payment", {})
-            chosen_idx = response.get("index", 0)
-            sub_option = next((o for o in options if o.get("index") == chosen_idx), {})
-            sub_node = sub_option.get("node", {})
-            cards = sub_node.get("cards", []) if isinstance(sub_node, dict) else []
-            card_info = next((c for c in cards if c.get("name") == card_name), {})
-            cost = card_info.get("calculatedCost", 0)
-            return _msg(card_name, payment, cost)
+            chosen_idx = max(0, int(response.get("index", 0) or 0))
+            parent_options = waiting_for.get("options", [])
+            sub_node = parent_options[chosen_idx] if chosen_idx < len(parent_options) else {}
+            cost = _project_card_cost(sub_node, card_name)
+            return _msg(card_name, payment, cost, sub_node)
 
     return None
 
 
 def auto_payment_for_card(card_name: str, sub_node: dict, player: dict) -> dict:
-    """Generate an optimal steel/titanium payment for a project card using CARD_DB tags."""
-    cards = sub_node.get("cards", []) if isinstance(sub_node, dict) else []
-    card_info = next((c for c in cards if c.get("name") == card_name), {})
-    cost = card_info.get("calculatedCost", 0)
-    entry = CARD_DB.get(card_name, {})
-    tags = entry.get("tags", []) if entry else []
-
-    ti_avail = player.get("titanium", 0) if "space" in tags else 0
-    st_avail = player.get("steel", 0) if "building" in tags else 0
-
-    ti_used = min(ti_avail, (cost + 2) // 3)
-    remaining = max(0, cost - ti_used * 3)
-    st_used = min(st_avail, (remaining + 1) // 2)
-    remaining = max(0, remaining - st_used * 2)
-    mc_used = min(remaining, player.get("megacredits", 0))
-
+    """Generate a legal payment using the same server-owned policy as validation."""
+    cost = _project_card_cost(sub_node, card_name)
+    allowed, available, values = _payment_context(sub_node, player, card_name)
     payment = empty_payment()
-    payment["megacredits"] = mc_used
-    payment["steel"] = st_used
-    payment["titanium"] = ti_used
+    remaining = cost
+    resource_fields = [
+        field for field, is_allowed in allowed.items()
+        if is_allowed and field != "megacredits" and values.get(field, 0) > 0
+    ]
+    resource_fields.sort(key=lambda field: values[field], reverse=True)
+    for field in resource_fields:
+        value = values[field]
+        used = min(available[field], (remaining + value - 1) // value)
+        payment[field] = used
+        remaining = max(0, remaining - used * value)
+    payment["megacredits"] = min(remaining, available["megacredits"])
     return payment
