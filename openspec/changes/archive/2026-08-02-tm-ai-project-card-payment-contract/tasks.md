@@ -20,6 +20,6 @@
 - [x] 2.1 Выполнить полный tm-ai offline suite и статические проверки.
   - Проверка: `uv run --project tm-ai-server pytest tm-ai-server/tests -q`, `uv run --project tm-ai-server python -m compileall -q tm-ai-server/src`, `git diff --check`, языковая проверка и `openspec validate tm-ai-project-card-payment-contract --strict --no-interactive` завершаются с exit code `0`; provider invocations=`0`.
   - Evidence 2026-08-02: полный suite завершился `99 passed`, compileall и `git diff --check` — exit code `0`. Read-only canonical replay сохранённого synthetic state принял оба преобразованных response: `Power Plant:SP` с `MC=11, STEEL=0` и `Excavate:SP` с `MC=0, STEEL=4`; credentials/provider transport не использовались.
-- [ ] 2.2 Подготовить task-owned tm-ai commit и передать exact SHA для обновления arena pin; не выполнять paid rerun либо merge.
+- [x] 2.2 Подготовить task-owned tm-ai commit и передать exact SHA для обновления arena pin; не выполнять paid rerun либо merge.
   - Интерфейсы: проверенный tm-ai tree → exact commit SHA для `config/tm-ai-openrouter-arena.json` и arena pin tests.
-  - Проверка: `git status --short --branch`, `git show --stat --oneline HEAD` и clean diff scope после commit.
+  - Проверка: task-owned implementation commit `6235fedc47a33293e335706df066ee38104020e0` содержит только OpenSpec/docs/parser/payment/tests; branch `codex/tm-ai-project-card-payment-contract` clean и ahead `origin/main` на один commit. Paid rerun, merge и deploy не выполнялись.
