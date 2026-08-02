@@ -130,10 +130,12 @@ prepended as a banner on the next call.
 ### Payment (`payment.py`)
 
 `parse_payment_line` reads `PAYMENT: MC=n[, STEEL=n][, TITANIUM=n][, HEAT=n]...`;
-`correct_payment` clamps to available resources and the card's tag rules (steel only for
-building tags, titanium only for space tags) and tops up MC to cover the cost;
-`auto_payment_for_card` generates an optimal steel/titanium payment when no PAYMENT line is
-present (e.g. nested `or→projectCard`).
+`correct_payment` clamps to available resources and the TM server model's payment rules:
+`standardProjectCanPayWith` is authoritative for standard projects, while regular project
+cards use known tags plus `paymentOptions`. Unknown cards fail closed for steel/titanium.
+It then tops up MC to cover the cost. `auto_payment_for_card` uses the same allowlist when no
+PAYMENT line is present (e.g. nested `or→projectCard`). Nested card selection stays bound to
+the exact flattened `CHOICE` path and is never inferred from free-form model prose.
 
 ### Board awareness (`board.py`)
 

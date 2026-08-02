@@ -60,6 +60,89 @@ def test_check_payment_sufficient():
     assert err is None
 
 
+def _standard_project_waiting_for():
+    return {
+        "type": "or",
+        "options": [{
+            "type": "projectCard",
+            "title": "Standard projects",
+            "paymentOptions": {"heat": False, "plants": False},
+            "cards": [
+                {"name": "Asteroid:SP", "calculatedCost": 14,
+                 "standardProjectCanPayWith": {}, "isDisabled": True},
+                {"name": "Excavate:SP", "calculatedCost": 7,
+                 "standardProjectCanPayWith": {"steel": True}},
+                {"name": "Power Plant:SP", "calculatedCost": 11,
+                 "standardProjectCanPayWith": {}},
+            ],
+        }],
+    }
+
+
+def test_nested_project_card_choice_is_not_overridden_by_model_prose():
+    wf = _standard_project_waiting_for()
+    options = flatten_options(wf)
+    player = {"megacredits": 13, "steel": 7, "titanium": 0, "heat": 0, "plants": 1}
+
+    response, _ = parse_action_response(
+        "Asteroid:SP is disabled; choose the power option.\nCHOICE: 2\nPAYMENT: MC=11",
+        options, wf, "p1", player=player,
+    )
+
+    assert response["response"]["card"] == "Power Plant:SP"
+
+
+def test_standard_project_payment_uses_explicit_server_rules():
+    wf = _standard_project_waiting_for()
+    options = flatten_options(wf)
+    player = {"megacredits": 13, "steel": 7, "titanium": 0, "heat": 0, "plants": 1}
+
+    excavate, _ = parse_action_response(
+        "CHOICE: 1\nPAYMENT: STEEL=4", options, wf, "p1", player=player,
+    )
+    power, _ = parse_action_response(
+        "CHOICE: 2\nPAYMENT: STEEL=6", options, wf, "p1", player=player,
+    )
+
+    assert excavate["response"]["payment"]["steel"] == 4
+    assert excavate["response"]["payment"]["megacredits"] == 0
+    assert power["response"]["payment"]["steel"] == 0
+    assert power["response"]["payment"]["megacredits"] == 11
+    assert check_payment_valid(power, options, wf, player) is None
+
+
+def test_standard_project_payment_rejects_underfunded_legal_resources():
+    wf = _standard_project_waiting_for()
+    options = flatten_options(wf)
+    player = {"megacredits": 5, "steel": 7, "titanium": 0, "heat": 11, "plants": 4}
+
+    power, _ = parse_action_response(
+        "CHOICE: 2\nPAYMENT: STEEL=6, HEAT=11, PLANTS=4",
+        options, wf, "p1", player=player,
+    )
+
+    payment = power["response"]["payment"]
+    assert payment["steel"] == 0
+    assert payment["heat"] == 0
+    assert payment["plants"] == 0
+    assert payment["megacredits"] == 5
+    assert check_payment_valid(power, options, wf, player) is not None
+
+
+def test_select_payment_heat_behavior_is_unchanged():
+    wf = {"type": "payment", "amount": 8, "paymentOptions": {"heat": True}}
+    options = flatten_options(wf)
+    player = {"megacredits": 0, "heat": 8, "plants": 0}
+
+    response, _ = parse_action_response(
+        "CHOICE: 1\nPAYMENT: HEAT=8", options, wf, "p1", player=player,
+    )
+
+    assert response["payment"]["heat"] == 8
+    assert response["payment"]["megacredits"] == 0
+    assert check_payment_valid(response, options, wf, player) is None
+
+
 def test_find_choice_plain():
     assert find_choice("blah\nCHOICE: 3\n") == 3
 

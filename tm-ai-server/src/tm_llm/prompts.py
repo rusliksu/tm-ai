@@ -826,20 +826,14 @@ def parse_action_response(text: str, options: list[dict], waiting_for: dict, pla
             available_cards = sub_node.get("cards", []) if isinstance(sub_node, dict) else []
             card_name = inner.get("card", "")
             payment = parse_payment_line(text)
-            if payment:
-                text_lower = text.lower()
-                for c in available_cards:
-                    cn = c.get("name", "")
-                    if cn and cn.lower() in text_lower:
-                        card_name = cn
-                        break
             if not card_name and available_cards:
-                card_name = available_cards[0].get("name", "")
+                card_name = next(
+                    (c.get("name", "") for c in available_cards if c.get("isDisabled") is not True),
+                    "",
+                )
                 logger.warning("or→projectCard: no card named (player=%s) — using first %r", player_id, card_name)
             if payment:
-                card_info = next((c for c in available_cards if c.get("name") == card_name), {})
-                stub = {"type": "projectCard", "amount": card_info.get("calculatedCost", 0)}
-                payment = correct_payment(payment, stub, p, card_name=card_name)
+                payment = correct_payment(payment, sub_node, p, card_name=card_name)
             else:
                 payment = auto_payment_for_card(card_name, sub_node, p)
                 logger.info("Auto-payment for %r (player=%s): %s", card_name, player_id, payment)
