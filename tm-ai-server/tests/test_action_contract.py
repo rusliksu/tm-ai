@@ -259,7 +259,7 @@ def test_nested_or_inside_and_requires_branch_and_active_child_value_only():
         (
             {"type": "resource", "title": "Resource", "include": ["microbes", "floaters"]},
             "floaters",
-            {"type": "resource", "resourceType": "floaters"},
+            {"type": "resource", "resource": "floaters"},
         ),
         (
             {
@@ -286,6 +286,49 @@ def test_single_value_node_types_build_exact_wire_response(waiting_for: dict, va
     )
 
     assert response == expected
+
+
+def test_nested_resource_builds_canonical_server_response():
+    waiting_for = {
+        "type": "and",
+        "options": [
+            {"type": "resource", "include": ["microbes", "floaters"]},
+            {"type": "option", "title": "Confirm"},
+        ],
+    }
+
+    response = build_input_response(
+        waiting_for,
+        ActionPlan(candidate="root", values={"v:0": "microbes"}),
+    )
+
+    assert response == {
+        "type": "and",
+        "responses": [
+            {"type": "resource", "resource": "microbes"},
+            {"type": "option"},
+        ],
+    }
+
+
+def test_canonical_server_resource_shape_rejects_legacy_field():
+    def server_accepts(response: dict, include: list[str]) -> bool:
+        return (
+            set(response) == {"type", "resource"}
+            and response.get("type") == "resource"
+            and response.get("resource") in include
+        )
+
+    include = ["microbes", "floaters"]
+    accepted = build_input_response(
+        {"type": "resource", "include": include},
+        ActionPlan(candidate="root", values={"v:root": "floaters"}),
+    )
+
+    assert server_accepts(accepted, include) is True
+    assert server_accepts(
+        {"type": "resource", "resourceType": "floaters"}, include
+    ) is False
 
 
 def test_static_option_has_no_slots_and_needs_no_hidden_default():

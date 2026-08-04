@@ -411,7 +411,7 @@ def _build_node(node: dict, path: tuple[int, ...], values: dict[str, Any]) -> di
     if node_type == "party":
         return {"type": "party", "partyName": values[_slot_id(path)]}
     if node_type == "resource":
-        return {"type": "resource", "resourceType": values[_slot_id(path)]}
+        return {"type": "resource", "resource": values[_slot_id(path)]}
     if node_type == "globalEvent":
         return {"type": "globalEvent", "globalEventName": values[_slot_id(path)]}
     raise ActionContractError("unsupported_node")
