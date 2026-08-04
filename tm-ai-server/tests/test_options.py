@@ -1,4 +1,7 @@
 """Tests for the decision-tree handling lifted into tm_llm.options."""
+import pytest
+
+from tm_llm.action_contract import ActionContractError
 from tm_llm.options import flatten_options, index_to_response, _default_response
 
 
@@ -146,3 +149,30 @@ def test_card_min_selection():
           "cards": [{"name": "A"}, {"name": "B"}]}
     resp = index_to_response(wf, 1)
     assert resp == {"type": "card", "cards": ["B"]}
+
+
+def test_resource_paths_accept_canonical_include_and_emit_resource_field():
+    wf = {"type": "resource", "include": ["microbes", "floaters"]}
+
+    opts = flatten_options(wf)
+
+    assert [option["title"] for option in opts] == ["microbes", "floaters"]
+    assert opts[1]["node"] == {"resource": "floaters"}
+    assert index_to_response(wf, opts[1]["path"]) == {
+        "type": "resource",
+        "resource": "floaters",
+    }
+    assert _default_response(wf) == {"type": "resource", "resource": "microbes"}
+
+
+def test_resource_paths_keep_legacy_resources_input_but_normalize_output():
+    wf = {"type": "resource", "resources": ["animals"]}
+
+    assert index_to_response(wf, 0) == {"type": "resource", "resource": "animals"}
+    assert _default_response(wf) == {"type": "resource", "resource": "animals"}
+
+
+@pytest.mark.parametrize("mapper", [flatten_options, lambda node: index_to_response(node, 0), _default_response])
+def test_resource_paths_fail_closed_for_empty_allowlist(mapper):
+    with pytest.raises(ActionContractError, match="no_choices"):
+        mapper({"type": "resource"})

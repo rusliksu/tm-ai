@@ -16,12 +16,19 @@ InputResponse wire format (from TM server InputResponse.ts):
   SelectColony: {type:'colony', colonyName:<ColonyName>}
   SelectDelegate: {type:'delegate', player:<Color>}
   SelectParty:  {type:'party',  partyName:<PartyName>}
-  SelectResource: {type:'resource', resourceType:<ResourceType>}
+  SelectResource: {type:'resource', resource:<ResourceType>}
 """
 from __future__ import annotations
 
-from .action_contract import MAX_OPTIONS, node_title as _node_title
+from .action_contract import ActionContractError, MAX_OPTIONS, node_title as _node_title
 from .payment import mc_payment
+
+
+def _resource_values(node: dict) -> list:
+    values = node.get("include") or node.get("resources") or []
+    if not values:
+        raise ActionContractError("no_choices")
+    return values
 
 
 def flatten_options(waiting_for: dict, max_actions: int = MAX_OPTIONS) -> list[dict]:
@@ -146,10 +153,10 @@ def flatten_options(waiting_for: dict, max_actions: int = MAX_OPTIONS) -> list[d
             _emit(str(party), [i], {"partyName": party})
 
     elif node_type == "resource":
-        for i, res in enumerate(waiting_for.get("resources", [])):
+        for i, res in enumerate(_resource_values(waiting_for)):
             if len(options) >= max_actions:
                 break
-            _emit(str(res), [i], {"resourceType": res})
+            _emit(str(res), [i], {"resource": res})
 
     else:
         _emit(_node_title(waiting_for, 0), [0], waiting_for)
@@ -226,9 +233,9 @@ def index_to_response(waiting_for: dict, index) -> dict:
         return {"type": "party", "partyName": parties[head] if head < len(parties) else ""}
 
     elif node_type == "resource":
-        resources = waiting_for.get("resources", ["megacredits"])
+        resources = _resource_values(waiting_for)
         res = resources[head] if head < len(resources) else resources[0]
-        return {"type": "resource", "resourceType": res}
+        return {"type": "resource", "resource": res}
 
     else:
         return _default_response(waiting_for)
@@ -292,7 +299,7 @@ def _default_response(node: dict) -> dict:
     elif t == "policy":
         return {"type": "policy", "policyId": node.get("policyId", "")}
     elif t == "resource":
-        resources = node.get("resources", ["megacredits"])
-        return {"type": "resource", "resourceType": resources[0] if resources else "megacredits"}
+        resources = _resource_values(node)
+        return {"type": "resource", "resource": resources[0]}
     else:
         return {"type": t}
