@@ -113,6 +113,29 @@ def test_flatten_top_level_project_card_excludes_only_exact_boolean_disabled():
     assert [o["path"] for o in opts] == [[1], [2], [3]]
 
 
+def test_flatten_top_level_card_excludes_disabled_and_preserves_original_paths():
+    wf = {"type": "card", "min": 1, "max": 1, "cards": [
+        {"name": "Disabled", "isDisabled": True},
+        {"name": "Enabled false", "isDisabled": False},
+        {"name": "Enabled missing"},
+        {"name": "Enabled non-boolean", "isDisabled": 1},
+    ]}
+
+    opts = flatten_options(wf)
+
+    assert [o["title"] for o in opts] == [
+        "Enabled false",
+        "Enabled missing",
+        "Enabled non-boolean",
+    ]
+    assert [o["path"] for o in opts] == [[1], [2], [3]]
+    assert [index_to_response(wf, o["path"])["cards"] for o in opts] == [
+        ["Enabled false"],
+        ["Enabled missing"],
+        ["Enabled non-boolean"],
+    ]
+
+
 def test_index_to_response_or_nested():
     wf = {"type": "or", "options": [
         {"type": "or", "title": "Fund", "options": [

@@ -106,6 +106,8 @@ def flatten_options(waiting_for: dict, max_actions: int = MAX_OPTIONS) -> list[d
             for i, card in enumerate(cards):
                 if len(options) >= max_actions:
                     break
+                if card.get("isDisabled") is True:
+                    continue
                 _emit(card.get("name", f"Card {i}"), [i], card)
 
     elif node_type == "projectCard":
