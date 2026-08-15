@@ -12,7 +12,8 @@ import logging
 import subprocess
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 
 _app_logger = logging.getLogger("tm_llm")
 _app_logger.setLevel(logging.INFO)
@@ -26,30 +27,45 @@ from . import config, registry
 from .action_contract import ACTION_CONTRACT_VERSION, ActionContractError
 from .engine import select_action_llm
 from .openrouter import ensure_client
+from .sentry import create_sentry_reporter
 from .schemas import (
     HealthResponse, MoveRequest, MoveResponse,
     PlayerRegisterRequest, PlayerRegisterResponse, VersionResponse,
 )
 
 logger = logging.getLogger(__name__)
+reporter = create_sentry_reporter()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if config.OPENROUTER_API_KEY:
-        ensure_client()
-        logger.info("OpenRouter client ready (default model: %s, provider: %s)",
-                    config.OPENROUTER_MODEL, config.OPENROUTER_PROVIDER or "auto (throughput)")
-    else:
-        logger.warning("OPENROUTER_API_KEY is not set — /move calls will fail")
-    registry.prune_stale_state()
     try:
+        if config.OPENROUTER_API_KEY:
+            ensure_client()
+            logger.info("OpenRouter client ready (default model: %s, provider: %s)",
+                        config.OPENROUTER_MODEL, config.OPENROUTER_PROVIDER or "auto (throughput)")
+        else:
+            logger.warning("OPENROUTER_API_KEY is not set — /move calls will fail")
+        registry.prune_stale_state()
         yield
+    except Exception as exc:
+        logger.error("tm-ai application lifecycle failed")
+        reporter.capture(exc, "startup")
+        reporter.flush()
+        raise
     finally:
         registry.save_all_active_players()
+        reporter.close()
 
 
 app = FastAPI(title="TM LLM AI Server", version="0.2.0", lifespan=lifespan)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception(_request: Request, exc: Exception) -> JSONResponse:
+    logger.error("Unhandled tm-ai API error")
+    reporter.capture(exc, "server_error")
+    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
 
 
 @app.get("/health", response_model=HealthResponse)

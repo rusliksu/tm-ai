@@ -17,6 +17,7 @@ dependencies = [
     "pydantic>=2.5.0",
     "requests>=2.34.0",
     "openai>=2.37.0",
+    "sentry-sdk>=2,<3",
 ]
 
 [dependency-groups]
