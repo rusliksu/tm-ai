@@ -1,0 +1,12 @@
+project:
+  uuid: 442cbbe4-daaa-4ae5-bfb2-5a0f1fa2e927
+  slug: tm-ai
+  node_id: 382fd5d906cc
+  build_id: 396059a0-8f7b-54f8-8e2f-9390ceb50dd7
+vcs:
+  type: git
+agents:
+  available:
+  - codex
+  auto_commit: true
+  lint_on_edit: false
