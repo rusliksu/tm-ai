@@ -446,6 +446,26 @@ def test_engine_v2_exhaustion_fails_closed_instead_of_sending_zero_zero(monkeypa
     assert exc.value.reason == "validation_retries_exhausted"
 
 
+def test_engine_legacy_payment_exhaustion_fails_closed(monkeypatch):
+    player = FakePlayer(["CHOICE: 1\nPAYMENT: MC=1"])
+    monkeypatch.setattr(config, "ACTION_CONTRACT_MODE", "v2", raising=False)
+    monkeypatch.setattr(config, "MAX_ACTION_RETRIES", 0)
+    monkeypatch.setattr(engine.registry, "get_or_create_player", lambda *_: player)
+
+    with pytest.raises(ActionContractError) as exc:
+        engine.select_action_llm(
+            state={
+                "game": {"generation": 1},
+                "player": {"name": "A", "color": "red", "megacredits": 1},
+            },
+            waiting_for={"type": "payment", "amount": 9, "paymentOptions": {}},
+            game_id="g1",
+            player_id="p1",
+        )
+
+    assert exc.value.reason == "validation_retries_exhausted"
+
+
 def test_engine_compare_mode_keeps_legacy_response_and_emits_safe_summary(monkeypatch):
     player = FakePlayer(["CHOICE: 1"])
     monkeypatch.setattr(config, "ACTION_CONTRACT_MODE", "compare", raising=False)

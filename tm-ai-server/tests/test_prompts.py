@@ -186,6 +186,48 @@ def test_select_payment_honors_enabled_resources_and_reserved_units():
     assert check_payment_valid(response, options, wf, player) is None
 
 
+def test_select_payment_completes_shortfall_with_enabled_resources():
+    wf = {
+        "type": "payment",
+        "amount": 9,
+        "paymentOptions": {"titanium": True},
+    }
+    options = flatten_options(wf)
+    player = {
+        "megacredits": 6, "steel": 0, "titanium": 1,
+        "titaniumValue": 3, "heat": 0, "plants": 0,
+    }
+
+    response, _ = parse_action_response(
+        "CHOICE: 1\nPAYMENT: MC=6", options, wf, "p1", player=player,
+    )
+
+    assert response["payment"]["megacredits"] == 6
+    assert response["payment"]["titanium"] == 1
+    assert check_payment_valid(response, options, wf, player) is None
+
+
+def test_select_payment_uses_luna_trade_federation_titanium_value():
+    wf = {
+        "type": "payment",
+        "amount": 8,
+        "paymentOptions": {"lunaTradeFederationTitanium": True},
+    }
+    options = flatten_options(wf)
+    player = {
+        "megacredits": 6, "steel": 0, "titanium": 1,
+        "titaniumValue": 3, "heat": 0, "plants": 0,
+    }
+
+    response, _ = parse_action_response(
+        "CHOICE: 1\nPAYMENT: MC=6", options, wf, "p1", player=player,
+    )
+
+    assert response["payment"]["megacredits"] == 6
+    assert response["payment"]["titanium"] == 1
+    assert check_payment_valid(response, options, wf, player) is None
+
+
 def test_find_choice_plain():
     assert find_choice("blah\nCHOICE: 3\n") == 3
 
