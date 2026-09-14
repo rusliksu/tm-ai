@@ -190,6 +190,10 @@ def _select_payment_context(waiting_for: dict, player: dict) -> tuple[dict, dict
     values["megacredits"] = 1
     values["steel"] = max(0, int(player.get("steelValue", 2) or 2))
     values["titanium"] = max(0, int(player.get("titaniumValue", 3) or 3))
+    if (payment_options.get("titanium") is not True and (
+        payment_options.get("lunaTradeFederationTitanium") is True
+    )):
+        values["titanium"] = max(0, values["titanium"] - 1)
     return allowed, available, values
 
 
@@ -223,8 +227,28 @@ def correct_payment(payment: dict, waiting_for: dict, player: dict, card_name: s
             result[field] * values.get(field, 0)
             for field in result if field != "megacredits"
         )
-        needed_mc = max(0, int(waiting_for.get("amount", 0) or 0) - covered)
+        cost = max(0, int(waiting_for.get("amount", 0) or 0))
+        needed_mc = max(0, cost - covered)
         result["megacredits"] = min(needed_mc, available["megacredits"])
+        remaining = max(0, cost - covered - result["megacredits"])
+        resource_fields = [
+            field for field, is_allowed in allowed.items()
+            if is_allowed and field != "megacredits" and values.get(field, 0) > 0
+            and result[field] < available[field]
+        ]
+        resource_fields.sort(key=lambda field: (-values[field], field))
+        for field in resource_fields:
+            if remaining <= 0:
+                break
+            value = values[field]
+            extra = min(available[field] - result[field], (remaining + value - 1) // value)
+            result[field] += extra
+            total = sum(result[name] * values.get(name, 0) for name in result)
+            if total > cost and result["megacredits"] > 0:
+                result["megacredits"] -= min(result["megacredits"], total - cost)
+            remaining = max(0, cost - sum(
+                result[name] * values.get(name, 0) for name in result
+            ))
         return result
 
     allowed, available, values = _payment_context(waiting_for, player, card_name)

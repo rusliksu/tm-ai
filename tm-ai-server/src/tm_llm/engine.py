@@ -155,8 +155,9 @@ def _select_action(state: dict, waiting_for: dict, player, last_error: str | Non
                 logger.warning("Action invalid after retries (player=%s) — best-effort Pass (%r)",
                                player.player_id, pass_opt["title"])
             else:
-                logger.error("Action invalid after retries (player=%s):\n%s — sending best-effort",
+                logger.error("Action invalid after retries (player=%s):\n%s — failing closed",
                              player.player_id, combined)
+                raise ActionContractError("validation_retries_exhausted")
 
     tactical = prompts.capture_tactical(text)
     if tactical:
