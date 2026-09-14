@@ -160,6 +160,39 @@ def _payment_context(waiting_for: dict, player: dict, card_name: str) -> tuple[d
     return allowed, available, values
 
 
+def _select_payment_context(waiting_for: dict, player: dict) -> tuple[dict, dict, dict]:
+    """Return the server-owned rules for a standalone SelectPayment prompt."""
+    payment_options = waiting_for.get("paymentOptions", {}) or {}
+    reserve_units = waiting_for.get("reserveUnits", {}) or {}
+    allowed = {field: False for field in empty_payment()}
+    allowed["megacredits"] = True
+    for field in allowed:
+        if field == "megacredits":
+            continue
+        if field == "titanium":
+            allowed[field] = (
+                payment_options.get("titanium") is True
+                or payment_options.get("lunaTradeFederationTitanium") is True
+            )
+        else:
+            allowed[field] = payment_options.get(field) is True
+
+    available = {}
+    for field in ("megacredits", "steel", "titanium", "heat", "plants"):
+        held = max(0, int(player.get(field, 0) or 0))
+        reserved = max(0, int(reserve_units.get(field, 0) or 0))
+        available[field] = max(0, held - reserved)
+    for field in empty_payment():
+        if field not in available:
+            available[field] = max(0, int(waiting_for.get(field, 0) or 0))
+
+    values = dict(PAYMENT_VALUES)
+    values["megacredits"] = 1
+    values["steel"] = max(0, int(player.get("steelValue", 2) or 2))
+    values["titanium"] = max(0, int(player.get("titaniumValue", 3) or 3))
+    return allowed, available, values
+
+
 def _project_card_cost(waiting_for: dict, card_name: str) -> int:
     card = _project_card_info(waiting_for, card_name)
     if card:
@@ -178,26 +211,20 @@ def _legal_payment_total(payment: dict, waiting_for: dict, player: dict, card_na
 def correct_payment(payment: dict, waiting_for: dict, player: dict, card_name: str = "") -> dict:
     """Clamp payment fields to available resources and ensure the total covers the cost."""
     if waiting_for.get("type", "") != "projectCard":
-        result = dict(payment)
-        result["steel"] = 0
-        result["titanium"] = 0
-        for field in ("heat", "plants"):
-            result[field] = min(
-                max(0, int(result.get(field, 0) or 0)),
-                max(0, int(player.get(field, 0) or 0)),
-            )
-        mc_avail = max(0, int(player.get("megacredits", 0) or 0))
-        result["megacredits"] = min(
-            max(0, int(result.get("megacredits", 0) or 0)), mc_avail,
-        )
+        allowed, available, values = _select_payment_context(waiting_for, player)
+        result = empty_payment()
+        for field, is_allowed in allowed.items():
+            if is_allowed:
+                result[field] = min(
+                    max(0, int(payment.get(field, 0) or 0)),
+                    available.get(field, 0),
+                )
         covered = sum(
-            max(0, int(result.get(field, 0) or 0)) * value
-            for field, value in PAYMENT_VALUES.items()
-            if field not in ("steel", "titanium")
+            result[field] * values.get(field, 0)
+            for field in result if field != "megacredits"
         )
         needed_mc = max(0, int(waiting_for.get("amount", 0) or 0) - covered)
-        if result["megacredits"] < needed_mc:
-            result["megacredits"] = min(needed_mc, mc_avail)
+        result["megacredits"] = min(needed_mc, available["megacredits"])
         return result
 
     allowed, available, values = _payment_context(waiting_for, player, card_name)
@@ -255,12 +282,17 @@ def check_payment_valid(response: dict, options: list[dict], waiting_for: dict, 
     if wf_type == "payment":
         cost = waiting_for.get("amount", 0)
         payment = response.get("payment", {})
-        total = max(0, int(payment.get("megacredits", 0) or 0)) + sum(
-            max(0, int(payment.get(field, 0) or 0)) * value
-            for field, value in PAYMENT_VALUES.items()
-            if field not in ("steel", "titanium")
+        allowed, available, values = _select_payment_context(waiting_for, player)
+        legal = all(
+            max(0, int(payment.get(field, 0) or 0)) <= available[field]
+            and (allowed[field] or max(0, int(payment.get(field, 0) or 0)) == 0)
+            for field in allowed
         )
-        return None if total >= cost else (
+        total = sum(
+            max(0, int(payment.get(field, 0) or 0)) * values.get(field, 0)
+            for field, is_allowed in allowed.items() if is_allowed
+        )
+        return None if legal and total >= cost else (
             f"Your payment for 'standard project' is insufficient: total {total} MC "
             f"but card costs {cost} MC. Available resources: MC={mc}."
         )

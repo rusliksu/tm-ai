@@ -143,6 +143,49 @@ def test_select_payment_heat_behavior_is_unchanged():
     assert check_payment_valid(response, options, wf, player) is None
 
 
+def test_select_payment_discards_resources_disabled_by_server_options():
+    wf = {
+        "type": "payment",
+        "amount": 10,
+        "paymentOptions": {"heat": False, "plants": False},
+    }
+    options = flatten_options(wf)
+    player = {"megacredits": 10, "heat": 0, "plants": 2}
+
+    response, _ = parse_action_response(
+        "CHOICE: 1\nPAYMENT: MC=4, PLANTS=2", options, wf, "p1", player=player,
+    )
+
+    assert response["payment"]["plants"] == 0
+    assert response["payment"]["megacredits"] == 10
+    assert check_payment_valid(response, options, wf, player) is None
+
+
+def test_select_payment_honors_enabled_resources_and_reserved_units():
+    wf = {
+        "type": "payment",
+        "amount": 10,
+        "paymentOptions": {"titanium": True},
+        "reserveUnits": {
+            "megacredits": 3, "steel": 0, "titanium": 0,
+            "plants": 0, "energy": 0, "heat": 0,
+        },
+    }
+    options = flatten_options(wf)
+    player = {
+        "megacredits": 7, "steel": 0, "titanium": 2,
+        "titaniumValue": 3, "heat": 0, "plants": 0,
+    }
+
+    response, _ = parse_action_response(
+        "CHOICE: 1\nPAYMENT: MC=7, TITANIUM=2", options, wf, "p1", player=player,
+    )
+
+    assert response["payment"]["titanium"] == 2
+    assert response["payment"]["megacredits"] == 4
+    assert check_payment_valid(response, options, wf, player) is None
+
+
 def test_find_choice_plain():
     assert find_choice("blah\nCHOICE: 3\n") == 3
 
