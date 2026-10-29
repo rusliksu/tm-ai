@@ -818,7 +818,11 @@ def parse_action_response(text: str, options: list[dict], waiting_for: dict, pla
             payment = correct_payment(payment, waiting_for, p, card_name=wf_card_name)
             response = {**response, "payment": payment}
         else:
-            logger.warning("No PAYMENT line for %s (player=%s) — using default. %.200s", wf_type, player_id, text)
+            card_name = response.get("card", "")
+            payment = auto_payment_for_card(card_name, waiting_for, p)
+            response = {**response, "payment": payment}
+            logger.info("Auto-payment for direct %s (player=%s, card=%r): %s",
+                        wf_type, player_id, card_name, payment)
     elif response.get("type") == "or":
         inner = response.get("response", {})
         if inner.get("type") == "projectCard":

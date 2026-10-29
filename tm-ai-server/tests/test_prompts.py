@@ -40,6 +40,18 @@ def test_parse_action_project_card_payment():
     assert response["payment"]["megacredits"] == 10
 
 
+def test_parse_action_project_card_auto_payment_uses_steel_when_mc_short():
+    wf = {"type": "projectCard", "card": {"name": "Aquifer Pumping", "calculatedCost": 18},
+          "cards": [{"name": "Aquifer Pumping", "calculatedCost": 18, "tags": ["building"]}],
+          "paymentOptions": {"heat": False, "plants": False}}
+    options = flatten_options(wf)
+    player = {"megacredits": 0, "steel": 18}
+    response, _ = parse_action_response("CHOICE: 1", options, wf, "p1", player=player)
+    assert response["payment"]["megacredits"] == 0
+    assert response["payment"]["steel"] == 9
+    assert check_payment_valid(response, options, wf, player) is None
+
+
 def test_payment_line_parsing():
     p = parse_payment_line("PAYMENT: MC=5, STEEL=3, TITANIUM=1")
     assert p["megacredits"] == 5 and p["steel"] == 3 and p["titanium"] == 1
